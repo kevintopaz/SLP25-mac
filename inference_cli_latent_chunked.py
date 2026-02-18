@@ -238,7 +238,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--video_backend", default="opencv", choices=["opencv", "ffmpeg"])
     parser.add_argument("--10bit", dest="use_10bit", action="store_true")
     parser.add_argument("--model_dir", default=None)
-    parser.add_argument("--dit_model", default=DEFAULT_DIT, choices=get_available_dit_models())
+    parser.add_argument("--dit_model", default=DEFAULT_DIT)
     parser.add_argument("--vae_model", default=DEFAULT_VAE)
     parser.add_argument("--resolution", type=int, default=1080)
     parser.add_argument("--max_resolution", type=int, default=0)
