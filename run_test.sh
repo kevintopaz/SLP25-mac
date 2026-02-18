@@ -24,7 +24,7 @@
 
 INPUT_FOLDER="./magnific_batch_test"
 OUTPUT_FOLDER="./magnific_batch_test_output"
-RESOLUTION="1440"
+RESOLUTION="2160"
 
 # Validate input folder
 if [ ! -d "$INPUT_FOLDER" ]; then

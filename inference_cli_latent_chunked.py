@@ -49,9 +49,6 @@ import numpy as np
 import shutil
 import subprocess
 
-from src.utils.downloads import download_weight
-from src.utils.model_registry import get_available_dit_models, DEFAULT_DIT, DEFAULT_VAE
-from src.utils.constants import SEEDVR2_FOLDER_NAME
 from src.core.generation_utils import setup_generation_context, prepare_runner
 from src.core.generation_phases_latent import (
     encode_whole_video,
@@ -171,7 +168,7 @@ def _process_video(frames: torch.Tensor, args: argparse.Namespace, device_id: st
         tensor_offload_device=tensor_off, debug=debug
     )
     
-    model_dir = args.model_dir or f"./models/{SEEDVR2_FOLDER_NAME}"
+    model_dir = args.model_dir
     runner, cache_ctx = prepare_runner(
         dit_model=args.dit_model, vae_model=args.vae_model, model_dir=model_dir,
         debug=debug, ctx=ctx,
@@ -185,13 +182,9 @@ def _process_video(frames: torch.Tensor, args: argparse.Namespace, device_id: st
     )
     ctx['cache_context'] = cache_ctx
     
-    dit_tiles = None
-    if args.dit_tiles:
-        try:
-            parts = args.dit_tiles.replace('x', ',').split(',')
-            dit_tiles = (int(parts[0]), int(parts[1]))
-        except:
-            pass
+    # Auto-determine DiT tiling based on resolution
+    dit_tiles = (2, 2) if args.resolution >= 2160 else None
+    dit_tile_overlap = 0.25
     
     # Phase 1: Encode whole video
     ctx = encode_whole_video(runner, ctx, frames, debug, args.resolution, args.max_resolution)
@@ -201,7 +194,7 @@ def _process_video(frames: torch.Tensor, args: argparse.Namespace, device_id: st
         runner, ctx, debug,
         chunk_size=args.latent_chunk_size, overlap=args.latent_overlap,
         seed=args.seed, latent_noise_scale=args.latent_noise_scale,
-        shared_noise=args.shared_noise, dit_tiles=dit_tiles, dit_tile_overlap=args.dit_tile_overlap,
+        shared_noise=args.shared_noise, dit_tiles=dit_tiles, dit_tile_overlap=dit_tile_overlap,
         prompt=args.prompt, negative_prompt=args.negative_prompt,
         cfg_scale=args.cfg_scale
     )
@@ -238,8 +231,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--video_backend", default="opencv", choices=["opencv", "ffmpeg"])
     parser.add_argument("--10bit", dest="use_10bit", action="store_true")
     parser.add_argument("--model_dir", default=None)
-    parser.add_argument("--dit_model", default=DEFAULT_DIT)
-    parser.add_argument("--vae_model", default=DEFAULT_VAE)
+    parser.add_argument("--dit_model", default=None)
+    parser.add_argument("--vae_model", default=None)
     parser.add_argument("--resolution", type=int, default=1080)
     parser.add_argument("--max_resolution", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
@@ -263,8 +256,6 @@ def parse_arguments() -> argparse.Namespace:
                             "Use higher values (e.g. 4.0-7.0) for stronger prompt influence (multi-step models).")
     parser.add_argument("--latent_noise_scale", type=float, default=0.0)
     parser.add_argument("--shared_noise", action="store_true")
-    parser.add_argument("--dit_tiles", default=None)
-    parser.add_argument("--dit_tile_overlap", type=float, default=0.25)
     
     # Text prompt options
     parser.add_argument("--prompt", type=str, default=None,
@@ -317,11 +308,7 @@ def main():
     
     start = time.time()
     
-    try:
-        if not download_weight(args.dit_model, args.vae_model, args.model_dir, debug):
-            debug.log("Model download failed", level="ERROR", force=True)
-            sys.exit(1)
-        
+    try:        
         frames, fps = extract_video_frames(args.input, args.skip_first_frames, args.load_cap)
         result = _process_video(frames, args, device_id)
         
