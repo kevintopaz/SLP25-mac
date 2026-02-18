@@ -23,8 +23,8 @@
 # fi
 
 INPUT_FOLDER="./magnific_batch_test"
-OUTPUT_FOLDER="./magnific_batch_test_output"
-RESOLUTION="2160"
+OUTPUT_FOLDER="./magnific_batch_test_output_flash_attn_2"
+RESOLUTION="1440"
 
 # Validate input folder
 if [ ! -d "$INPUT_FOLDER" ]; then
@@ -118,7 +118,8 @@ for ext in $VIDEO_EXTENSIONS; do
             --video_backend "ffmpeg" \
             --usm_weight 0.5 \
             --usm_radius 10 \
-            --usm_threshold 10
+            --usm_threshold 10 \
+            --attention_mode "flash_attn_2"
         
         echo ""
         echo "Completed: $FILENAME"
