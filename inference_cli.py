@@ -170,7 +170,7 @@ class FFMPEGVideoWriter:
         self.proc = subprocess.Popen(
             ['ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
              '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
-             '-c:v', codec, '-pix_fmt', pix_fmt, '-preset', 'medium', '-crf', '12', path],
+             '-c:v', codec, '-pix_fmt', pix_fmt, '-preset', 'medium', '-crf', '15', path],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
     
@@ -341,6 +341,54 @@ def extract_frames_from_image(image_path: str) -> Tuple[torch.Tensor, float]:
     debug.log(f"Image tensor shape: {frames_tensor.shape}, dtype: {frames_tensor.dtype}", category="memory")
     
     return frames_tensor, 30.0  # Default FPS for images
+
+
+def _apply_input_downscale(
+    frames_tensor: torch.Tensor,
+    scale: float,
+    debug: 'Debug'
+) -> torch.Tensor:
+    """
+    Downscale input frames and resize back to original size.
+    
+    This preprocessing can help reduce high-frequency noise/artifacts in the input,
+    creating a smoother input that may produce better upscaling results.
+    
+    Args:
+        frames_tensor: Input frames [T, H, W, C], Float16/Float32, range [0,1]
+        scale: Downscale factor (e.g., 2.0 means downscale by 2x then upscale back)
+        debug: Debug instance for logging
+        
+    Returns:
+        Preprocessed frames tensor with same shape as input
+    """
+    import torch.nn.functional as F
+    
+    if scale <= 1.0:
+        return frames_tensor
+    
+    T, H, W, C = frames_tensor.shape
+    new_h = int(H / scale)
+    new_w = int(W / scale)
+    
+    debug.log(f"Applying input downscale: {W}x{H} -> {new_w}x{new_h} -> {W}x{H} (scale={scale}x)", 
+              category="video", force=True)
+    
+    # Convert to [T, C, H, W] for F.interpolate
+    frames_tchw = frames_tensor.permute(0, 3, 1, 2)
+    
+    # Downscale
+    frames_down = F.interpolate(frames_tchw, size=(new_h, new_w), mode='bilinear', align_corners=False)
+    
+    # Upscale back to original size
+    frames_up = F.interpolate(frames_down, size=(H, W), mode='bilinear', align_corners=False)
+    
+    # Convert back to [T, H, W, C]
+    result = frames_up.permute(0, 2, 3, 1)
+    
+    del frames_tchw, frames_down, frames_up
+    
+    return result
 
 
 def get_input_type(input_path: str) -> Literal['video', 'image', 'directory', 'unknown']:
@@ -534,6 +582,7 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
         # Single GPU: stream in main process
         else:
             chunk_count = 0
+            
             for result in _stream_video_chunks(
                 cap=cap,
                 frames_to_process=frames_to_process,
@@ -545,11 +594,13 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
                 runner_cache=runner_cache,
                 log_progress=streaming,
                 total_chunks=total_chunks,
-                cleanup_timer_name="chunk_cleanup"
+                cleanup_timer_name="chunk_cleanup",
+                save_batches_path=output_path if getattr(args, 'save_batches', False) else None,
+                fps=fps
             ):
                 chunk_count += 1
                 
-                # Save output
+                # Save to main output (streaming)
                 if is_png:
                     save_frames_to_image(result, output_path, base_name, start_index=frames_written)
                 else:
@@ -630,7 +681,9 @@ def _stream_video_chunks(
     log_progress: bool = False,
     total_chunks: int = 0,
     cleanup_timer_name: Optional[str] = None,
-    log_prefix: str = ""
+    log_prefix: str = "",
+    save_batches_path: Optional[str] = None,
+    fps: float = 30.0
 ) -> Generator[torch.Tensor, None, None]:
     """
     Generator that streams and processes video chunks.
@@ -652,6 +705,8 @@ def _stream_video_chunks(
         total_chunks: Total chunks for progress display (used if log_progress=True)
         cleanup_timer_name: Optional timer name for memory cleanup logging
         log_prefix: Optional prefix for log messages (e.g., "[GPU 0] " for worker identification)
+        save_batches_path: If provided with args.save_batches, save each batch as separate video
+        fps: FPS for batch output videos (default: 30.0)
     
     Yields:
         Processed frames tensor [T, H, W, C] for each chunk, context frames removed
@@ -698,7 +753,9 @@ def _stream_video_chunks(
             args=chunk_args,
             device_id=device_id,
             debug=debug,
-            runner_cache=runner_cache
+            runner_cache=runner_cache,
+            save_batches_path=save_batches_path,
+            fps=fps
         )
         
         # Remove context frames from output
@@ -745,7 +802,8 @@ def save_frames_to_video(
     Save frames tensor to MP4 video file.
     
     Converts tensor from Float32 [0,1] to uint8 [0,255], RGB to BGR for OpenCV,
-    and writes to video file using mp4v codec. Supports streaming mode where
+    and writes to video file using H.264 codec (avc1) for browser compatibility.
+    Falls back to mp4v if H.264 is unavailable. Supports streaming mode where
     an existing writer is passed and kept open for subsequent chunks.
     
     Args:
@@ -769,8 +827,15 @@ def save_frames_to_video(
         if video_backend == "ffmpeg":
             writer = FFMPEGVideoWriter(output_path, W, H, fps, use_10bit)
         else:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            # Try H.264 (avc1) for better browser compatibility, fallback to mp4v
+            fourcc = cv2.VideoWriter_fourcc(*'avc1')
             writer = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
+            if not writer.isOpened():
+                # Release failed writer and fallback to mp4v
+                writer.release()
+                debug.log("H.264 encoder not available, falling back to mp4v", level="WARNING", category="file", force=True)
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                writer = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
         if not writer.isOpened():
             raise ValueError(f"Cannot create video writer for: {output_path}")
     
@@ -833,7 +898,9 @@ def _process_frames_core(
     args: argparse.Namespace,
     device_id: str,
     debug: Debug,
-    runner_cache: Optional[Dict[str, Any]] = None
+    runner_cache: Optional[Dict[str, Any]] = None,
+    save_batches_path: Optional[str] = None,
+    fps: float = 30.0
 ) -> torch.Tensor:
     """
     Core frame processing logic shared between worker and direct processing.
@@ -847,6 +914,8 @@ def _process_frames_core(
         device_id: Device ID for inference ("0", "1", etc.)
         debug: Debug instance for logging
         runner_cache: Optional cache dict for model reuse (direct mode only)
+        save_batches_path: If provided with args.save_batches, save each batch as separate video
+        fps: FPS for batch output videos (default: 30.0)
     
     Returns:
         Upscaled frames tensor [T', H', W', C], Float32, range [0,1]
@@ -915,7 +984,7 @@ def _process_frames_core(
     
     runner, cache_context = prepare_runner(
         dit_model=args.dit_model,
-        vae_model=DEFAULT_VAE,
+        vae_model=args.vae_model,
         model_dir=model_dir,
         debug=debug,
         ctx=ctx,
@@ -948,6 +1017,11 @@ def _process_frames_core(
     ctx['text_embeds'] = load_text_embeddings(script_directory, ctx['dit_device'], ctx['compute_dtype'], debug)
     debug.log("Loaded text embeddings for DiT", category="dit")
     
+    # Apply input downscale preprocessing if requested
+    input_downscale = getattr(args, 'input_downscale', 1.0)
+    if input_downscale > 1.0:
+        frames_tensor = _apply_input_downscale(frames_tensor, input_downscale, debug)
+    
     # Compute generation info and log start (handles prepending internally)
     frames_tensor, gen_info = compute_generation_info(
         ctx=ctx,
@@ -978,18 +1052,39 @@ def _process_frames_core(
         color_correction=args.color_correction
     )
     
+    # Parse dit_tiles if provided
+    dit_tiles = None
+    if getattr(args, 'dit_tiles', None):
+        try:
+            parts = args.dit_tiles.replace('x', ',').split(',')
+            dit_tiles = (int(parts[0].strip()), int(parts[1].strip()))
+            if dit_tiles[0] < 1 or dit_tiles[1] < 1:
+                raise ValueError("Tile counts must be >= 1")
+        except (ValueError, IndexError) as e:
+            debug.log(f"Invalid --dit_tiles format '{args.dit_tiles}': {e}. Expected format: '2,2' or '2x2'", 
+                     level="ERROR", category="dit", force=True)
+            dit_tiles = None
+    
     # Phase 2: Upscale
     ctx = upscale_all_batches(
         runner, ctx=ctx, debug=debug, progress_callback=None,
         seed=args.seed,
         latent_noise_scale=args.latent_noise_scale,
-        cache_model=cache_dit
+        cache_model=cache_dit,
+        shared_noise=getattr(args, 'shared_noise', False),
+        dit_tiles=dit_tiles,
+        dit_tile_overlap=getattr(args, 'dit_tile_overlap', 0.25)
     )
     
     # Phase 3: Decode
     ctx = decode_all_batches(
         runner, ctx=ctx, debug=debug, progress_callback=None,
-        cache_model=cache_vae
+        cache_model=cache_vae,
+        save_batches=getattr(args, 'save_batches', False),
+        save_batches_path=save_batches_path,
+        save_batches_fps=fps,
+        video_backend=getattr(args, 'video_backend', 'opencv'),
+        use_10bit=getattr(args, 'use_10bit', False)
     )
     
     # Phase 4: Post-process
@@ -1364,6 +1459,8 @@ Examples:
     model_group.add_argument("--dit_model", type=str, default=DEFAULT_DIT,
                         choices=get_available_dit_models(),
                         help="DiT model to use. Options: 3B (fp16/fp8/GGUF) or 7B (fp16/fp8/GGUF). Default: 3B FP8")
+    model_group.add_argument("--vae_model", type=str, default=DEFAULT_VAE,
+                        help="VAE model to use. Default: ema_vae_fp16.safetensors")
     
     # Processing Parameters
     process_group = parser.add_argument_group('Processing parameters')
@@ -1387,6 +1484,10 @@ Examples:
     process_group.add_argument("--chunk_size", type=int, default=0,
                         help="Frames per chunk for streaming mode. When > 0, processes video in "
                              "memory-bounded chunks of N frames. 0 = load all frames at once (default: 0)")
+    process_group.add_argument("--save_batches", action="store_true",
+                        help="Save each batch as a separate video file alongside the final output. "
+                             "Files are named <output>_batch_001.mp4, _batch_002.mp4, etc. "
+                             "Batches are determined by --batch_size")
     process_group.add_argument("--prepend_frames", type=int, default=0,
                         help="Prepend N reversed frames to reduce start artifacts (auto-removed). Default: 0")
     process_group.add_argument("--temporal_overlap", type=int, default=0,
@@ -1401,8 +1502,15 @@ Examples:
                     "'none' (disabled) (default: lab)")
     quality_group.add_argument("--input_noise_scale", type=float, default=0.0,
                         help="Input noise injection scale (0.0-1.0). Adds variation to input images (default: 0.0)")
+    quality_group.add_argument("--input_downscale", type=float, default=1.0,
+                        help="Downscale input by factor X and resize back before processing. "
+                             "Reduces high-frequency noise/artifacts in input. 1.0 = disabled (default: 1.0), "
+                             "2.0 = downscale by 2x then upscale back")
     quality_group.add_argument("--latent_noise_scale", type=float, default=0.0,
                         help="Latent noise injection scale (0.0-1.0). Adds variation to latent space (default: 0.0)")
+    quality_group.add_argument("--shared_noise", action="store_true",
+                        help="Use the same spatial noise pattern for all temporal frames during diffusion. "
+                             "May reduce frame-to-frame flickering but could cause visible static grain pattern")
     
     # Device Management
     device_group = parser.add_argument_group('Device management')
@@ -1442,6 +1550,17 @@ Examples:
                         help="VAE decode tile overlap in pixels (default: 128). Reduces visible seams between tiles. Only used if --vae_decode_tiled is set")
     vae_group.add_argument("--tile_debug", type=str, default="false", choices=["false", "encode", "decode"],
                         help="Visualize tiles: 'false' (default), 'encode', or 'decode'")
+    
+    # DiT Tiling (for memory reduction during upscaling)
+    dit_tile_group = parser.add_argument_group('DiT tiling (for memory reduction during upscaling)')
+    dit_tile_group.add_argument("--dit_tiles", type=str, default=None,
+                        help="Split latent into NxM tiles for DiT processing (e.g., '2,2' for 2x2 tiles). "
+                             "Reduces VRAM but increases processing time. Tiles have minimum 25%% overlap "
+                             "and sizes are adjusted to be divisible by 4. Default: disabled (no tiling)")
+    dit_tile_group.add_argument("--dit_tile_overlap", type=float, default=0.25,
+                        help="Minimum overlap ratio between DiT tiles (0.0-0.5). Default: 0.25 (25%%). "
+                             "Higher values reduce seam artifacts but increase computation. "
+                             "Only used when --dit_tiles is set")
     
     # Performance
     perf_group = parser.add_argument_group('Performance optimization')
@@ -1580,7 +1699,7 @@ def main() -> None:
             debug.log(f"Using devices: {device_list}", category="device")
         
         # Download models once before processing
-        if not download_weight(dit_model=args.dit_model, vae_model=DEFAULT_VAE, model_dir=args.model_dir, debug=debug):
+        if not download_weight(dit_model=args.dit_model, vae_model=args.vae_model, model_dir=args.model_dir, debug=debug):
             debug.log("Failed to download required models. Check console output above.", level="ERROR", category="download", force=True)
             sys.exit(1)
         

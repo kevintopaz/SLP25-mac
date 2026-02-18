@@ -168,6 +168,9 @@ def download_weight(dit_model: str, vae_model: str, model_dir: Optional[str] = N
     cache_dir = model_dir or get_base_cache_dir()
     os.makedirs(cache_dir, exist_ok=True)
     
+    # Track if user specified a custom model_dir (skip validation for files there)
+    user_specified_dir = model_dir is not None
+    
     files_to_download = [
         (dit_model, MODEL_REGISTRY.get(dit_model)),
         (vae_model, MODEL_REGISTRY.get(vae_model))
@@ -175,6 +178,13 @@ def download_weight(dit_model: str, vae_model: str, model_dir: Optional[str] = N
     
     for filename, model_info in files_to_download:
         if not model_info:
+            # Check if file exists in user-specified model_dir
+            if user_specified_dir:
+                user_filepath = os.path.join(cache_dir, filename)
+                if os.path.exists(user_filepath):
+                    if debug:
+                        debug.log(f"{filename} found in custom model_dir, using as-is", category="setup", force=True)
+                    continue
             if debug:
                 debug.log(f"{filename} not in registry, skipping validation", 
                          level="WARNING", category="setup")
@@ -182,6 +192,14 @@ def download_weight(dit_model: str, vae_model: str, model_dir: Optional[str] = N
         
         # Get model type for logging
         model_type = "VAE" if model_info.category == "vae" else "DiT"
+        
+        # Check if file exists in user-specified model_dir first (skip validation for custom models)
+        if user_specified_dir:
+            user_filepath = os.path.join(cache_dir, filename)
+            if os.path.exists(user_filepath):
+                if debug:
+                    debug.log(f"{model_type} model found in custom model_dir: {user_filepath}", category="setup", force=True)
+                continue
         
         # Check if file exists in any registered path first
         existing_filepath = find_model_file(filename, fallback_dir=cache_dir)

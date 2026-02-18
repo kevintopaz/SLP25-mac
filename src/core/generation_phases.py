@@ -25,6 +25,8 @@ Key Features:
 
 import os
 import torch
+import numpy as np
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Callable
 
 from .generation_utils import (
@@ -59,6 +61,7 @@ from ..optimization.performance import (
 )
 from ..utils.color_fix import (
     lab_color_transfer,
+    lab_reinhard_transfer,
     wavelet_adaptive_color_correction,
     hsv_saturation_histogram_match, 
     wavelet_reconstruction,
@@ -539,6 +542,178 @@ def encode_all_batches(
     return ctx
 
 
+def _compute_dit_tile_params(
+    latent_shape: Tuple[int, int, int, int],
+    tiles: Tuple[int, int],
+    min_overlap: float = 0.25,
+    debug: Optional['Debug'] = None
+) -> Tuple[List[Tuple[int, int, int, int]], Tuple[int, int], Tuple[int, int]]:
+    """
+    Compute tile positions and sizes for tiled DiT processing.
+    
+    Latent shape is [T, H, W, C]. We tile spatially (H, W dimensions).
+    Tile sizes are adjusted to be divisible by 4 for DiT compatibility.
+    
+    Args:
+        latent_shape: Shape of latent tensor [T, H, W, C]
+        tiles: (rows, cols) number of tiles in each dimension
+        min_overlap: Minimum overlap ratio (0.0-0.5), default 0.25
+        debug: Debug instance for logging
+        
+    Returns:
+        Tuple containing:
+            - tiles_info: List of (y_start, x_start, tile_h, tile_w) for each tile
+            - tile_size: (tile_h, tile_w) computed tile sizes
+            - overlap_size: (overlap_h, overlap_w) overlap sizes
+    """
+    T, H, W, C = latent_shape
+    tile_rows, tile_cols = tiles
+    
+    # Ensure overlap is between 0.0 and 0.5
+    min_overlap = max(0.0, min(0.5, min_overlap))
+    
+    # Compute base tile sizes (before overlap)
+    base_tile_h = H // tile_rows
+    base_tile_w = W // tile_cols
+    
+    # Compute overlap sizes (minimum 25% of tile)
+    overlap_h = max(4, int(base_tile_h * min_overlap))
+    overlap_w = max(4, int(base_tile_w * min_overlap))
+    
+    # Compute effective tile sizes with overlap
+    # tile_size = base_tile + overlap (shared with adjacent tile)
+    tile_h = base_tile_h + overlap_h
+    tile_w = base_tile_w + overlap_w
+    
+    # Ensure tile sizes are divisible by 4
+    tile_h = (tile_h + 3) // 4 * 4
+    tile_w = (tile_w + 3) // 4 * 4
+    
+    # Ensure we don't exceed latent size
+    tile_h = min(tile_h, H)
+    tile_w = min(tile_w, W)
+    
+    # Compute stride (step between tile starts)
+    stride_h = tile_h - ((tile_h * tile_rows - H) // (tile_rows - 1))
+    stride_w = tile_w - ((tile_w * tile_cols - W) // (tile_cols - 1))
+    
+    # Generate tile positions
+    tiles_info = []
+    for row in range(tile_rows):
+        for col in range(tile_cols):
+            y_start = min(row * stride_h, max(0, H - tile_h))
+            x_start = min(col * stride_w, max(0, W - tile_w))
+            tiles_info.append((y_start, x_start, tile_h, tile_w))
+    
+    if debug:
+        debug.log(f"DiT tiling: {len(tiles_info)} tiles, size=({tile_h}x{tile_w}), "
+                 f"overlap=({overlap_h}x{overlap_w}), stride=({stride_h}x{stride_w}), full size=({H}x{W})",
+                 category="dit", force=True, indent_level=1)
+    
+    return tiles_info
+
+
+def _tiled_dit_inference(
+    runner: 'VideoDiffusionInfer',
+    latent: torch.Tensor,
+    noises: List[torch.Tensor],
+    conditions: List[torch.Tensor],
+    text_embeds: Dict[str, Any],
+    ctx: Dict[str, Any],
+    dit_tiles: Tuple[int, int],
+    dit_tile_overlap: float,
+    debug: Optional['Debug'] = None
+) -> List[torch.Tensor]:
+    """
+    Perform tiled DiT inference to reduce VRAM usage.
+    
+    Splits latent, noise, and conditions into overlapping tiles, processes each
+    through the DiT model, and merges results with cosine-weighted blending.
+    
+    Args:
+        runner: VideoDiffusionInfer instance with loaded DiT model
+        latent: Input latent tensor [T, H, W, C]
+        noises: List of noise tensors
+        conditions: List of condition tensors
+        text_embeds: Text embedding dictionary
+        ctx: Generation context
+        dit_tiles: (rows, cols) number of tiles
+        dit_tile_overlap: Minimum overlap ratio (0.0-0.5)
+        debug: Debug instance for logging
+        
+    Returns:
+        List containing single merged upscaled latent tensor
+    """
+    T, H, W, C = latent.shape
+    
+    # Compute tile parameters
+    tiles_info = _compute_dit_tile_params(
+        latent.shape, dit_tiles, dit_tile_overlap, debug
+    )
+    
+    if len(tiles_info) <= 1:
+        # Only one tile - no need for tiling, process directly
+        if debug:
+            debug.log("Latent too small for tiling, processing full latent", category="dit", indent_level=1)
+        return runner.inference(noises=noises, conditions=conditions, **text_embeds)
+    
+    # Initialize output accumulator and count for simple averaging
+    device = latent.device
+    dtype = latent.dtype
+    
+    # Accumulate on offload device if available, else on inference device
+    accum_device = ctx.get('tensor_offload_device') or device
+    
+    result = torch.zeros((T, H, W, C), device=accum_device, dtype=dtype)
+    count = torch.zeros((1, H, W, 1), device=accum_device, dtype=dtype)
+    
+    num_tiles = len(tiles_info)
+    
+    for tile_idx, (y_start, x_start, tile_h_actual, tile_w_actual) in enumerate(tiles_info):
+        if debug:
+            debug.log(f"Processing tile {tile_idx + 1}/{num_tiles}: pos=({y_start}, {x_start}), "
+                     f"size=({tile_h_actual}x{tile_w_actual})", category="dit", force=True, indent_level=1)
+        
+        # Extract tile from latent, noise, and conditions
+        tile_noises = [n[:, y_start:y_start + tile_h_actual, x_start:x_start + tile_w_actual, :] for n in noises]
+        tile_conditions = [c[:, y_start:y_start + tile_h_actual, x_start:x_start + tile_w_actual, :] for c in conditions]
+        
+        # Run inference on tile
+        with torch.no_grad():
+            tile_result = runner.inference(
+                noises=tile_noises,
+                conditions=tile_conditions,
+                **text_embeds
+            )
+        
+        tile_upscaled = tile_result[0]  # [T, tile_h, tile_w, C]
+        
+        # Move to accumulator device if different
+        if accum_device != device:
+            tile_upscaled = tile_upscaled.to(accum_device)
+        
+        # Simple accumulation - sum tiles and increment count
+        result[:, y_start:y_start + tile_h_actual, x_start:x_start + tile_w_actual, :] += tile_upscaled
+        count[:, y_start:y_start + tile_h_actual, x_start:x_start + tile_w_actual, :] += 1
+        
+        # Cleanup tile tensors
+        del tile_noises, tile_conditions, tile_result, tile_upscaled
+    
+    # Normalize by count (simple averaging)
+    result = result / count.clamp(min=1)
+    
+    # Move result back to inference device if needed
+    if result.device != device:
+        result = result.to(device)
+    
+    del count
+    
+    if debug:
+        debug.log(f"Tiled DiT inference complete: merged {num_tiles} tiles by averaging", category="dit", indent_level=1)
+    
+    return [result]
+
+
 def upscale_all_batches(
     runner: 'VideoDiffusionInfer',
     ctx: Dict[str, Any],
@@ -546,7 +721,10 @@ def upscale_all_batches(
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
     seed: int = 42,
     latent_noise_scale: float = 0.0,
-    cache_model: bool = False
+    cache_model: bool = False,
+    shared_noise: bool = False,
+    dit_tiles: Optional[Tuple[int, int]] = None,
+    dit_tile_overlap: float = 0.25
 ) -> Dict[str, Any]:
     """
     Phase 2: DiT Upscaling for all encoded batches.
@@ -565,6 +743,12 @@ def upscale_all_batches(
                            but may help with certain artifacts. 0.0 = no noise (crisp),
                            1.0 = maximum noise (softer)
         cache_model: If True, keep DiT model for reuse instead of deleting it
+        shared_noise: If True, use the same spatial noise pattern for all temporal frames.
+                     This may reduce frame-to-frame flickering but could cause static grain.
+        dit_tiles: Optional tuple (rows, cols) for tiled DiT processing. E.g., (2, 2) splits
+                  latent into 2x2 tiles with overlap. None = disabled (process full latent).
+        dit_tile_overlap: Minimum overlap ratio between tiles (0.0-0.5). Default: 0.25 (25%).
+                         Higher values reduce seam artifacts but increase computation.
         
     Returns:
         dict: Updated context containing:
@@ -677,10 +861,23 @@ def upscale_all_batches(
             )
 
             # Generate noise (randn_like automatically uses latent's device)
-            base_noise = torch.randn_like(latent, dtype=ctx['compute_dtype'])
+            # latent shape is [T, H, W, C] where T is temporal frames
+            if shared_noise and latent.shape[0] > 1:
+                # Use same spatial noise pattern for all temporal frames to reduce flickering
+                single_frame_noise = torch.randn(1, *latent.shape[1:], device=latent.device, dtype=ctx['compute_dtype'])
+                base_noise = single_frame_noise.expand(latent.shape[0], -1, -1, -1).contiguous()
+                single_aug_noise = torch.randn(1, *latent.shape[1:], device=latent.device, dtype=ctx['compute_dtype'])
+                aug_noise_expansion = single_aug_noise.expand(latent.shape[0], -1, -1, -1).contiguous()
+                debug.log(f"Using shared noise across {latent.shape[0]} temporal frames", category="generation", indent_level=1)
+                del single_frame_noise, single_aug_noise
+            else:
+                # Independent noise per frame (default behavior)
+                base_noise = torch.randn_like(latent, dtype=ctx['compute_dtype'])
+                aug_noise_expansion = torch.randn_like(base_noise)
             
             noises = [base_noise]
-            aug_noises = [base_noise * 0.1 + torch.randn_like(base_noise) * 0.05]
+            aug_noises = [base_noise * 0.1 + aug_noise_expansion * 0.05]
+            del aug_noise_expansion
             
             # Log latent noise application if enabled
             if latent_noise_scale > 0:
@@ -715,19 +912,48 @@ def upscale_all_batches(
             # Skip autocast on MPS (CompatibleDiT already handles dtype conversion)
             debug.start_timer(f"dit_inference_{upscale_idx+1}")
             with torch.no_grad():
-                if dit_dtype != ctx['compute_dtype'] and ctx['dit_device'].type != 'mps':
-                    with torch.autocast(ctx['dit_device'].type, ctx['compute_dtype'], enabled=True):
+                if dit_tiles is not None:
+                    # Tiled DiT processing for memory reduction
+                    if dit_dtype != ctx['compute_dtype'] and ctx['dit_device'].type != 'mps':
+                        with torch.autocast(ctx['dit_device'].type, ctx['compute_dtype'], enabled=True):
+                            upscaled_latents = _tiled_dit_inference(
+                                runner=runner,
+                                latent=latent,
+                                noises=noises,
+                                conditions=conditions,
+                                text_embeds=ctx['text_embeds'],
+                                ctx=ctx,
+                                dit_tiles=dit_tiles,
+                                dit_tile_overlap=dit_tile_overlap,
+                                debug=debug
+                            )
+                    else:
+                        upscaled_latents = _tiled_dit_inference(
+                            runner=runner,
+                            latent=latent,
+                            noises=noises,
+                            conditions=conditions,
+                            text_embeds=ctx['text_embeds'],
+                            ctx=ctx,
+                            dit_tiles=dit_tiles,
+                            dit_tile_overlap=dit_tile_overlap,
+                            debug=debug
+                        )
+                else:
+                    # Standard full-latent inference
+                    if dit_dtype != ctx['compute_dtype'] and ctx['dit_device'].type != 'mps':
+                        with torch.autocast(ctx['dit_device'].type, ctx['compute_dtype'], enabled=True):
+                            upscaled_latents = runner.inference(
+                                noises=noises,
+                                conditions=conditions,
+                                **ctx['text_embeds'],
+                            )
+                    else:
                         upscaled_latents = runner.inference(
                             noises=noises,
                             conditions=conditions,
                             **ctx['text_embeds'],
                         )
-                else:
-                    upscaled_latents = runner.inference(
-                        noises=noises,
-                        conditions=conditions,
-                        **ctx['text_embeds'],
-                    )
             debug.end_timer(f"dit_inference_{upscale_idx+1}", f"DiT inference {upscale_idx+1}")
             
             # Offload upscaled latents to avoid VRAM accumulation
@@ -804,12 +1030,109 @@ def upscale_all_batches(
     return ctx
 
 
+def _save_batch_video(
+    batch_tensor: torch.Tensor,
+    batch_idx: int,
+    save_batches_path: str,
+    fps: float = 30.0,
+    video_backend: str = "opencv",
+    use_10bit: bool = False,
+    debug: Optional['Debug'] = None
+) -> None:
+    """
+    Save a single decoded batch as a video file.
+    
+    Args:
+        batch_tensor: Decoded frames tensor [T, H, W, C] in [-1, 1] range
+        batch_idx: Batch index for filename (1-based)
+        save_batches_path: Base output path (e.g., "output.mp4" -> "output_batch_001.mp4")
+        fps: Output video FPS
+        video_backend: Video backend ("opencv" or "ffmpeg")
+        use_10bit: Use 10-bit color depth
+        debug: Debug instance for logging
+    """
+    import cv2
+    
+    # Build output path: output.mp4 -> output_batch_001.mp4
+    base_path = Path(save_batches_path)
+    batch_output_path = str(base_path.parent / f"{base_path.stem}_batch_{batch_idx:03d}{base_path.suffix}")
+    
+    # Normalize from [-1, 1] to [0, 1], then to [0, 255]
+    batch_normalized = batch_tensor.clone()
+    batch_normalized.clamp_(-1, 1).mul_(0.5).add_(0.5)
+    frames_np = (batch_normalized.float().cpu().numpy() * 255.0).astype(np.uint8)
+    del batch_normalized
+    
+    T, H, W, C = frames_np.shape
+    
+    # Create output directory if needed
+    os.makedirs(Path(batch_output_path).parent, exist_ok=True)
+    
+    if video_backend == "ffmpeg":
+        import subprocess
+        import shutil
+        
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path is None:
+            if debug:
+                debug.log(f"ffmpeg not found, falling back to opencv for batch {batch_idx}", 
+                         level="WARNING", category="file", indent_level=1)
+            video_backend = "opencv"
+    
+    if video_backend == "ffmpeg":
+        # Use ffmpeg for better quality
+        pix_fmt = "yuv420p10le" if use_10bit else "yuv420p"
+        cmd = [
+            ffmpeg_path, "-y",
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-s", f"{W}x{H}",
+            "-pix_fmt", "rgb24",
+            "-r", str(fps),
+            "-i", "-",
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "18",
+            "-pix_fmt", pix_fmt,
+            batch_output_path
+        ]
+        
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        for frame in frames_np:
+            proc.stdin.write(frame[:, :, :3].tobytes())  # RGB only
+        proc.stdin.close()
+        proc.wait()
+    else:
+        # Use OpenCV
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')
+        writer = cv2.VideoWriter(batch_output_path, fourcc, fps, (W, H))
+        
+        if not writer.isOpened():
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(batch_output_path, fourcc, fps, (W, H))
+        
+        for frame in frames_np:
+            frame_bgr = cv2.cvtColor(frame[:, :, :3], cv2.COLOR_RGB2BGR)
+            writer.write(frame_bgr)
+        
+        writer.release()
+    
+    if debug:
+        debug.log(f"Saved batch {batch_idx}: {batch_output_path} ({T} frames)", 
+                 category="file", force=True)
+
+
 def decode_all_batches(
     runner: 'VideoDiffusionInfer',
     ctx: Dict[str, Any],
     debug: 'Debug',
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
-    cache_model: bool = False
+    cache_model: bool = False,
+    save_batches: bool = False,
+    save_batches_path: Optional[str] = None,
+    save_batches_fps: float = 30.0,
+    video_backend: str = "opencv",
+    use_10bit: bool = False
 ) -> Dict[str, Any]:
     """
     Phase 3: VAE Decoding.
@@ -826,6 +1149,11 @@ def decode_all_batches(
         debug: Debug instance for logging (required)
         progress_callback: Optional callback(current, total, frames, phase_name)
         cache_model: If True, keep VAE model for reuse instead of deleting it
+        save_batches: If True, save each decoded batch as a separate video file
+        save_batches_path: Base path for batch output files (e.g., "output.mp4" -> "output_batch_001.mp4")
+        save_batches_fps: FPS for batch output videos (default: 30.0)
+        video_backend: Video backend for saving ("opencv" or "ffmpeg")
+        use_10bit: Use 10-bit color depth for output
         
     Returns:
         dict: Updated context containing:
@@ -1022,6 +1350,18 @@ def decode_all_batches(
             
             debug.log(f"Wrote {batch_frames} frames to positions {write_start}-{write_end}", 
                      category="video", indent_level=1)
+            
+            # Save individual batch if enabled
+            if save_batches and save_batches_path:
+                _save_batch_video(
+                    batch_tensor=ctx['final_video'][write_start:write_end].clone(),
+                    batch_idx=decode_idx + 1,
+                    save_batches_path=save_batches_path,
+                    fps=save_batches_fps,
+                    video_backend=video_backend,
+                    use_10bit=use_10bit,
+                    debug=debug
+                )
             
             # Free memory immediately - no batch_samples storage
             release_tensor_memory(ctx['all_upscaled_latents'][batch_idx])
@@ -1301,6 +1641,9 @@ def postprocess_all_batches(
                 if color_correction == "lab":
                     debug.log("Applying LAB perceptual color transfer", category="video", force=True, indent_level=1)
                     sample = lab_color_transfer(sample, input_video, debug, luminance_weight=0.8)
+                elif color_correction == "lab_reinhard":
+                    debug.log("Applying Reinhard LAB mean-std color transfer", category="video", force=True, indent_level=1)
+                    sample = lab_reinhard_transfer(sample, input_video, debug)
                 elif color_correction == "wavelet_adaptive":
                     debug.log("Applying wavelet with adaptive saturation correction", category="video", force=True, indent_level=1)
                     sample = wavelet_adaptive_color_correction(sample, input_video, debug)

@@ -7,6 +7,7 @@ while transferring color distributions.
 
 Available Methods:
 - lab: Full perceptual color matching with optional detail preservation (recommended)
+- lab_reinhard: Reinhard mean-std LAB transfer (mean-shift L, mean-std A/B)
 - wavelet: Frequency-based color transfer preserving high-frequency details
 - wavelet_adaptive: Wavelet with targeted saturation correction
 - hsv: Hue-conditional saturation histogram matching
@@ -361,6 +362,107 @@ def lab_color_transfer(
         result = result.to(original_dtype)
     
     debug.log(f"LAB color transfer completed (luminance_weight={luminance_weight})", category="video", indent_level=1)
+    
+    return result
+
+
+def lab_reinhard_transfer(
+    content_feat: Tensor,
+    style_feat: Tensor,
+    debug,
+) -> Tensor:
+    """
+    Reinhard-style LAB mean-std color transfer using OpenCV.
+    
+    Based on Reinhardt et al. "Color Transfer between Images" and the
+    VideoDiffusion creative pipeline's reinhard_color_transfer.
+    
+    Algorithm:
+        - L channel: mean-shift only (preserves luminance contrast/detail)
+        - A, B channels: full mean-std normalization (transfers chrominance)
+    
+    This is lighter-weight than the histogram-matching lab_color_transfer
+    and avoids wavelet pre-processing, making it fast and predictable.
+    
+    Args:
+        content_feat: Target tensor [B, C, H, W] in [-1, 1] with upscaled details
+        style_feat: Source tensor [B, C, H, W] in [-1, 1] with original colors
+        debug: Debug instance for logging
+        
+    Returns:
+        Color-corrected tensor [B, C, H, W] in [-1, 1]
+    """
+    import cv2
+    import numpy as np
+    
+    # Handle spatial dimension mismatch
+    if content_feat.shape != style_feat.shape:
+        if debug:
+            debug.log(
+                f"Reinhard LAB: Resizing style {style_feat.shape} to match content {content_feat.shape}",
+                level="WARNING", category="precision", force=True
+            )
+        style_feat = safe_interpolate_operation(
+            style_feat,
+            size=content_feat.shape[-2:],
+            mode='bilinear',
+            align_corners=False
+        )
+    
+    original_device = content_feat.device
+    original_dtype = content_feat.dtype
+    
+    # Convert from [-1, 1] to [0, 255] uint8, [B, C, H, W] -> numpy [B, H, W, C] RGB
+    content_np = content_feat.float().add(1.0).mul_(127.5).clamp_(0, 255).byte()
+    content_np = content_np.permute(0, 2, 3, 1).cpu().numpy()
+    
+    style_np = style_feat.float().add(1.0).mul_(127.5).clamp_(0, 255).byte()
+    style_np = style_np.permute(0, 2, 3, 1).cpu().numpy()
+    
+    del content_feat, style_feat
+    
+    # Process each frame
+    results = []
+    for b in range(content_np.shape[0]):
+        source = content_np[b]      # [H, W, 3] RGB uint8
+        reference = style_np[b]     # [H, W, 3] RGB uint8
+        
+        source_lab = cv2.cvtColor(source, cv2.COLOR_RGB2LAB).astype(np.float32)
+        reference_lab = cv2.cvtColor(reference, cv2.COLOR_RGB2LAB).astype(np.float32)
+        
+        result_lab = np.empty_like(source_lab)
+        
+        for i, channel in enumerate(['L', 'A', 'B']):
+            src_mean = source_lab[:, :, i].mean()
+            src_std = source_lab[:, :, i].std()
+            ref_mean = reference_lab[:, :, i].mean()
+            ref_std = reference_lab[:, :, i].std()
+            
+            if src_std > 0:
+                if channel == 'L':
+                    # L channel: mean-shift only — preserves luminance contrast
+                    result_lab[:, :, i] = (source_lab[:, :, i] - src_mean) + ref_mean
+                else:
+                    # A, B channels: full mean-std normalization
+                    result_lab[:, :, i] = ((source_lab[:, :, i] - src_mean) / src_std) * ref_std + ref_mean
+            else:
+                result_lab[:, :, i] = source_lab[:, :, i]
+        
+        result_lab = np.clip(result_lab, 0, 255).astype(np.uint8)
+        result_rgb = cv2.cvtColor(result_lab, cv2.COLOR_LAB2RGB)
+        results.append(result_rgb)
+    
+    del content_np, style_np
+    
+    # Convert back to tensor [B, C, H, W] in [-1, 1]
+    result = np.stack(results, axis=0)  # [B, H, W, 3]
+    del results
+    result = torch.from_numpy(result).permute(0, 3, 1, 2).float()  # [B, C, H, W]
+    result = result.div_(127.5).sub_(1.0)  # [0, 255] -> [-1, 1]
+    result = result.to(device=original_device, dtype=original_dtype)
+    
+    if debug:
+        debug.log("Reinhard LAB color transfer completed", category="video", indent_level=1)
     
     return result
 
