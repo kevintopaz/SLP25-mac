@@ -21,6 +21,11 @@ seedvr2.py
 src/core/isolated_generation.py
 src/core/subprocess_runner.py
 models/video_vae_v3_mine_bad/
+/models/
+/magnific_batch_test/
 src/processing/
 TILE_VAE*
 .DS_Store
+
+#Ignore cursor AI rules
+.cursor/rules/codacy.mdc
