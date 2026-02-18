@@ -31,11 +31,21 @@ except Exception as e:
 
 def load_config(path: str, argv: List[str] = None) -> Union[DictConfig, ListConfig]:
     """
-    Load a configuration. Will resolve inheritance.
+    Load a configuration from a YAML file. Will resolve inheritance.
     """
-    
-    #print(path)
     config = OmegaConf.load(path)
+    if argv is not None:
+        config_argv = OmegaConf.from_dotlist(argv)
+        config = OmegaConf.merge(config, config_argv)
+    config = resolve_recursive(config, resolve_inheritance)
+    return config
+
+
+def load_config_from_string(yaml_str: str, argv: List[str] = None) -> Union[DictConfig, ListConfig]:
+    """
+    Load a configuration from a YAML string. Will resolve inheritance.
+    """
+    config = OmegaConf.create(yaml_str)
     if argv is not None:
         config_argv = OmegaConf.from_dotlist(argv)
         config = OmegaConf.merge(config, config_argv)

@@ -32,7 +32,10 @@ DOWNLOAD_RETRY_DELAY = 2  # seconds
 
 def get_script_directory() -> str:
     """Get the root script directory path (3 levels up from this file)"""
-    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    file_path = __file__
+    if file_path and file_path.startswith('bytesio_zip:'):
+        file_path = file_path.replace('bytesio_zip:', '', 1)
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(file_path))))
 
 
 def get_base_cache_dir() -> str:

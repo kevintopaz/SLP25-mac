@@ -55,10 +55,13 @@ from typing import Dict, Any, Optional, Tuple, Union, Callable
 
 # Import SafeTensors with fallback
 try:
-    from safetensors.torch import load_file as load_safetensors_file
+    from safetensors.torch import load_file as load_safetensors_file, load as load_safetensors_bytes
     SAFETENSORS_AVAILABLE = True
 except ImportError:
     SAFETENSORS_AVAILABLE = False
+    load_safetensors_bytes = None
+
+from utils.getData import get_path_or_bytes
 
 from .infer import VideoDiffusionInfer
 from ..common.config import create_object
@@ -81,16 +84,17 @@ from ..utils.constants import get_script_directory, suppress_tensor_warnings
 script_directory = get_script_directory()
 
 
-def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch.device("cpu"),
+def load_quantized_state_dict(checkpoint_path: Union[str, bytes], device: torch.device = torch.device("cpu"),
                               debug: Optional['Debug'] = None) -> Dict[str, torch.Tensor]:
     """
     Load model state dict from checkpoint with support for multiple formats.
     
-    Handles .safetensors, .gguf, and .pth files. GGUF models support quantization
-    for memory-efficient loading. Validates required libraries are installed.
+    Handles .safetensors, .gguf, and .pth files. Also supports loading from bytes
+    (decrypted model data). GGUF models support quantization for memory-efficient loading.
+    Validates required libraries are installed.
     
     Args:
-        checkpoint_path: Path to checkpoint file
+        checkpoint_path: Path to checkpoint file (str) or decrypted bytes (bytes)
         device: Target device for tensor placement (torch.device object, defaults to CPU)
         debug: Optional Debug instance for logging
         
@@ -100,8 +104,29 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
     Notes:
         - SafeTensors files use optimized loading with direct device placement
         - PyTorch files use memory-mapped loading to reduce RAM usage
+        - Bytes input is assumed to be decrypted SafeTensors data
     """
     device_str = str(device)
+    
+    if isinstance(checkpoint_path, bytes):
+        if not SAFETENSORS_AVAILABLE or load_safetensors_bytes is None:
+            error_msg = "Cannot load from bytes: SafeTensors library is required"
+            if debug:
+                debug.log(error_msg, level="ERROR", category="dit", force=True)
+            raise ImportError(error_msg)
+        
+        try:
+            state = load_safetensors_bytes(checkpoint_path)
+            state = {k: v.to(device) for k, v in state.items()}
+        except RuntimeError as e:
+            if device.type == "mps" and any(k in str(e).lower() for k in ["watermark", "allocat", "memory"]):
+                if debug:
+                    debug.log("Using CPU intermediate loading for MPS compatibility", 
+                            category="info", indent_level=1)
+                state = load_safetensors_bytes(checkpoint_path)
+            else:
+                raise
+        return state
     
     if checkpoint_path.endswith('.safetensors'):
         if not SAFETENSORS_AVAILABLE:
@@ -568,6 +593,19 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     """
     model_type_lower = model_type.lower()
     
+    # Handle encrypted models
+    model_path_or_bytes = checkpoint_path
+    if isinstance(checkpoint_path, str) and checkpoint_path.endswith('.enc'):
+        try:
+            model_path_or_bytes = get_path_or_bytes(checkpoint_path)
+            if debug:
+                debug.log(f"Decrypted encrypted model: {os.path.basename(checkpoint_path)}", 
+                         category="info", indent_level=1)
+        except Exception as e:
+            if debug:
+                debug.log(f"Error decrypting model: {e}, proceeding with original path", 
+                         level="WARNING", category="info")
+    
     # Log loading action
     action = "Materializing" if used_meta else "Loading"
     target_device_str = str(target_device).upper()
@@ -576,7 +614,7 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     
     # Load state dict from file
     debug.start_timer(f"{model_type_lower}_weights_load")
-    state = load_quantized_state_dict(checkpoint_path, target_device, debug)
+    state = load_quantized_state_dict(model_path_or_bytes, target_device, debug)
     debug.end_timer(f"{model_type_lower}_weights_load", f"{model_type} weights loaded from file")
     
     # Apply dtype conversion if requested

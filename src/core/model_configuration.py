@@ -67,7 +67,10 @@ from .model_loader import (
 )
 from .infer import VideoDiffusionInfer
 from .model_cache import get_global_cache
-from ..common.config import load_config
+from ..common.config import load_config, load_config_from_string
+from ...configs_3b.main import CONFIG_YAML as CONFIG_3B_YAML
+from ...configs_7b.main import CONFIG_YAML as CONFIG_7B_YAML
+from ..models.video_vae_v3.vae_config import CONFIG_YAML as VAE_CONFIG_YAML
 from ..models.video_vae_v3.modules.causal_inflation_lib import InflatedCausalConv3d
 from ..optimization.compatibility import (
     CompatibleDiT,
@@ -715,10 +718,8 @@ def _create_new_runner(
              category="runner", force=True)
     
     debug.start_timer("config_load")
-    config_path = os.path.join(script_directory, 
-                              './configs_7b' if "7b" in dit_model else './configs_3b', 
-                              'main.yaml')
-    config = load_config(config_path)
+    config_yaml = CONFIG_7B_YAML if "7b" in dit_model else CONFIG_3B_YAML
+    config = load_config_from_string(config_yaml)
     debug.end_timer("config_load", "Config loading")
     
     debug.start_timer("runner_video_infer")
@@ -1114,9 +1115,7 @@ def _setup_vae_model(
     elif not hasattr(runner, 'vae') or runner.vae is None:
         # Create new VAE model
         # Configure VAE
-        vae_config_path = os.path.join(script_directory, 
-                                      'src/models/video_vae_v3/s8_c16_t4_inflation_sd3.yaml')
-        vae_config = load_config(vae_config_path)
+        vae_config = load_config_from_string(VAE_CONFIG_YAML)
         
         spatial_downsample_factor = vae_config.get('spatial_downsample_factor', 8)
         temporal_downsample_factor = vae_config.get('temporal_downsample_factor', 4)
