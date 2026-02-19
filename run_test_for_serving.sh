@@ -23,9 +23,9 @@
 # fi
 
 INPUT_FOLDER="./landscape_test"
-OUTPUT_FOLDER="./landscape_test_4k"
-OUTPUT_WIDTH="3840"
-OUTPUT_HEIGHT="2160"
+OUTPUT_FOLDER="./landscape_test_2k_threadedcolor_cpuusm"
+OUTPUT_WIDTH="1920"
+OUTPUT_HEIGHT="1080"
 
 # Validate input folder
 if [ ! -d "$INPUT_FOLDER" ]; then

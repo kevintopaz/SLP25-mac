@@ -21,6 +21,8 @@ from torch.nn import functional as F
 from typing import Optional
 from torchvision.transforms import ToTensor, ToPILImage
 from ..common.half_precision_fixes import safe_pad_operation, safe_interpolate_operation, ensure_float32_precision
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def adain_color_fix(target: Image.Image, source: Image.Image) -> Image.Image:
@@ -421,12 +423,9 @@ def lab_reinhard_transfer(
     
     del content_feat, style_feat
     
-    # Process each frame
-    results = []
-    for b in range(content_np.shape[0]):
-        source = content_np[b]      # [H, W, 3] RGB uint8
-        reference = style_np[b]     # [H, W, 3] RGB uint8
-        
+    # Per-frame Reinhard transfer (CPU-bound) — parallelize with threads
+    def _reinhard_single_frame(args):
+        idx, source, reference = args
         source_lab = cv2.cvtColor(source, cv2.COLOR_RGB2LAB).astype(np.float32)
         reference_lab = cv2.cvtColor(reference, cv2.COLOR_RGB2LAB).astype(np.float32)
         
@@ -440,19 +439,28 @@ def lab_reinhard_transfer(
             
             if src_std > 0:
                 if channel == 'L':
-                    # L channel: mean-shift only — preserves luminance contrast
                     result_lab[:, :, i] = (source_lab[:, :, i] - src_mean) + ref_mean
                 else:
-                    # A, B channels: full mean-std normalization
                     result_lab[:, :, i] = ((source_lab[:, :, i] - src_mean) / src_std) * ref_std + ref_mean
             else:
                 result_lab[:, :, i] = source_lab[:, :, i]
         
         result_lab = np.clip(result_lab, 0, 255).astype(np.uint8)
-        result_rgb = cv2.cvtColor(result_lab, cv2.COLOR_LAB2RGB)
-        results.append(result_rgb)
+        return idx, cv2.cvtColor(result_lab, cv2.COLOR_LAB2RGB)
     
-    del content_np, style_np
+    from concurrent.futures import ThreadPoolExecutor
+    
+    frame_pairs = [(b, content_np[b], style_np[b]) for b in range(content_np.shape[0])]
+    max_workers = min(32, content_np.shape[0])
+    
+    print(f"Processing {len(frame_pairs)} frames in parallel using {max_workers} cores...", flush=True)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        raw_results = list(executor.map(_reinhard_single_frame, frame_pairs))
+    
+    raw_results.sort(key=lambda x: x[0])
+    results = [frame for _, frame in raw_results]
+    
+    del content_np, style_np, frame_pairs, raw_results
     
     # Convert back to tensor [B, C, H, W] in [-1, 1]
     result = np.stack(results, axis=0)  # [B, H, W, 3]
