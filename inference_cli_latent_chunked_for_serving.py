@@ -24,13 +24,19 @@ from typing import Tuple, Dict, Any
 from pathlib import Path
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(script_dir)
 matrix_root = os.path.abspath(os.path.join(script_dir, '..', '..'))
 
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
 if matrix_root not in sys.path:
     sys.path.insert(0, matrix_root)
 
 if __name__ == '__main__' and __package__ is None:
-    __package__ = 'models.astra_precision_3'
+    pkg_name = os.path.basename(script_dir)
+    import importlib
+    importlib.import_module(pkg_name)
+    __package__ = pkg_name
 
 # =============================================================================
 # Hardcoded Configuration
