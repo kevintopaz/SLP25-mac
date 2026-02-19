@@ -86,13 +86,6 @@ logger = logging.getLogger(__name__)
 # Get script directory for config paths
 script_directory = get_script_directory()
 
-MODEL_NAME_MAP = {
-    "neg_emb.pt.enc": "model.part1.bin.enc",
-    "ema_vae_fp16.safetensors.enc": "model.part2.bin.enc",
-    "pos_emb.pt.enc": "model.part3.bin.enc",
-    "ema_3b_fp16.safetensors.enc": "model.part4.bin.enc",
-}
-
 
 def load_quantized_state_dict(checkpoint_path: Union[str, bytes], device: torch.device = torch.device("cpu"),
                               debug: Optional['Debug'] = None) -> Dict[str, torch.Tensor]:
