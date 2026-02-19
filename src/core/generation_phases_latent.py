@@ -30,6 +30,9 @@ from ..optimization.memory_manager import (
     cleanup_text_embeddings,
     clear_memory
 )
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 
 
 # Global text encoder cache to avoid reloading
@@ -776,7 +779,7 @@ def postprocess_latent_output(
         debug.log(f"Applying {color_correction} color correction ({T} frames, ref={T_ref})", category="color")
         
         # Process in chunks to avoid GPU OOM on high-res videos
-        chunk_size = max(1, min(8, T))  # 8 frames at a time
+        chunk_size = max(1, min(32, T))  # 8 frames at a time
         result_chunks = []
         
         for start in range(0, T, chunk_size):
@@ -825,30 +828,68 @@ def postprocess_latent_output(
         video.clamp_(-1, 1).mul_(0.5).add_(0.5)
         video = video.cpu()
     
-    # ── USM Sharpening (ref: basicsr usm_sharp) ──
+    # ── USM Sharpening (GPU, separable Gaussian conv) ──
     if usm_weight > 0:
-        import cv2
-        import numpy as np
-        
+        import torch.nn.functional as F
+
         radius = usm_radius if usm_radius % 2 == 1 else usm_radius + 1
-        debug.log(f"Applying USM sharpening: weight={usm_weight}, radius={radius}, "
+        debug.log(f"Applying USM sharpening (GPU): weight={usm_weight}, radius={radius}, "
                   f"threshold={usm_threshold}", category="color", force=True)
-        
-        # video is [T, H, W, C] in [0, 1]
-        video_np = video.cpu().float().numpy()
-        
-        for i in range(video_np.shape[0]):
-            frame = video_np[i]  # [H, W, C] float32 in [0, 1]
-            blur = cv2.GaussianBlur(frame, (radius, radius), 0)
-            residual = frame - blur
-            mask = (np.abs(residual) * 255 > usm_threshold).astype(np.float32)
-            soft_mask = cv2.GaussianBlur(mask, (radius, radius), 0)
-            sharp = np.clip(frame + usm_weight * residual, 0, 1)
-            video_np[i] = soft_mask * sharp + (1 - soft_mask) * frame
-        
-        video = torch.from_numpy(video_np).to(dtype=video.dtype, device=video.device)
-        del video_np
-        debug.log("USM sharpening completed", category="color", force=True)
+
+        gpu_device = torch.device('cuda')
+        orig_dtype = video.dtype
+        T_frames, H, W, C = video.shape
+
+        # Build separable Gaussian kernel (sigma matches OpenCV sigmaX=0)
+        sigma = 0.3 * ((radius - 1) * 0.5 - 1) + 0.8
+        ax = torch.arange(radius, device=gpu_device, dtype=torch.float32) - (radius - 1) / 2.0
+        gauss_1d = torch.exp(-0.5 * (ax / sigma) ** 2)
+        gauss_1d = gauss_1d / gauss_1d.sum()
+        pad = radius // 2
+
+        # Separable conv weights: [C_out, C_in/groups, kH, kW] with groups=C
+        kernel_h = gauss_1d.view(1, 1, 1, -1).expand(C, -1, -1, -1).contiguous()
+        kernel_v = gauss_1d.view(1, 1, -1, 1).expand(C, -1, -1, -1).contiguous()
+
+        def _gpu_blur(x):
+            """Separable Gaussian blur on [N, C, H, W] GPU tensor."""
+            x = F.pad(x, [pad, pad, 0, 0], mode='reflect')
+            x = F.conv2d(x, kernel_h, groups=C)
+            x = F.pad(x, [0, 0, pad, pad], mode='reflect')
+            x = F.conv2d(x, kernel_v, groups=C)
+            return x
+
+        # Process in temporal chunks to limit GPU memory
+        chunk_size = max(1, min(8, T_frames))
+        result_chunks = []
+
+        debug.log(f"Sharpening {T_frames} frames on GPU (chunks of {chunk_size})...",
+                  category="color", indent_level=1)
+
+        for start in range(0, T_frames, chunk_size):
+            end = min(start + chunk_size, T_frames)
+            # [chunk, H, W, C] -> [chunk, C, H, W] float32 on GPU
+            chunk = video[start:end].to(device=gpu_device, dtype=torch.float32).permute(0, 3, 1, 2)
+
+            blur = _gpu_blur(chunk)
+            residual = chunk - blur
+            del blur
+
+            mask = (residual.abs() * 255.0 > usm_threshold).float()
+            soft_mask = _gpu_blur(mask)
+            del mask
+
+            sharp = (chunk + usm_weight * residual).clamp_(0, 1)
+            out = soft_mask * sharp + (1.0 - soft_mask) * chunk
+            del residual, soft_mask, sharp, chunk
+
+            result_chunks.append(out.permute(0, 2, 3, 1).cpu())  # [chunk, H, W, C]
+            del out
+
+        video = torch.cat(result_chunks, dim=0).to(dtype=orig_dtype)
+        del result_chunks, kernel_h, kernel_v, gauss_1d
+        torch.cuda.empty_cache()
+        debug.log("USM sharpening completed (GPU)", category="color", force=True)
     
     ctx['final_video'] = video
     

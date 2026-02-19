@@ -15,6 +15,7 @@ Usage:
 
 import sys
 import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import argparse
 import time
 import platform
@@ -53,7 +54,7 @@ LOAD_CAP = 0
 
 # Latent chunking
 LATENT_CHUNK_SIZE = 15             # Temporal frames per DiT chunk (4n+1)
-LATENT_OVERLAP = 7                # Overlap between latent chunks
+LATENT_OVERLAP = 4                # Overlap between latent chunks
 
 # Post-processing
 COLOR_CORRECTION = "lab_reinhard"          # "lab", "lab_reinhard", "wavelet", "hsv", "wavelet_adaptive", "adain", "none"
