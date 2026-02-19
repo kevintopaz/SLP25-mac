@@ -743,7 +743,7 @@ def postprocess_latent_output(
         raise ValueError("No decoded_video in context. Run decode_whole_latent first.")
     
     video = ctx['decoded_video']
-    video = video.clamp(-1, 1) * 0.5 + 0.5
+    del ctx['decoded_video']
     T = video.shape[0]
     
     debug.log(f"Post-processing {T} frames, color_correction={color_correction}",
@@ -764,9 +764,8 @@ def postprocess_latent_output(
         reference_cpu = ctx['transformed_video'].permute(1, 0, 2, 3)  # [T_ref, C, H, W]
         T_ref = reference_cpu.shape[0]
         
-        # video is [T, H, W, C] in [0, 1] -> convert to [T, C, H, W] in [-1, 1]
+        # video is [T, H, W, C] in [-1, 1] -> [T, C, H, W] (stay in [-1, 1] for color correction)
         video = video.permute(0, 3, 1, 2)  # [T, C, H, W]
-        video = video * 2.0 - 1.0           # [0, 1] -> [-1, 1]
         
         # Build frame indices for temporal alignment
         if T_ref != T:
@@ -810,15 +809,21 @@ def postprocess_latent_output(
                 debug.log(f"Unknown color correction method: {color_correction}",
                           level="WARNING", category="color", force=True)
             
+            # Convert chunk to [0,1] range and [chunk, H, W, C] on CPU immediately
+            # to avoid accumulating a huge GPU tensor for high-res videos
+            video_chunk.clamp_(-1, 1).mul_(0.5).add_(0.5)
+            video_chunk = video_chunk.permute(0, 2, 3, 1).cpu()
             result_chunks.append(video_chunk)
             del ref_chunk
         
-        video = torch.cat(result_chunks, dim=0)  # [T, C, H, W] in [-1, 1]
+        del video  # free the GPU source tensor before CPU concat
+        torch.cuda.empty_cache()
+        video = torch.cat(result_chunks, dim=0)  # [T, H, W, C] in [0, 1] on CPU
         del result_chunks, reference_cpu
-        
-        # Convert back to [T, H, W, C] in [0, 1]
-        video = video.clamp(-1, 1) * 0.5 + 0.5
-        video = video.permute(0, 2, 3, 1)
+    else:
+        # No color correction: convert in-place to [0, 1] and move to CPU
+        video.clamp_(-1, 1).mul_(0.5).add_(0.5)
+        video = video.cpu()
     
     # ── USM Sharpening (ref: basicsr usm_sharp) ──
     if usm_weight > 0:
@@ -847,8 +852,6 @@ def postprocess_latent_output(
     
     ctx['final_video'] = video
     
-    if 'decoded_video' in ctx:
-        del ctx['decoded_video']
     if 'transformed_video' in ctx:
         del ctx['transformed_video']
     

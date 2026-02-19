@@ -24,8 +24,15 @@ from typing import Tuple, Dict, Any
 from pathlib import Path
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(script_dir)
-matrix_root = os.path.abspath(os.path.join(script_dir, '..', '..'))
+
+if os.environ.get('CLOUD_RUN', 'false') == 'true':
+    # Cloud: script lives at <root>/models/astra_precision_3/
+    matrix_root = os.path.abspath(os.path.join(script_dir, '..', '..'))
+    _package_name = 'models.astra_precision_3'
+else:
+    # Local: script lives at <root>/astra_precision_3/
+    matrix_root = os.path.abspath(os.path.join(script_dir, '..'))
+    _package_name = 'astra_precision_3'
 
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
@@ -33,16 +40,13 @@ if matrix_root not in sys.path:
     sys.path.insert(0, matrix_root)
 
 if __name__ == '__main__' and __package__ is None:
-    pkg_name = os.path.basename(script_dir)
-    import importlib
-    importlib.import_module(pkg_name)
-    __package__ = pkg_name
+    __package__ = _package_name
 
 # =============================================================================
 # Hardcoded Configuration
 # =============================================================================
 
-VIDEO_BACKEND = "opencv"          # "opencv" or "ffmpeg"
+VIDEO_BACKEND = "ffmpeg"          # "opencv" or "ffmpeg"
 USE_10BIT = False
 MAX_RESOLUTION = 0
 SEED = 32
@@ -82,6 +86,8 @@ VAE_DECODE_TILE_OVERLAP = 128
 
 # Attention
 ATTENTION_MODE = "sdpa"           # "sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"
+
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
 # =============================================================================
 # Early Setup
@@ -170,6 +176,28 @@ class FFMPEGVideoWriter:
                 pass
             self.proc.wait()
             self.proc = None
+
+
+
+def compute_resolution(input_w: int, input_h: int, target_w: int, target_h: int) -> int:
+    """
+    Compute resolution (shorter edge) that fits within target_w x target_h
+    while preserving the input aspect ratio.
+    
+    Example:
+        1920x1080 input, 3840x2160 target → 3840x2160 → resolution = 2160
+        1440x1080 input, 3840x2160 target → 2880x2160 → resolution = 2160
+        1920x800  input, 3840x2160 target → 3840x1600 → resolution = 1600
+    """
+    scale_w = target_w / input_w
+    scale_h = target_h / input_h
+    if scale_w > scale_h:
+        final_h = target_h
+        final_w = round(input_w * scale_h)
+    else:
+        final_w = target_w
+        final_h = round(input_h * scale_w)
+    return final_w, final_h
 
 
 def extract_video_frames(video_path: str, skip_frames: int = 0, load_cap: int = 0) -> Tuple[torch.Tensor, float]:
@@ -286,11 +314,14 @@ class AstraSLP3:
     def progress_func(self, progress: float, message: str = "Processing..."):
         logger.info(f"Overall progress={progress * 100:.2f}% - {message}")
 
-    def _process_video(self, frames: torch.Tensor, resolution: int) -> torch.Tensor:
-        dit_tiles = (2, 2) if resolution >= 2160 else None
+    def _process_video(self, frames: torch.Tensor, resolution: int) -> Tuple[torch.Tensor, Dict[str, float]]:
+        dit_tiles = (2, 2) if resolution >= 1800 else None
         dit_tile_overlap = 0.25
 
+        t0 = time.time()
         ctx = encode_whole_video(self.runner, self.ctx, frames, self.debug, resolution, MAX_RESOLUTION)
+        t1 = time.time()
+        logger.info(f"[Profile] VAE Encode: {t1 - t0:.2f}s")
 
         ctx = upscale_latent_chunked(
             self.runner, ctx, self.debug,
@@ -300,19 +331,32 @@ class AstraSLP3:
             prompt=PROMPT, negative_prompt=NEGATIVE_PROMPT,
             cfg_scale=CFG_SCALE
         )
+        t2 = time.time()
+        logger.info(f"[Profile] DiT Upscale: {t2 - t1:.2f}s")
 
         ctx = decode_whole_latent(self.runner, ctx, self.debug)
+        t3 = time.time()
+        logger.info(f"[Profile] VAE Decode: {t3 - t2:.2f}s")
 
         ctx = postprocess_latent_output(
             ctx, self.debug, COLOR_CORRECTION,
             usm_weight=USM_WEIGHT, usm_radius=USM_RADIUS,
             usm_threshold=USM_THRESHOLD
         )
+        t4 = time.time()
+        logger.info(f"[Profile] Post-process: {t4 - t3:.2f}s")
+
+        timings = {
+            "encode": t1 - t0,
+            "dit": t2 - t1,
+            "decode": t3 - t2,
+            "post": t4 - t3,
+        }
 
         result = ctx['final_video']
         if result.is_cuda or (hasattr(result, 'is_mps') and result.is_mps):
             result = result.cpu()
-        return result.to(torch.float32)
+        return result.to(torch.float32), timings
 
     def __call__(
         self,
@@ -327,28 +371,42 @@ class AstraSLP3:
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"Input video not found: {input_path}")
 
-        resolution = int(model_parameters.get('resolution', 1080))
+        output_width = int(model_parameters.get('output_width', 3840))
+        output_height = int(model_parameters.get('output_height', 2160))
 
         logger.info(f"Input video: {input_path}")
         logger.info(f"Output path: {output_path}")
-        logger.info(f"Resolution: {resolution}")
+        logger.info(f"Resolution: {output_width}x{output_height}")
 
         if callable(getattr(self, 'progress_func', None)):
             self.progress_func(0.0, "Loading video frames...")
 
         frames, fps = extract_video_frames(input_path, SKIP_FIRST_FRAMES, LOAD_CAP)
+        if frames.shape[0] < 5:
+            debug.log(f"Cannot process: clip too short ({frames.shape[0]} frames, minimum 5)", level="ERROR", force=True)
+            sys.exit(1)
+        input_h, input_w = frames.shape[1], frames.shape[2]
+        resolution_w, resolution_h = compute_resolution(input_w, input_h, output_width, output_height)
+        debug.log(f"Input: {input_w}x{input_h}, target box: {output_width}x{output_height} → final resolution: {resolution_w}x{resolution_h}", category="info", force=True)
 
         if callable(getattr(self, 'progress_func', None)):
             self.progress_func(0.05, "Processing video...")
 
-        result = self._process_video(frames, resolution)
+        result, timings = self._process_video(frames, min(resolution_w, resolution_h))
 
         if callable(getattr(self, 'progress_func', None)):
             self.progress_func(0.95, "Saving video...")
 
+        t_save_start = time.time()
         save_video(result, output_path, fps, VIDEO_BACKEND, USE_10BIT)
+        t_save_end = time.time()
 
         logger.info(f"Saved output to {output_path}")
+        logger.info(
+            f"[Profile] Total breakdown — Encode: {timings['encode']:.2f}s, "
+            f"DiT: {timings['dit']:.2f}s, Decode: {timings['decode']:.2f}s, "
+            f"Post: {timings['post']:.2f}s, Save: {t_save_end - t_save_start:.2f}s"
+        )
 
         if callable(getattr(self, 'progress_func', None)):
             self.progress_func(1.0, "Video upscaling complete!")
@@ -368,7 +426,8 @@ def parse_arguments() -> argparse.Namespace:
     
     parser.add_argument("input", help="Input video file")
     parser.add_argument("--output", default=None)
-    parser.add_argument("--resolution", type=int, default=1080)
+    parser.add_argument("--output_width", type=int, default=3840, help="Target output width")
+    parser.add_argument("--output_height", type=int, default=2160, help="Target output height")
     parser.add_argument("--debug", action="store_true")
     
     if len(sys.argv) == 1:
@@ -393,17 +452,23 @@ def main():
         debug.log("ffmpeg not found", level="ERROR", category="setup", force=True)
         sys.exit(1)
 
-    upscaler = AstraPrecision3Upscaler(device='cuda:0')
+    upscaler = AstraSLP3(device='cuda:0')
 
-    output = args.output or str(Path(args.input).with_stem(Path(args.input).stem + "_latent_chunked"))
+    output = args.output or str(Path(args.input).with_stem(Path(args.input).stem + "_output"))
 
     start = time.time()
+
+    # parameter check 
+    input_ext = os.path.splitext(args.input)[1].lower()
+    if not os.path.isfile(args.input) or input_ext not in VIDEO_EXTENSIONS:
+        debug.log(f"Input file is not a video file: {args.input}", level="ERROR", category="setup", force=True)
+        sys.exit(1)
 
     try:
         upscaler(
             input_path=args.input,
             output_path=output,
-            model_parameters={'resolution': args.resolution}
+            model_parameters={'output_width': args.output_width, 'output_height': args.output_height}
         )
 
         elapsed = time.time() - start

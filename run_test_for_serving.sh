@@ -22,9 +22,10 @@
 #     exit 1
 # fi
 
-INPUT_FOLDER="./magnific_batch_test"
-OUTPUT_FOLDER="./magnific_batch_test_output_flash_attn_2"
-RESOLUTION="1440"
+INPUT_FOLDER="./landscape_test"
+OUTPUT_FOLDER="./landscape_test_4k"
+OUTPUT_WIDTH="3840"
+OUTPUT_HEIGHT="2160"
 
 # Validate input folder
 if [ ! -d "$INPUT_FOLDER" ]; then
@@ -39,18 +40,11 @@ mkdir -p "$OUTPUT_FOLDER"
 cd "$(dirname "$0")"
 
 
-# Video extensions to process
-VIDEO_EXTENSIONS="mp4 MP4 mov MOV avi AVI mkv MKV webm WEBM"
-
-# Count total videos
-total_count=0
-for ext in $VIDEO_EXTENSIONS; do
-    count=$(find "$INPUT_FOLDER" -maxdepth 1 -type f -name "*.$ext" 2>/dev/null | wc -l)
-    total_count=$((total_count + count))
-done
+# Count total files
+total_count=$(find "$INPUT_FOLDER" -maxdepth 1 -type f 2>/dev/null | wc -l)
 
 if [ $total_count -eq 0 ]; then
-    echo "No video files found in: $INPUT_FOLDER"
+    echo "No files found in: $INPUT_FOLDER"
     exit 0
 fi
 
@@ -59,7 +53,7 @@ echo "Batch Video Upscaler"
 echo "========================================"
 echo "Input folder:  $INPUT_FOLDER"
 echo "Output folder: $OUTPUT_FOLDER"
-echo "Resolution:    $RESOLUTION"
+echo "Target:        ${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}"
 echo "Videos found:  $total_count"
 echo "========================================"
 echo ""
@@ -67,42 +61,41 @@ echo ""
 # Process counter
 current=0
 
-# Process each video file
-for ext in $VIDEO_EXTENSIONS; do
-    for INPUT_FILE in "$INPUT_FOLDER"/*.$ext; do
-        # Skip if no matches (glob didn't expand)
-        [ -e "$INPUT_FILE" ] || continue
-        
-        current=$((current + 1))
-        
-        # Get filename without path
-        FILENAME=$(basename "$INPUT_FILE")
-        
-        # Build output path (same filename in output folder)
-        OUTPUT_FILE="$OUTPUT_FOLDER/$FILENAME"
-        
-        echo ""
-        echo "========================================"
-        echo "[$current/$total_count] Processing: $FILENAME"
-        echo "========================================"
-        echo "Input:  $INPUT_FILE"
-        echo "Output: $OUTPUT_FILE"
-        echo ""
-        
-        # Skip if output already exists
-        if [ -f "$OUTPUT_FILE" ]; then
-            echo "Skipping: Output already exists"
-            continue
-        fi
-        
-        # Process video
-        python inference_cli_latent_chunked_for_serving.py "$INPUT_FILE" \
-            --output "$OUTPUT_FILE" \
-            --resolution $RESOLUTION
-        
-        echo ""
-        echo "Completed: $FILENAME"
-    done
+# Process each file
+for INPUT_FILE in "$INPUT_FOLDER"/*; do
+    # Skip if not a regular file
+    [ -f "$INPUT_FILE" ] || continue
+    
+    current=$((current + 1))
+    
+    # Get filename without path
+    FILENAME=$(basename "$INPUT_FILE")
+    
+    # Build output path (same filename in output folder)
+    OUTPUT_FILE="$OUTPUT_FOLDER/$FILENAME"
+    
+    echo ""
+    echo "========================================"
+    echo "[$current/$total_count] Processing: $FILENAME"
+    echo "========================================"
+    echo "Input:  $INPUT_FILE"
+    echo "Output: $OUTPUT_FILE"
+    echo ""
+    
+    # Skip if output already exists
+    if [ -f "$OUTPUT_FILE" ]; then
+        echo "Skipping: Output already exists"
+        continue
+    fi
+    
+    # Process video
+    python inference_cli_latent_chunked_for_serving.py "$INPUT_FILE" \
+        --output "$OUTPUT_FILE" \
+        --output_width $OUTPUT_WIDTH \
+        --output_height $OUTPUT_HEIGHT
+    
+    echo ""
+    echo "Completed: $FILENAME"
 done
 
 echo ""
