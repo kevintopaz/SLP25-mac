@@ -61,7 +61,7 @@ except ImportError:
     SAFETENSORS_AVAILABLE = False
     load_safetensors_bytes = None
 
-from utils.getData import get_path_or_bytes
+# from utils.getData import get_path_or_bytes
 
 from .infer import VideoDiffusionInfer
 from ..common.config import create_object

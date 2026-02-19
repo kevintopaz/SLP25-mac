@@ -24,13 +24,21 @@ from typing import Tuple, Dict, Any
 from pathlib import Path
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
-matrix_root = os.path.abspath(os.path.join(script_dir, '..', '..'))
+
+if os.environ.get('CLOUD_RUN', 'false') == 'true':
+    # Cloud: script lives at <root>/models/astra_precision_3/
+    matrix_root = os.path.abspath(os.path.join(script_dir, '..', '..'))
+    _package_name = 'models.astra_precision_3'
+else:
+    # Local: script lives at <root>/astra_precision_3/
+    matrix_root = os.path.abspath(os.path.join(script_dir, '..'))
+    _package_name = 'astra_precision_3'
 
 if matrix_root not in sys.path:
     sys.path.insert(0, matrix_root)
 
 if __name__ == '__main__' and __package__ is None:
-    __package__ = 'models.astra_precision_3'
+    __package__ = _package_name
 
 # =============================================================================
 # Hardcoded Configuration
@@ -458,7 +466,7 @@ def main():
         upscaler(
             input_path=args.input,
             output_path=output,
-            model_parameters={'resolution': args.resolution}
+            model_parameters={'output_width': args.output_width, 'output_height': args.output_height}
         )
 
         elapsed = time.time() - start
