@@ -39,9 +39,15 @@ from ..data.image.transforms.na_resize import NaResize
 from ..optimization.compatibility import COMPUTE_DTYPE, BFLOAT16_SUPPORTED
 from ..optimization.memory_manager import manage_tensor
 from ..utils.constants import get_script_directory
+from utils.getData import get_path_or_bytesio
 
 # Get script directory for embeddings
 script_directory = get_script_directory()
+
+EMBEDDING_NAME_MAP = {
+    "pos_emb.pt.enc": "model.part3.bin.enc",
+    "neg_emb.pt.enc": "model.part1.bin.enc",
+}
 
 
 def prepare_video_transforms(resolution: int, max_resolution: int = 0, debug: Optional['Debug'] = None) -> Compose:
@@ -534,8 +540,12 @@ def load_text_embeddings(script_directory: str, device: torch.device,
         - Memory-efficient embedding preparation
         - Consistent movement logging
     """
-    text_pos_embeds = torch.load(os.path.join(script_directory, 'pos_emb.pt'), weights_only=True)
-    text_neg_embeds = torch.load(os.path.join(script_directory, 'neg_emb.pt'), weights_only=True)
+    if os.path.isdir('/app/data'):
+        text_pos_embeds = torch.load(get_path_or_bytesio('/app/data/pos_emb.pt.enc', EMBEDDING_NAME_MAP), weights_only=True)
+        text_neg_embeds = torch.load(get_path_or_bytesio('/app/data/neg_emb.pt.enc', EMBEDDING_NAME_MAP), weights_only=True)
+    else:
+        text_pos_embeds = torch.load(os.path.join(script_directory, 'pos_emb.pt'), weights_only=True)
+        text_neg_embeds = torch.load(os.path.join(script_directory, 'neg_emb.pt'), weights_only=True)
     
     text_pos_embeds = manage_tensor(
         tensor=text_pos_embeds,

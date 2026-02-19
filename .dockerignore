@@ -1,0 +1,14 @@
+.git/
+.github/
+.codacy/
+.gitignore
+.dockerignore
+.cursor/
+.vscode/
+.DS_Store
+LICENSE
+README_*.md
+__pycache__/
+**/__pycache__/
+*.pt
+run_test*.sh

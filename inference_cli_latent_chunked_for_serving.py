@@ -114,7 +114,7 @@ from .src.core.generation_phases_latent import (
 from .src.utils.debug import Debug
 from .src.optimization.memory_manager import get_gpu_backend
 
-debug = Debug(enabled=False)
+debug = Debug(enabled=True)
 
 if os.environ.get('CLOUD_RUN', 'false') == 'true':
     from utils.register.registry_class import MODEL
@@ -231,8 +231,8 @@ class AstraSLP3:
     def init_args(self, args):
         if os.environ.get('CLOUD_RUN') == 'true':
             args.model_dir = "./data"
-            args.dit_name = "model.part2.bin.enc"
-            args.vae_name = "model.part1.bin.enc"
+            args.dit_name = "model.part4.bin.enc"
+            args.vae_name = "model.part2.bin.enc"
             return args
         else:
             args.model_dir = "models"
