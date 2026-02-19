@@ -34,6 +34,8 @@ else:
     matrix_root = os.path.abspath(os.path.join(script_dir, '..'))
     _package_name = 'astra_precision_3'
 
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
 if matrix_root not in sys.path:
     sys.path.insert(0, matrix_root)
 
