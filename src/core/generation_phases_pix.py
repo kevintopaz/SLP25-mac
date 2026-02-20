@@ -173,6 +173,9 @@ def process_pix_chunk(
         runner, ctx, chunk_frames, debug, resolution, max_resolution
     )
 
+    # Release fragmented CUDA cache between phases so DiT has contiguous blocks
+    torch.cuda.empty_cache()
+
     # Phase 2 -- DiT Upscale  (chunk_size=0 -> process full latent in one shot)
     # cache_model=True keeps runner.dit alive for subsequent chunks
     ctx = upscale_latent_chunked(
@@ -188,6 +191,9 @@ def process_pix_chunk(
         cfg_scale=cfg_scale,
         cache_model=True,
     )
+
+    # Release fragmented CUDA cache between phases so VAE decode has contiguous blocks
+    torch.cuda.empty_cache()
 
     # Phase 3 -- VAE Decode
     # cache_model=True keeps runner.vae alive for subsequent chunks
@@ -419,8 +425,11 @@ def process_video_pix_chunked(
     # --- Post-process (color correction + USM) on the whole assembled video ---
     _reset_ctx(ctx)
     ctx['decoded_video'] = final_video.to(device)
+    del final_video
     if final_transformed is not None:
-        ctx['transformed_video'] = final_transformed       # stays on CPU
+        ctx['transformed_video'] = final_transformed
+        del final_transformed
+    clear_memory(debug=debug, force=True)
 
     t_post_start = time.time()
     ctx = postprocess_latent_output(
@@ -442,4 +451,4 @@ def process_video_pix_chunked(
     if result.is_cuda or (hasattr(result, 'is_mps') and result.is_mps):
         result = result.cpu()
 
-    return result.to(torch.float32), timings
+    return result, timings

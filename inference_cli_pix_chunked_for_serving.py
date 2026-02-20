@@ -62,7 +62,8 @@ LOAD_CAP = 0
 #   for smooth blending between chunks.  Must be < PIX_CHUNK_SIZE.
 #   New frames per chunk (stride) = PIX_CHUNK_SIZE - PIX_OVERLAP.
 PIX_CHUNK_SIZE = 65               # batch_size (4*16+1 = 65)
-PIX_OVERLAP = 13                  # temporal_overlap
+PIX_OVERLAP = 6                  # temporal_overlap
+DIT_TILE_OVERLAP = 0.1 
 
 # Post-processing
 COLOR_CORRECTION = "lab_reinhard" # "lab", "lab_reinhard", "wavelet", "hsv", "wavelet_adaptive", "adain", "none"
@@ -111,7 +112,7 @@ if platform.system() == "Darwin":
     os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
     os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.0")
 else:
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:512")
     if CUDA_DEVICE is not None:
         device_list_env = [x.strip() for x in CUDA_DEVICE.split(',') if x.strip() != '']
         if os.environ.get("CUDA_VISIBLE_DEVICES") is None and len(device_list_env) == 1:
@@ -231,8 +232,7 @@ def extract_video_frames(video_path: str, skip_frames: int = 0, load_cap: int = 
 
 
 def save_video(tensor: torch.Tensor, path: str, fps: float, backend: str = "opencv", use_10bit: bool = False):
-    frames = (tensor.cpu().numpy() * 255.0).astype(np.uint8)
-    T, H, W, _ = frames.shape
+    T, H, W, _ = tensor.shape
     os.makedirs(Path(path).parent, exist_ok=True)
 
     if backend == "ffmpeg":
@@ -244,8 +244,9 @@ def save_video(tensor: torch.Tensor, path: str, fps: float, backend: str = "open
             writer.release()
             writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (W, H))
 
-    for f in frames:
-        writer.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+    for i in range(T):
+        frame = (tensor[i].cpu().float().numpy() * 255.0).astype(np.uint8)
+        writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
     writer.release()
     debug.log(f"Saved {T} frames: {path}", category="file", force=True)
 
@@ -320,6 +321,7 @@ class AstraSLP3:
             max_resolution=MAX_RESOLUTION,
             chunk_size=PIX_CHUNK_SIZE,
             overlap=PIX_OVERLAP,
+            dit_tile_overlap=DIT_TILE_OVERLAP,
             seed=SEED,
             latent_noise_scale=LATENT_NOISE_SCALE,
             shared_noise=SHARED_NOISE,

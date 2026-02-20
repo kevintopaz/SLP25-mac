@@ -23,9 +23,9 @@
 # fi
 
 INPUT_FOLDER="./landscape_test"
-OUTPUT_FOLDER="./landscape_test_2k_threadedcolor_cpuusm"
-OUTPUT_WIDTH="1920"
-OUTPUT_HEIGHT="1080"
+OUTPUT_FOLDER="./landscape_test_4k"
+OUTPUT_WIDTH="3840"
+OUTPUT_HEIGHT="2160"
 
 # Validate input folder
 if [ ! -d "$INPUT_FOLDER" ]; then
@@ -92,7 +92,8 @@ for INPUT_FILE in "$INPUT_FOLDER"/*; do
     python inference_cli_latent_chunked_for_serving.py "$INPUT_FILE" \
         --output "$OUTPUT_FILE" \
         --output_width $OUTPUT_WIDTH \
-        --output_height $OUTPUT_HEIGHT
+        --output_height $OUTPUT_HEIGHT \
+        --debug
     
     echo ""
     echo "Completed: $FILENAME"
