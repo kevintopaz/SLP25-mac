@@ -812,10 +812,8 @@ def postprocess_latent_output(
                 debug.log(f"Unknown color correction method: {color_correction}",
                           level="WARNING", category="color", force=True)
             
-            # Convert chunk to [0,1] range and [chunk, H, W, C] on CPU immediately
-            # to avoid accumulating a huge GPU tensor for high-res videos
             video_chunk.clamp_(-1, 1).mul_(0.5).add_(0.5)
-            video_chunk = video_chunk.permute(0, 2, 3, 1).cpu()
+            video_chunk = video_chunk.permute(0, 2, 3, 1).to(dtype=torch.float16).cpu()
             result_chunks.append(video_chunk)
             del ref_chunk
         
@@ -824,9 +822,8 @@ def postprocess_latent_output(
         video = torch.cat(result_chunks, dim=0)  # [T, H, W, C] in [0, 1] on CPU
         del result_chunks, reference_cpu
     else:
-        # No color correction: convert in-place to [0, 1] and move to CPU
         video.clamp_(-1, 1).mul_(0.5).add_(0.5)
-        video = video.cpu()
+        video = video.to(dtype=torch.float16).cpu()
     
     # ── USM Sharpening (GPU, separable Gaussian conv) ──
     if usm_weight > 0:
@@ -837,7 +834,6 @@ def postprocess_latent_output(
                   f"threshold={usm_threshold}", category="color", force=True)
 
         gpu_device = torch.device('cuda')
-        orig_dtype = video.dtype
         T_frames, H, W, C = video.shape
 
         # Build separable Gaussian kernel (sigma matches OpenCV sigmaX=0)
@@ -859,16 +855,13 @@ def postprocess_latent_output(
             x = F.conv2d(x, kernel_v, groups=C)
             return x
 
-        # Process in temporal chunks to limit GPU memory
         chunk_size = max(1, min(8, T_frames))
-        result_chunks = []
 
-        debug.log(f"Sharpening {T_frames} frames on GPU (chunks of {chunk_size})...",
+        debug.log(f"Sharpening {T_frames} frames on GPU in-place (chunks of {chunk_size})...",
                   category="color", indent_level=1)
 
         for start in range(0, T_frames, chunk_size):
             end = min(start + chunk_size, T_frames)
-            # [chunk, H, W, C] -> [chunk, C, H, W] float32 on GPU
             chunk = video[start:end].to(device=gpu_device, dtype=torch.float32).permute(0, 3, 1, 2)
 
             blur = _gpu_blur(chunk)
@@ -883,12 +876,11 @@ def postprocess_latent_output(
             out = soft_mask * sharp + (1.0 - soft_mask) * chunk
             del residual, soft_mask, sharp, chunk
 
-            result_chunks.append(out.permute(0, 2, 3, 1).cpu())  # [chunk, H, W, C]
+            video[start:end] = out.permute(0, 2, 3, 1).to(dtype=torch.float16).cpu()
             del out
+            torch.cuda.empty_cache()
 
-        video = torch.cat(result_chunks, dim=0).to(dtype=orig_dtype)
-        del result_chunks, kernel_h, kernel_v, gauss_1d
-        torch.cuda.empty_cache()
+        del kernel_h, kernel_v, gauss_1d
         debug.log("USM sharpening completed (GPU)", category="color", force=True)
     
     ctx['final_video'] = video
