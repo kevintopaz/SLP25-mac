@@ -103,7 +103,7 @@ if platform.system() == "Darwin":
     os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
     os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.0")
 else:
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:512")
     if CUDA_DEVICE is not None:
         device_list_env = [x.strip() for x in CUDA_DEVICE.split(',') if x.strip() != '']
         if os.environ.get("CUDA_VISIBLE_DEVICES") is None and len(device_list_env) == 1:
