@@ -61,7 +61,8 @@ except ImportError:
     SAFETENSORS_AVAILABLE = False
     load_safetensors_bytes = None
 
-# from utils.getData import get_path_or_bytes
+if os.environ.get('CLOUD_RUN', 'false') == 'true':
+    from utils.getData import get_path_or_bytes
 
 from .infer import VideoDiffusionInfer
 from ..common.config import create_object
@@ -609,6 +610,8 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
             if debug:
                 debug.log(f"Error decrypting model: {e}, proceeding with original path", 
                          level="WARNING", category="info")
+            logger.error(f"Error decrypting model: {e}")
+            raise
     
     # Log loading action
     action = "Materializing" if used_meta else "Loading"

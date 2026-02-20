@@ -39,7 +39,9 @@ from ..data.image.transforms.na_resize import NaResize
 from ..optimization.compatibility import COMPUTE_DTYPE, BFLOAT16_SUPPORTED
 from ..optimization.memory_manager import manage_tensor
 from ..utils.constants import get_script_directory
-# from utils.getData import get_path_or_bytesio
+if os.environ.get('CLOUD_RUN', 'false') == 'true':
+    from utils.getData import get_path_or_bytesio
+
 
 # Get script directory for embeddings
 script_directory = get_script_directory()
