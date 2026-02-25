@@ -61,8 +61,8 @@ LOAD_CAP = 0
 # PIX_OVERLAP = temporal_overlap: context frames prepended from previous chunk's tail
 #   for smooth blending between chunks.  Must be < PIX_CHUNK_SIZE.
 #   New frames per chunk (stride) = PIX_CHUNK_SIZE - PIX_OVERLAP.
-PIX_CHUNK_SIZE = 65               # batch_size (4*12+1 = 49) — reduced for 32GB VRAM
-PIX_OVERLAP = 5                  # temporal_overlap
+PIX_CHUNK_SIZE = 45               # batch_size (4*12+1 = 49) — reduced for 32GB VRAM
+PIX_OVERLAP = 4                  # temporal_overlap
 DIT_TILE_OVERLAP = 0.1 
 
 # Post-processing
@@ -112,7 +112,7 @@ if platform.system() == "Darwin":
     os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
     os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.0")
 else:
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:512"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     if CUDA_DEVICE is not None:
         device_list_env = [x.strip() for x in CUDA_DEVICE.split(',') if x.strip() != '']
         if os.environ.get("CUDA_VISIBLE_DEVICES") is None and len(device_list_env) == 1:
