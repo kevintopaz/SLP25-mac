@@ -61,7 +61,7 @@ LOAD_CAP = 0
 # PIX_OVERLAP = temporal_overlap: context frames prepended from previous chunk's tail
 #   for smooth blending between chunks.  Must be < PIX_CHUNK_SIZE.
 #   New frames per chunk (stride) = PIX_CHUNK_SIZE - PIX_OVERLAP.
-PIX_CHUNK_SIZE = 65               # batch_size (4*16+1 = 65)
+PIX_CHUNK_SIZE = 61               # batch_size (4*16+1 = 65)
 PIX_OVERLAP = 6                  # temporal_overlap
 DIT_TILE_OVERLAP = 0.1 
 
@@ -119,6 +119,7 @@ else:
             os.environ["CUDA_VISIBLE_DEVICES"] = device_list_env[0]
 
 import torch
+# torch.cuda.set_per_process_memory_fraction(0.9375)  # Limit VRAM to ~30GB on 32GB GPU
 import cv2
 import numpy as np
 import shutil
