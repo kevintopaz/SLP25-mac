@@ -61,8 +61,8 @@ LOAD_CAP = 0
 # PIX_OVERLAP = temporal_overlap: context frames prepended from previous chunk's tail
 #   for smooth blending between chunks.  Must be < PIX_CHUNK_SIZE.
 #   New frames per chunk (stride) = PIX_CHUNK_SIZE - PIX_OVERLAP.
-PIX_CHUNK_SIZE = 45               # batch_size (4*12+1 = 49) — reduced for 32GB VRAM
-PIX_OVERLAP = 4                  # temporal_overlap
+PIX_CHUNK_SIZE = 61               # batch_size (4*12+1 = 49) — reduced for 32GB VRAM
+PIX_OVERLAP = 6                  # temporal_overlap
 DIT_TILE_OVERLAP = 0.1 
 
 # Post-processing
@@ -389,7 +389,9 @@ class AstraSLP3:
 
         logger.info(f"Saved output to {output_path}")
         logger.info(
-            f"[Profile] Total -- Encode+DiT+Decode+Blend: {timings['encode_dit_decode']:.2f}s, "
+            f"[Profile] Total -- Encode: {timings['encode']:.2f}s, "
+            f"DiT: {timings['dit']:.2f}s, "
+            f"Decode: {timings['decode']:.2f}s, "
             f"Post: {timings['post']:.2f}s, "
             f"Save: {t_save_end - t_save_start:.2f}s"
         )

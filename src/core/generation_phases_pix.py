@@ -138,7 +138,7 @@ def process_pix_chunk(
     prompt: Optional[str],
     negative_prompt: Optional[str],
     cfg_scale: float,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, float]]:
     """
     Run full encode -> DiT -> decode on a single pixel-space chunk.
 
@@ -162,22 +162,26 @@ def process_pix_chunk(
         cfg_scale:          Classifier-free guidance scale (1.0 = disabled).
 
     Returns:
-        ``(decoded, transformed)`` where
-        - *decoded*      is ``[T, H, W, C]`` in ``[-1, 1]`` on **CPU**
-        - *transformed*  is ``[C, T, H, W]`` in ``[-1, 1]`` on **CPU** (or ``None``)
+        ``(decoded, transformed, chunk_timings)`` where
+        - *decoded*       is ``[T, H, W, C]`` in ``[-1, 1]`` on **CPU**
+        - *transformed*   is ``[C, T, H, W]`` in ``[-1, 1]`` on **CPU** (or ``None``)
+        - *chunk_timings* is a dict with ``encode``, ``dit``, ``decode`` times in seconds
     """
     _reset_ctx(ctx)
 
     # Phase 1 -- VAE Encode
+    t_enc_start = time.time()
     ctx = encode_whole_video(
         runner, ctx, chunk_frames, debug, resolution, max_resolution
     )
+    t_enc_end = time.time()
 
     # Release fragmented CUDA cache between phases so DiT has contiguous blocks
     torch.cuda.empty_cache()
 
     # Phase 2 -- DiT Upscale  (chunk_size=0 -> process full latent in one shot)
     # cache_model=True keeps runner.dit alive for subsequent chunks
+    t_dit_start = time.time()
     ctx = upscale_latent_chunked(
         runner, ctx, debug,
         chunk_size=0, overlap=0,
@@ -191,13 +195,16 @@ def process_pix_chunk(
         cfg_scale=cfg_scale,
         cache_model=True,
     )
+    t_dit_end = time.time()
 
     # Release fragmented CUDA cache between phases so VAE decode has contiguous blocks
     torch.cuda.empty_cache()
 
     # Phase 3 -- VAE Decode
     # cache_model=True keeps runner.vae alive for subsequent chunks
+    t_dec_start = time.time()
     ctx = decode_whole_latent(runner, ctx, debug, cache_model=True)
+    t_dec_end = time.time()
 
     # Move results to CPU
     decoded = ctx['decoded_video']
@@ -208,7 +215,13 @@ def process_pix_chunk(
     if transformed is not None:
         transformed = transformed.cpu()
 
-    return decoded, transformed
+    chunk_timings = {
+        "encode": t_enc_end - t_enc_start,
+        "dit": t_dit_end - t_dit_start,
+        "decode": t_dec_end - t_dec_start,
+    }
+
+    return decoded, transformed, chunk_timings
 
 
 # =============================================================================
@@ -327,6 +340,9 @@ def process_video_pix_chunked(
 
     # --- Process each chunk through encode -> DiT -> decode ---
     t_pipeline_start = time.time()
+    total_encode_time = 0.0
+    total_dit_time = 0.0
+    total_decode_time = 0.0
 
     # We assemble into a pre-allocated final_video buffer and blend in-place,
     # matching the decode_all_batches pattern from the reference.
@@ -346,7 +362,7 @@ def process_video_pix_chunked(
         )
 
         t0 = time.time()
-        decoded, transformed = process_pix_chunk(
+        decoded, transformed, chunk_timings = process_pix_chunk(
             runner, ctx, chunk_input, debug,
             resolution, max_resolution, seed,
             latent_noise_scale, shared_noise,
@@ -354,7 +370,14 @@ def process_video_pix_chunked(
             prompt, negative_prompt, cfg_scale,
         )
         t1 = time.time()
-        logger.info("[Profile] Chunk %d encode+dit+decode: %.2fs", ci + 1, t1 - t0)
+        total_encode_time += chunk_timings["encode"]
+        total_dit_time += chunk_timings["dit"]
+        total_decode_time += chunk_timings["decode"]
+        logger.info(
+            "[Profile] Chunk %d/%d: %.2fs (encode=%.2fs, dit=%.2fs, decode=%.2fs)",
+            ci + 1, num_chunks, t1 - t0,
+            chunk_timings["encode"], chunk_timings["dit"], chunk_timings["decode"],
+        )
 
         # decoded: [T_chunk, H_out, W_out, C]  on CPU, [-1,1]
         # transformed: [C, T_chunk, H_out, W_out] on CPU, [-1,1] or None
@@ -420,7 +443,11 @@ def process_video_pix_chunked(
             clear_memory(debug=debug, force=True)
 
     t_pipeline_end = time.time()
-    logger.info("[Profile] All chunks encode+dit+decode+blend: %.2fs", t_pipeline_end - t_pipeline_start)
+    logger.info(
+        "[Profile] All %d chunks total: %.2fs (encode=%.2fs, dit=%.2fs, decode=%.2fs)",
+        num_chunks, t_pipeline_end - t_pipeline_start,
+        total_encode_time, total_dit_time, total_decode_time,
+    )
 
     # --- Post-process (color correction + USM) on the whole assembled video ---
     _reset_ctx(ctx)
@@ -443,7 +470,9 @@ def process_video_pix_chunked(
 
     timings = {
         "encode_dit_decode": t_pipeline_end - t_pipeline_start,
-        "blend": 0.0,  # blending is done inline during chunk assembly
+        "encode": total_encode_time,
+        "dit": total_dit_time,
+        "decode": total_decode_time,
         "post": t_post_end - t_post_start,
     }
 
