@@ -61,7 +61,8 @@ LOAD_CAP = 0
 # PIX_OVERLAP = temporal_overlap: context frames prepended from previous chunk's tail
 #   for smooth blending between chunks.  Must be < PIX_CHUNK_SIZE.
 #   New frames per chunk (stride) = PIX_CHUNK_SIZE - PIX_OVERLAP.
-PIX_CHUNK_SIZE = 45               # batch_size (4*12+1 = 49) — reduced for 32GB VRAM
+# PIX_CHUNK_SIZE = 45               # batch_size (4*12+1 = 49) — reduced for 32GB VRAM
+PIX_CHUNK_SIZE = 61
 PIX_OVERLAP = 4                  # temporal_overlap
 DIT_TILE_OVERLAP = 0.1 
 
