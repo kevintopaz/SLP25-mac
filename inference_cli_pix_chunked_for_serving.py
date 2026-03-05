@@ -226,52 +226,93 @@ def compute_resolution(input_w: int, input_h: int, target_w: int, target_h: int)
     return final_w, final_h
 
 
-def extract_video_frames(video_path: str, skip_frames: int = 0, load_cap: int = 0) -> Tuple[torch.Tensor, float]:
-    if not os.path.exists(video_path):
-        raise FileNotFoundError(f"Video not found: {video_path}")
+class LazyVideoReader:
+    """
+    Lazily reads video frames per-chunk to avoid loading everything into RAM.
 
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise ValueError(f"Cannot open: {video_path}")
+    Exposes ``.shape`` and ``__getitem__`` (slice) so it can be used as a
+    drop-in replacement for the eager ``torch.Tensor`` returned by
+    ``extract_video_frames``.
+    """
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    def __init__(self, video_path: str, skip_frames: int = 0, load_cap: int = 0):
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video not found: {video_path}")
 
-    if skip_frames > 0:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, skip_frames)
+        self.video_path = video_path
+        self.skip_frames = skip_frames
 
-    to_read = total - skip_frames
-    if load_cap > 0:
-        to_read = min(to_read, load_cap)
+        # Probe metadata
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Cannot open: {video_path}")
+        self.fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        raw_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        raw_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
 
-    frames = []
-    for _ in range(to_read):
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0)
+        available = max(0, total - skip_frames)
+        if load_cap > 0:
+            available = min(available, load_cap)
+        self._total_frames = available
 
-    cap.release()
+        # SAR correction
+        self._sar = get_video_sar(video_path)
+        if self._sar != 1.0 and self._sar > 0:
+            self._display_w = round(raw_w * self._sar)
+        else:
+            self._display_w = raw_w
+        self._display_h = raw_h
+        self._raw_w = raw_w
 
-    if not frames:
-        raise ValueError("No frames read")
-
-    # SAR pre-stretching: convert non-square pixels to square-pixel space
-    # (mirrors old_code.py FrameProcessor: width = sar * width)
-    sar = get_video_sar(video_path)
-    if sar != 1.0:
-        h, w = frames[0].shape[:2]
-        new_w = round(w * sar)
-        if new_w != w:
+        if self._sar != 1.0:
             debug.log(
-                f"SAR={sar:.4f}, pre-stretching {w}x{h} → {new_w}x{h}",
+                f"SAR={self._sar:.4f}, will pre-stretch {raw_w}x{raw_h} → {self._display_w}x{raw_h}",
                 category="file", force=True,
             )
-            frames = [cv2.resize(f, (new_w, h), interpolation=cv2.INTER_CUBIC) for f in frames]
+        debug.log(
+            f"LazyVideoReader: {self._total_frames} frames, {self._display_w}x{self._display_h}, fps={self.fps}",
+            category="file", force=True,
+        )
 
-    tensor = torch.from_numpy(np.stack(frames)).to(torch.float16)
-    debug.log(f"Loaded {len(frames)} frames: {tensor.shape}", category="file", force=True)
-    return tensor, fps
+    @property
+    def shape(self):
+        return (self._total_frames, self._display_h, self._display_w, 3)
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            start = key.start or 0
+            stop = key.stop if key.stop is not None else self._total_frames
+            start = max(0, min(start, self._total_frames))
+            stop = max(start, min(stop, self._total_frames))
+            return self._read_range(start, stop)
+        raise TypeError(f"LazyVideoReader only supports slice indexing, got {type(key)}")
+
+    def _read_range(self, start: int, end: int) -> torch.Tensor:
+        """Read frames ``[start, end)`` and return ``[T, H, W, C]`` float16 ``[0, 1]``."""
+        cap = cv2.VideoCapture(self.video_path)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, self.skip_frames + start)
+
+        frames = []
+        for _ in range(end - start):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0)
+        cap.release()
+
+        if not frames:
+            raise ValueError(f"No frames read for range [{start}, {end})")
+
+        # SAR pre-stretching
+        if self._sar != 1.0:
+            h, w = frames[0].shape[:2]
+            new_w = round(w * self._sar)
+            if new_w != w:
+                frames = [cv2.resize(f, (new_w, h), interpolation=cv2.INTER_CUBIC) for f in frames]
+
+        return torch.from_numpy(np.stack(frames)).to(torch.float16)
 
 
 def save_video(tensor: torch.Tensor, path: str, fps: float, backend: str = "opencv", use_10bit: bool = False):
@@ -292,6 +333,21 @@ def save_video(tensor: torch.Tensor, path: str, fps: float, backend: str = "open
         writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
     writer.release()
     debug.log(f"Saved {T} frames: {path}", category="file", force=True)
+
+
+def _create_video_writer(path: str, width: int, height: int, fps: float,
+                         backend: str = "ffmpeg", use_10bit: bool = False):
+    """Create a video writer (used for streaming output)."""
+    os.makedirs(Path(path).parent, exist_ok=True)
+    if backend == "ffmpeg":
+        return FFMPEGVideoWriter(path, width, height, fps, use_10bit)
+    else:
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')
+        writer = cv2.VideoWriter(path, fourcc, fps, (width, height))
+        if not writer.isOpened():
+            writer.release()
+            writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+        return writer
 
 
 # =============================================================================
@@ -353,8 +409,20 @@ class AstraSLP3:
     def progress_func(self, progress: float, message: str = "Processing..."):
         logger.info(f"Overall progress={progress * 100:.2f}% - {message}")
 
-    def _process_video(self, frames: torch.Tensor, resolution: int) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Delegate to the pixel-space chunking pipeline in generation_phases_pix."""
+    def _process_video(self, frames, resolution: int,
+                       output_callback=None) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Delegate to the pixel-space chunking pipeline in generation_phases_pix.
+
+        Args:
+            frames: Input frames – either a ``torch.Tensor`` or a
+                ``LazyVideoReader`` (both support ``.shape`` and slice
+                indexing).
+            resolution: Target shortest-edge resolution.
+            output_callback: If set, finalized post-processed frames are
+                streamed to this callback instead of being accumulated
+                in RAM.  ``callback(frames_tensor)`` where
+                ``frames_tensor`` is ``[N, H, W, C]`` float16 ``[0, 1]``.
+        """
         return process_video_pix_chunked(
             runner=self.runner,
             ctx=self.ctx,
@@ -376,6 +444,7 @@ class AstraSLP3:
             usm_radius=USM_RADIUS,
             usm_threshold=USM_THRESHOLD,
             device=self.device,
+            output_callback=output_callback,
         )
 
     def __call__(
@@ -399,17 +468,20 @@ class AstraSLP3:
         logger.info(f"Target box: widthxheight: {output_width}x{output_height}")
 
         if callable(getattr(self, 'progress_func', None)):
-            self.progress_func(0.0, "Loading video frames...")
+            self.progress_func(0.0, "Probing video metadata...")
 
-        frames, fps = extract_video_frames(input_path, SKIP_FIRST_FRAMES, LOAD_CAP)
-        if frames.shape[0] < 5:
+        # ── Lazy video reader: reads frames per-chunk, not all at once ──
+        reader = LazyVideoReader(input_path, SKIP_FIRST_FRAMES, LOAD_CAP)
+        fps = reader.fps
+
+        if reader.shape[0] < 5:
             debug.log(
-                f"Cannot process: clip too short ({frames.shape[0]} frames, minimum 5)",
+                f"Cannot process: clip too short ({reader.shape[0]} frames, minimum 5)",
                 level="ERROR", force=True,
             )
             sys.exit(1)
 
-        input_h, input_w = frames.shape[1], frames.shape[2]
+        input_h, input_w = reader.shape[1], reader.shape[2]
         resolution_w, resolution_h = compute_resolution(input_w, input_h, output_width, output_height)
         debug.log(
             f"Input: {input_w}x{input_h}, target box: {output_width}x{output_height} "
@@ -420,22 +492,40 @@ class AstraSLP3:
         if callable(getattr(self, 'progress_func', None)):
             self.progress_func(0.05, "Processing video...")
 
-        result, timings = self._process_video(frames, min(resolution_w, resolution_h))
+        # ── Streaming output: write finalized frames to disk as they
+        #    become available so we never hold the full output in RAM. ──
+        writer_holder = [None]   # lazily initialised on first callback
+        saved_frames = [0]
+
+        def _output_callback(frames_tensor: torch.Tensor):
+            """Receive post-processed frames [N, H, W, C] float16 [0,1] and save."""
+            if writer_holder[0] is None:
+                _, H, W, _ = frames_tensor.shape
+                writer_holder[0] = _create_video_writer(
+                    output_path, W, H, fps, VIDEO_BACKEND, USE_10BIT,
+                )
+            for i in range(frames_tensor.shape[0]):
+                frame_np = (frames_tensor[i].float().numpy() * 255.0).astype(np.uint8)
+                writer_holder[0].write(cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR))
+            saved_frames[0] += frames_tensor.shape[0]
+
+        _, timings = self._process_video(
+            reader, min(resolution_w, resolution_h),
+            output_callback=_output_callback,
+        )
+
+        if writer_holder[0] is not None:
+            writer_holder[0].release()
 
         if callable(getattr(self, 'progress_func', None)):
-            self.progress_func(0.95, "Saving video...")
+            self.progress_func(0.95, "Finalising...")
 
-        t_save_start = time.time()
-        save_video(result, output_path, fps, VIDEO_BACKEND, USE_10BIT)
-        t_save_end = time.time()
-
-        logger.info(f"Saved output to {output_path}")
+        logger.info(f"Saved {saved_frames[0]} frames to {output_path}")
         logger.info(
             f"[Profile] Total -- Encode: {timings['encode']:.2f}s, "
             f"DiT: {timings['dit']:.2f}s, "
             f"Decode: {timings['decode']:.2f}s, "
-            f"Post: {timings['post']:.2f}s, "
-            f"Save: {t_save_end - t_save_start:.2f}s"
+            f"Post: {timings['post']:.2f}s"
         )
 
         if callable(getattr(self, 'progress_func', None)):

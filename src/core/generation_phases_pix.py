@@ -24,7 +24,8 @@ import time
 import logging
 import math
 import torch
-from typing import Dict, Any, Optional, Tuple, List
+import torch.nn.functional as F
+from typing import Callable, Dict, Any, Optional, Tuple, List
 
 from .generation_phases_latent import (
     encode_whole_video,
@@ -265,13 +266,140 @@ def process_pix_chunk(
 
 
 # =============================================================================
+# Inline post-processing (for streaming mode)
+# =============================================================================
+
+def _postprocess_frames_inline(
+    decoded: torch.Tensor,
+    transformed: Optional[torch.Tensor],
+    color_correction: str,
+    usm_weight: float,
+    usm_radius: int,
+    usm_threshold: int,
+    device: str = "cuda:0",
+) -> torch.Tensor:
+    """
+    Post-process a small batch of decoded frames **in-place** so they can be
+    written to disk immediately.
+
+    This is the streaming equivalent of ``postprocess_latent_output`` —
+    it applies color correction + USM sharpening on a per-batch basis
+    instead of on the whole video.
+
+    Args:
+        decoded:          ``[T, H, W, C]`` in ``[-1, 1]`` on **CPU**.
+        transformed:      ``[C, T, H, W]`` in ``[-1, 1]`` on **CPU** (reference
+                          for color correction, or ``None``).
+        color_correction: Color-correction method name.
+        usm_weight:       USM sharpening weight (0 = disabled).
+        usm_radius:       USM Gaussian kernel size (must be odd).
+        usm_threshold:    USM pixel-difference threshold.
+        device:           GPU device string.
+
+    Returns:
+        ``[T, H, W, C]`` float16 ``[0, 1]`` on **CPU**, ready for saving.
+    """
+    T = decoded.shape[0]
+    if T == 0:
+        return decoded.to(dtype=torch.float16)
+
+    # ── Color correction ──
+    if color_correction != "none" and transformed is not None:
+        from ..utils.color_fix import (
+            lab_color_transfer, lab_reinhard_transfer, wavelet_reconstruction,
+            hsv_saturation_histogram_match, wavelet_adaptive_color_correction,
+            adaptive_instance_normalization,
+        )
+
+        # transformed: [C, T, H, W] → reference_cpu: [T, C, H, W]
+        reference_cpu = transformed.permute(1, 0, 2, 3)
+
+        # video: [T, H, W, C] → [T, C, H, W]
+        video = decoded.permute(0, 3, 1, 2).to(device)
+
+        chunk_sz = max(1, min(32, T))
+        result_chunks = []
+        for s in range(0, T, chunk_sz):
+            e = min(s + chunk_sz, T)
+            vc = video[s:e]
+            rc = reference_cpu[s:e].to(device)
+
+            if color_correction == "lab":
+                vc = lab_color_transfer(vc, rc, None, luminance_weight=0.8)
+            elif color_correction == "lab_reinhard":
+                vc = lab_reinhard_transfer(vc, rc, None)
+            elif color_correction == "wavelet":
+                vc = wavelet_reconstruction(vc, rc, None)
+            elif color_correction == "hsv":
+                orig_dev = vc.device
+                vc = hsv_saturation_histogram_match(vc.cpu(), rc.cpu(), None).to(orig_dev)
+            elif color_correction == "wavelet_adaptive":
+                vc = wavelet_adaptive_color_correction(vc, rc, None)
+            elif color_correction == "adain":
+                vc = adaptive_instance_normalization(vc, rc)
+
+            vc.clamp_(-1, 1).mul_(0.5).add_(0.5)
+            result_chunks.append(vc.permute(0, 2, 3, 1).to(dtype=torch.float16).cpu())
+            del rc
+        del video
+        torch.cuda.empty_cache()
+        video_out = torch.cat(result_chunks, dim=0)
+        del result_chunks, reference_cpu
+    else:
+        video_out = decoded.clamp(-1, 1).mul(0.5).add(0.5).to(dtype=torch.float16)
+
+    # ── USM sharpening ──
+    if usm_weight > 0:
+        radius = usm_radius if usm_radius % 2 == 1 else usm_radius + 1
+        gpu_device = torch.device(device)
+        _, H, W, C = video_out.shape
+
+        sigma = 0.3 * ((radius - 1) * 0.5 - 1) + 0.8
+        ax = torch.arange(radius, device=gpu_device, dtype=torch.float32) - (radius - 1) / 2.0
+        gauss_1d = torch.exp(-0.5 * (ax / sigma) ** 2)
+        gauss_1d = gauss_1d / gauss_1d.sum()
+        pad = radius // 2
+
+        kernel_h = gauss_1d.view(1, 1, 1, -1).expand(C, -1, -1, -1).contiguous()
+        kernel_v = gauss_1d.view(1, 1, -1, 1).expand(C, -1, -1, -1).contiguous()
+
+        def _blur(x):
+            x = F.pad(x, [pad, pad, 0, 0], mode='reflect')
+            x = F.conv2d(x, kernel_h, groups=C)
+            x = F.pad(x, [0, 0, pad, pad], mode='reflect')
+            x = F.conv2d(x, kernel_v, groups=C)
+            return x
+
+        usm_chunk = max(1, min(8, T))
+        for s in range(0, T, usm_chunk):
+            e = min(s + usm_chunk, T)
+            chunk = video_out[s:e].to(device=gpu_device, dtype=torch.float32).permute(0, 3, 1, 2)
+            blur = _blur(chunk)
+            residual = chunk - blur
+            del blur
+            mask = (residual.abs() * 255.0 > usm_threshold).float()
+            soft_mask = _blur(mask)
+            del mask
+            sharp = (chunk + usm_weight * residual).clamp_(0, 1)
+            out = soft_mask * sharp + (1.0 - soft_mask) * chunk
+            del residual, soft_mask, sharp, chunk
+            video_out[s:e] = out.permute(0, 2, 3, 1).to(dtype=torch.float16).cpu()
+            del out
+            torch.cuda.empty_cache()
+
+        del kernel_h, kernel_v, gauss_1d
+
+    return video_out
+
+
+# =============================================================================
 # Full pixel-space temporal-chunking pipeline
 # =============================================================================
 
 def process_video_pix_chunked(
     runner,
     ctx: Dict[str, Any],
-    frames: torch.Tensor,
+    frames,
     debug,
     resolution: int,
     max_resolution: int = 0,
@@ -290,7 +418,8 @@ def process_video_pix_chunked(
     usm_radius: int = 51,
     usm_threshold: int = 10,
     device: str = "cuda:0",
-) -> Tuple[torch.Tensor, Dict[str, float]]:
+    output_callback: Optional[Callable[[torch.Tensor], None]] = None,
+) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
     """
     Complete pixel-space temporal chunking pipeline.
 
@@ -311,13 +440,22 @@ def process_video_pix_chunked(
 
     After each chunk is decoded, overlapping regions in the decoded output
     are blended using a Hann-window crossfade (matching ``decode_all_batches``
-    in the reference).  Finally the assembled video is post-processed as one
-    (color correction + USM sharpening).
+    in the reference).
+
+    **Streaming mode** (``output_callback is not None``):
+        Finalized frames are post-processed per-chunk and streamed via
+        ``output_callback(tensor)`` (``[N, H, W, C]`` float16 ``[0, 1]``).
+        Only the overlap buffer is kept in RAM.  Returns ``(None, timings)``.
+
+    **Accumulate mode** (``output_callback is None``):
+        All frames are accumulated in a CPU buffer, post-processed as one,
+        and returned as ``(result, timings)``.
 
     Args:
         runner:             VideoDiffusionInfer (loaded DiT + VAE).
         ctx:                Shared generation context dict.
-        frames:             All input frames ``[T, H, W, C]`` float16 ``[0, 1]``.
+        frames:             Input frames -- ``torch.Tensor [T, H, W, C]`` or a
+                            lazy reader with ``.shape`` and slice support.
         debug:              Debug logger.
         resolution:         Target shortest-edge resolution.
         max_resolution:     Max resolution cap (0 = no limit).
@@ -338,12 +476,17 @@ def process_video_pix_chunked(
         usm_radius:         USM Gaussian kernel size.
         usm_threshold:      USM pixel-difference threshold.
         device:             Target device string (e.g. ``"cuda:0"``).
+        output_callback:    If set, stream post-processed frames to this
+                            callable instead of accumulating in RAM.
 
     Returns:
         ``(result, timings)`` where
-        - *result*  is ``[T, H, W, C]`` float32 ``[0, 1]`` on CPU
-        - *timings* is a dict with ``encode_dit_decode``, ``blend``, ``post``
+        - *result*  is ``[T, H, W, C]`` float16 ``[0, 1]`` on CPU (accumulate mode)
+          or ``None`` (streaming mode).
+        - *timings* is a dict with ``encode_dit_decode``, ``encode``, ``dit``,
+          ``decode``, ``post``.
     """
+    streaming = output_callback is not None
     T_total = frames.shape[0]
 
     # stride = new (non-overlapping) frames advanced per chunk
@@ -354,15 +497,12 @@ def process_video_pix_chunked(
         logger.warning("temporal_overlap >= chunk_size, resetting overlap to 0")
 
     # --- Compute overlapping read windows ---
-    # Each window reads chunk_size frames; windows are spaced by step.
-    # Matches: for batch_idx in range(0, total_frames, step): ... [batch_idx : batch_idx + batch_size]
     if chunk_size <= 0 or chunk_size >= T_total:
         read_windows: List[Tuple[int, int]] = [(0, T_total)]
     else:
         read_windows = []
         for start in range(0, T_total, step):
             end = min(start + chunk_size, T_total)
-            # Skip tiny trailing window whose unique frames <= overlap
             if start > 0 and (end - start) <= overlap:
                 break
             read_windows.append((start, end))
@@ -374,10 +514,9 @@ def process_video_pix_chunked(
         _, in_h, in_w, _ = frames.shape
         dit_tiles = _compute_dit_tiles(in_h, in_w, resolution)
 
-
     logger.info(
-        "Pixel-space chunking: %d chunk(s), batch_size=%d, temporal_overlap=%d, step=%d, dit_tiles=%s",
-        num_chunks, chunk_size, overlap, step, dit_tiles,
+        "Pixel-space chunking: %d chunk(s), batch_size=%d, temporal_overlap=%d, step=%d, dit_tiles=%s, streaming=%s",
+        num_chunks, chunk_size, overlap, step, dit_tiles, streaming,
     )
 
     # --- Process each chunk through encode -> DiT -> decode ---
@@ -385,141 +524,290 @@ def process_video_pix_chunked(
     total_encode_time = 0.0
     total_dit_time = 0.0
     total_decode_time = 0.0
+    total_post_time = 0.0
 
-    # We assemble into a pre-allocated final_video buffer and blend in-place,
-    # matching the decode_all_batches pattern from the reference.
-    # However, we don't know the output spatial dims until the first chunk is
-    # decoded, so we handle that lazily.
-    final_video: Optional[torch.Tensor] = None          # [T_total, H_out, W_out, C]
-    final_transformed: Optional[torch.Tensor] = None     # [C, T_total, H_out, W_out]
-    current_write_idx = 0   # tracks how many decoded frames have been written
+    # ------------------------------------------------------------------
+    # Helper: post-process and emit (streaming) or just return (accum.)
+    # ------------------------------------------------------------------
+    def _pp(dec: torch.Tensor, trans: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Post-process ``dec`` frames and stream / return them."""
+        if dec.shape[0] == 0:
+            return dec.to(dtype=torch.float16) if not streaming else None
+        processed = _postprocess_frames_inline(
+            dec, trans, color_correction,
+            usm_weight, usm_radius, usm_threshold, device,
+        )
+        if streaming:
+            output_callback(processed)
+            del processed
+            return None
+        return processed
 
-    for ci, (ws, we) in enumerate(read_windows):
-        chunk_input = frames[ws:we]
-        chunk_len = chunk_input.shape[0]
+    if streaming:
+        # ----- STREAMING MODE -----
+        # Keep only the overlap tail between chunks; post-process and
+        # stream finalized frames via callback.
+        overlap_dec: Optional[torch.Tensor] = None     # [overlap, H, W, C]
+        overlap_trans: Optional[torch.Tensor] = None    # [C, overlap, H, W]
 
+        for ci, (ws, we) in enumerate(read_windows):
+            chunk_input = frames[ws:we]
+            chunk_len = chunk_input.shape[0]
+
+            logger.info(
+                "Chunk %d/%d: input frames [%d, %d) (%d frames)",
+                ci + 1, num_chunks, ws, we, chunk_len,
+            )
+
+            t0 = time.time()
+            decoded, transformed, chunk_timings = process_pix_chunk(
+                runner, ctx, chunk_input, debug,
+                resolution, max_resolution, seed,
+                latent_noise_scale, shared_noise,
+                dit_tiles, dit_tile_overlap,
+                prompt, negative_prompt, cfg_scale,
+            )
+            t1 = time.time()
+            total_encode_time += chunk_timings["encode"]
+            total_dit_time += chunk_timings["dit"]
+            total_decode_time += chunk_timings["decode"]
+            logger.info(
+                "[Profile] Chunk %d/%d: %.2fs (encode=%.2fs, dit=%.2fs, decode=%.2fs)",
+                ci + 1, num_chunks, t1 - t0,
+                chunk_timings["encode"], chunk_timings["dit"], chunk_timings["decode"],
+            )
+
+            is_last = (ci == num_chunks - 1)
+            t_pp0 = time.time()
+
+            if ci == 0:
+                # ── First chunk ──
+                if num_chunks == 1:
+                    # Only one chunk — everything is final
+                    _pp(decoded, transformed)
+                else:
+                    # Save everything except the last *overlap* frames
+                    if overlap > 0 and decoded.shape[0] > overlap:
+                        safe_dec = decoded[:-overlap]
+                        safe_trans = transformed[:, :-overlap] if transformed is not None else None
+                        _pp(safe_dec, safe_trans)
+                        overlap_dec = decoded[-overlap:].clone()
+                        overlap_trans = transformed[:, -overlap:].clone() if transformed is not None else None
+                    elif overlap > 0:
+                        # Entire chunk is overlap-sized; hold it all
+                        overlap_dec = decoded.clone()
+                        overlap_trans = transformed.clone() if transformed is not None else None
+                    else:
+                        _pp(decoded, transformed)
+            else:
+                # ── Subsequent chunks ──
+                actual_overlap = min(overlap, decoded.shape[0])
+                if overlap_dec is not None:
+                    actual_overlap = min(actual_overlap, overlap_dec.shape[0])
+
+                if actual_overlap > 0 and overlap_dec is not None:
+                    # Blend the overlap region
+                    blended_dec = _blend_overlapping_frames(
+                        overlap_dec, decoded[:actual_overlap], actual_overlap,
+                    )
+                    blended_trans = None
+                    if overlap_trans is not None and transformed is not None:
+                        blended_trans_raw = _blend_overlapping_transformed(
+                            overlap_trans, transformed[:, :actual_overlap], actual_overlap,
+                        )
+                        blended_trans = blended_trans_raw
+
+                    debug.log(
+                        f"Blended {actual_overlap} overlapping frames",
+                        category="video", indent_level=1,
+                    )
+
+                    # Blended overlap is now final — post-process & stream
+                    _pp(blended_dec, blended_trans)
+                    del blended_dec
+                    if blended_trans is not None:
+                        del blended_trans
+
+                # Non-overlapping remainder of this chunk
+                rest_dec = decoded[actual_overlap:]
+                rest_trans = transformed[:, actual_overlap:] if transformed is not None else None
+
+                if is_last or overlap == 0:
+                    # All remaining frames are final
+                    _pp(rest_dec, rest_trans)
+                    overlap_dec = None
+                    overlap_trans = None
+                else:
+                    # Hold back the tail for blending with the next chunk
+                    if rest_dec.shape[0] > overlap:
+                        safe_dec = rest_dec[:-overlap]
+                        safe_trans = rest_trans[:, :-overlap] if rest_trans is not None else None
+                        _pp(safe_dec, safe_trans)
+                        overlap_dec = rest_dec[-overlap:].clone()
+                        overlap_trans = rest_trans[:, -overlap:].clone() if rest_trans is not None else None
+                    elif rest_dec.shape[0] > 0:
+                        overlap_dec = rest_dec.clone()
+                        overlap_trans = rest_trans.clone() if rest_trans is not None else None
+                    else:
+                        overlap_dec = None
+                        overlap_trans = None
+
+            t_pp1 = time.time()
+            total_post_time += t_pp1 - t_pp0
+
+            del decoded, transformed, chunk_input
+            if not is_last:
+                clear_memory(debug=debug, force=True)
+
+        # Flush any remaining overlap buffer (shouldn't normally happen)
+        if overlap_dec is not None and overlap_dec.shape[0] > 0:
+            t_pp0 = time.time()
+            _pp(overlap_dec, overlap_trans)
+            t_pp1 = time.time()
+            total_post_time += t_pp1 - t_pp0
+            del overlap_dec, overlap_trans
+
+        t_pipeline_end = time.time()
         logger.info(
-            "Chunk %d/%d: input frames [%d, %d) (%d frames)",
-            ci + 1, num_chunks, ws, we, chunk_len,
+            "[Profile] All %d chunks total: %.2fs (encode=%.2fs, dit=%.2fs, decode=%.2fs, post=%.2fs)",
+            num_chunks, t_pipeline_end - t_pipeline_start,
+            total_encode_time, total_dit_time, total_decode_time, total_post_time,
         )
 
-        t0 = time.time()
-        decoded, transformed, chunk_timings = process_pix_chunk(
-            runner, ctx, chunk_input, debug,
-            resolution, max_resolution, seed,
-            latent_noise_scale, shared_noise,
-            dit_tiles, dit_tile_overlap,
-            prompt, negative_prompt, cfg_scale,
-        )
-        t1 = time.time()
-        total_encode_time += chunk_timings["encode"]
-        total_dit_time += chunk_timings["dit"]
-        total_decode_time += chunk_timings["decode"]
-        logger.info(
-            "[Profile] Chunk %d/%d: %.2fs (encode=%.2fs, dit=%.2fs, decode=%.2fs)",
-            ci + 1, num_chunks, t1 - t0,
-            chunk_timings["encode"], chunk_timings["dit"], chunk_timings["decode"],
-        )
+        timings = {
+            "encode_dit_decode": t_pipeline_end - t_pipeline_start,
+            "encode": total_encode_time,
+            "dit": total_dit_time,
+            "decode": total_decode_time,
+            "post": total_post_time,
+        }
+        return None, timings
 
-        # decoded: [T_chunk, H_out, W_out, C]  on CPU, [-1,1]
-        # transformed: [C, T_chunk, H_out, W_out] on CPU, [-1,1] or None
-        decoded_frames = decoded.shape[0]
+    else:
+        # ----- ACCUMULATE MODE (original behaviour) -----
+        final_video: Optional[torch.Tensor] = None
+        final_transformed: Optional[torch.Tensor] = None
+        current_write_idx = 0
 
-        # Lazy allocation of output buffers after first decode reveals spatial dims
-        if final_video is None:
-            _, H_out, W_out, C_out = decoded.shape
-            final_video = torch.zeros(T_total, H_out, W_out, C_out,
-                                      dtype=decoded.dtype, device='cpu')
-            if transformed is not None:
-                C_t = transformed.shape[0]
-                final_transformed = torch.zeros(C_t, T_total, H_out, W_out,
-                                                dtype=transformed.dtype, device='cpu')
+        for ci, (ws, we) in enumerate(read_windows):
+            chunk_input = frames[ws:we]
+            chunk_len = chunk_input.shape[0]
 
-        if ci == 0 or overlap == 0:
-            # First chunk or no overlap: write all frames directly
-            write_end = min(current_write_idx + decoded_frames, T_total)
-            frames_to_write = write_end - current_write_idx
-            final_video[current_write_idx:write_end] = decoded[:frames_to_write]
-            if final_transformed is not None and transformed is not None:
-                final_transformed[:, current_write_idx:write_end] = transformed[:, :frames_to_write]
-            current_write_idx = write_end
-        else:
-            # Subsequent chunks with overlap: blend the overlapping region
-            actual_overlap = min(overlap, decoded_frames, current_write_idx)
+            logger.info(
+                "Chunk %d/%d: input frames [%d, %d) (%d frames)",
+                ci + 1, num_chunks, ws, we, chunk_len,
+            )
 
-            if actual_overlap > 0:
-                # Blend overlapping region in-place on final_video
-                prev_tail = final_video[current_write_idx - actual_overlap:current_write_idx]
-                cur_head = decoded[:actual_overlap]
-                blended = _blend_overlapping_frames(prev_tail, cur_head, actual_overlap)
-                final_video[current_write_idx - actual_overlap:current_write_idx] = blended
+            t0 = time.time()
+            decoded, transformed, chunk_timings = process_pix_chunk(
+                runner, ctx, chunk_input, debug,
+                resolution, max_resolution, seed,
+                latent_noise_scale, shared_noise,
+                dit_tiles, dit_tile_overlap,
+                prompt, negative_prompt, cfg_scale,
+            )
+            t1 = time.time()
+            total_encode_time += chunk_timings["encode"]
+            total_dit_time += chunk_timings["dit"]
+            total_decode_time += chunk_timings["decode"]
+            logger.info(
+                "[Profile] Chunk %d/%d: %.2fs (encode=%.2fs, dit=%.2fs, decode=%.2fs)",
+                ci + 1, num_chunks, t1 - t0,
+                chunk_timings["encode"], chunk_timings["dit"], chunk_timings["decode"],
+            )
 
-                # Blend transformed too
+            decoded_frames = decoded.shape[0]
+
+            # Lazy allocation
+            if final_video is None:
+                _, H_out, W_out, C_out = decoded.shape
+                final_video = torch.zeros(T_total, H_out, W_out, C_out,
+                                          dtype=decoded.dtype, device='cpu')
+                if transformed is not None:
+                    C_t = transformed.shape[0]
+                    final_transformed = torch.zeros(C_t, T_total, H_out, W_out,
+                                                    dtype=transformed.dtype, device='cpu')
+
+            if ci == 0 or overlap == 0:
+                write_end = min(current_write_idx + decoded_frames, T_total)
+                frames_to_write = write_end - current_write_idx
+                final_video[current_write_idx:write_end] = decoded[:frames_to_write]
                 if final_transformed is not None and transformed is not None:
-                    prev_tail_t = final_transformed[:, current_write_idx - actual_overlap:current_write_idx]
-                    cur_head_t = transformed[:, :actual_overlap]
-                    blended_t = _blend_overlapping_transformed(prev_tail_t, cur_head_t, actual_overlap)
-                    final_transformed[:, current_write_idx - actual_overlap:current_write_idx] = blended_t
-                    del prev_tail_t, cur_head_t, blended_t
+                    final_transformed[:, current_write_idx:write_end] = transformed[:, :frames_to_write]
+                current_write_idx = write_end
+            else:
+                actual_overlap = min(overlap, decoded_frames, current_write_idx)
 
-                debug.log(
-                    f"Blended {actual_overlap} overlapping frames at positions "
-                    f"{current_write_idx - actual_overlap}-{current_write_idx}",
-                    category="video", indent_level=1,
-                )
-                del prev_tail, cur_head, blended
+                if actual_overlap > 0:
+                    prev_tail = final_video[current_write_idx - actual_overlap:current_write_idx]
+                    cur_head = decoded[:actual_overlap]
+                    blended = _blend_overlapping_frames(prev_tail, cur_head, actual_overlap)
+                    final_video[current_write_idx - actual_overlap:current_write_idx] = blended
 
-            # Write non-overlapping part
-            non_overlap_decoded = decoded[actual_overlap:]
-            non_overlap_len = non_overlap_decoded.shape[0]
-            write_end = min(current_write_idx + non_overlap_len, T_total)
-            frames_to_write = write_end - current_write_idx
-            final_video[current_write_idx:write_end] = non_overlap_decoded[:frames_to_write]
-            if final_transformed is not None and transformed is not None:
-                non_overlap_t = transformed[:, actual_overlap:]
-                final_transformed[:, current_write_idx:write_end] = non_overlap_t[:, :frames_to_write]
-            current_write_idx = write_end
+                    if final_transformed is not None and transformed is not None:
+                        prev_tail_t = final_transformed[:, current_write_idx - actual_overlap:current_write_idx]
+                        cur_head_t = transformed[:, :actual_overlap]
+                        blended_t = _blend_overlapping_transformed(prev_tail_t, cur_head_t, actual_overlap)
+                        final_transformed[:, current_write_idx - actual_overlap:current_write_idx] = blended_t
+                        del prev_tail_t, cur_head_t, blended_t
 
-        del decoded, transformed, chunk_input
-        if ci < num_chunks - 1:
-            clear_memory(debug=debug, force=True)
+                    debug.log(
+                        f"Blended {actual_overlap} overlapping frames at positions "
+                        f"{current_write_idx - actual_overlap}-{current_write_idx}",
+                        category="video", indent_level=1,
+                    )
+                    del prev_tail, cur_head, blended
 
-    t_pipeline_end = time.time()
-    logger.info(
-        "[Profile] All %d chunks total: %.2fs (encode=%.2fs, dit=%.2fs, decode=%.2fs)",
-        num_chunks, t_pipeline_end - t_pipeline_start,
-        total_encode_time, total_dit_time, total_decode_time,
-    )
+                non_overlap_decoded = decoded[actual_overlap:]
+                non_overlap_len = non_overlap_decoded.shape[0]
+                write_end = min(current_write_idx + non_overlap_len, T_total)
+                frames_to_write = write_end - current_write_idx
+                final_video[current_write_idx:write_end] = non_overlap_decoded[:frames_to_write]
+                if final_transformed is not None and transformed is not None:
+                    non_overlap_t = transformed[:, actual_overlap:]
+                    final_transformed[:, current_write_idx:write_end] = non_overlap_t[:, :frames_to_write]
+                current_write_idx = write_end
 
-    # --- Post-process (color correction + USM) on the whole assembled video ---
-    _reset_ctx(ctx)
-    ctx['decoded_video'] = final_video.to(device)
-    del final_video
-    if final_transformed is not None:
-        ctx['transformed_video'] = final_transformed
-        del final_transformed
-    clear_memory(debug=debug, force=True)
+            del decoded, transformed, chunk_input
+            if ci < num_chunks - 1:
+                clear_memory(debug=debug, force=True)
 
-    t_post_start = time.time()
-    ctx = postprocess_latent_output(
-        ctx, debug, color_correction,
-        usm_weight=usm_weight,
-        usm_radius=usm_radius,
-        usm_threshold=usm_threshold,
-    )
-    t_post_end = time.time()
-    logger.info("[Profile] Post-process: %.2fs", t_post_end - t_post_start)
+        t_pipeline_end = time.time()
+        logger.info(
+            "[Profile] All %d chunks total: %.2fs (encode=%.2fs, dit=%.2fs, decode=%.2fs)",
+            num_chunks, t_pipeline_end - t_pipeline_start,
+            total_encode_time, total_dit_time, total_decode_time,
+        )
 
-    timings = {
-        "encode_dit_decode": t_pipeline_end - t_pipeline_start,
-        "encode": total_encode_time,
-        "dit": total_dit_time,
-        "decode": total_decode_time,
-        "post": t_post_end - t_post_start,
-    }
+        # --- Post-process (color correction + USM) on the whole assembled video ---
+        _reset_ctx(ctx)
+        ctx['decoded_video'] = final_video.to(device)
+        del final_video
+        if final_transformed is not None:
+            ctx['transformed_video'] = final_transformed
+            del final_transformed
+        clear_memory(debug=debug, force=True)
 
-    result = ctx['final_video']
-    if result.is_cuda or (hasattr(result, 'is_mps') and result.is_mps):
-        result = result.cpu()
+        t_post_start = time.time()
+        ctx = postprocess_latent_output(
+            ctx, debug, color_correction,
+            usm_weight=usm_weight,
+            usm_radius=usm_radius,
+            usm_threshold=usm_threshold,
+        )
+        t_post_end = time.time()
+        logger.info("[Profile] Post-process: %.2fs", t_post_end - t_post_start)
 
-    return result, timings
+        timings = {
+            "encode_dit_decode": t_pipeline_end - t_pipeline_start,
+            "encode": total_encode_time,
+            "dit": total_dit_time,
+            "decode": total_decode_time,
+            "post": t_post_end - t_post_start,
+        }
+
+        result = ctx['final_video']
+        if result.is_cuda or (hasattr(result, 'is_mps') and result.is_mps):
+            result = result.cpu()
+
+        return result, timings
