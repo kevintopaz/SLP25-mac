@@ -594,8 +594,11 @@ def _compute_dit_tile_params(
     tile_w = min(tile_w, W)
     
     # Compute stride (step between tile starts)
-    stride_h = tile_h - ((tile_h * tile_rows - H) // (tile_rows - 1))
-    stride_w = tile_w - ((tile_w * tile_cols - W) // (tile_cols - 1))
+    # When there is only 1 tile along an axis the stride is unused (only
+    # index 0 is iterated), so fall back to the tile size to avoid a
+    # division-by-zero.
+    stride_h = tile_h if tile_rows <= 1 else tile_h - ((tile_h * tile_rows - H) // (tile_rows - 1))
+    stride_w = tile_w if tile_cols <= 1 else tile_w - ((tile_w * tile_cols - W) // (tile_cols - 1))
     
     # Generate tile positions
     tiles_info = []

@@ -119,6 +119,46 @@ def _blend_overlapping_transformed(
     return prev_tail * w_prev + cur_head * w_cur
 
 
+def _compute_dit_tiles(
+    input_h: int, input_w: int, resolution: int
+) -> Optional[Tuple[int, int]]:
+    """
+    Compute DiT spatial tiling ``(rows, cols)`` based on target pixel count.
+
+    The target dimensions are reconstructed from the input aspect ratio and
+    *resolution* (shortest edge of the target).
+
+    Rules (by total pixel count):
+        - Target ≤ 1920×1080 (2.07M pixels)  →  ``None``  (no tiling)
+        - Target ≤ 3840×1080 (4.15M pixels)  →  ``(1, 2)`` or ``(2, 1)``
+          (2 tiles along the longer edge only)
+        - Target > 3840×1080 (4.15M pixels)  →  ``(2, 2)``
+    """
+    THRESHOLD_NO_TILE = (1920+100) * (1080+100)    # ~2.07M pixels
+    THRESHOLD_ONE_AXIS = (3840+100) * (1080+100)   # ~4.15M pixels
+
+    # Reconstruct target dimensions from input aspect ratio
+    if input_w >= input_h:
+        target_h = resolution
+        target_w = round(resolution * input_w / input_h)
+    else:
+        target_w = resolution
+        target_h = round(resolution * input_h / input_w)
+
+    total_pixels = target_w * target_h
+
+    if total_pixels <= THRESHOLD_NO_TILE:
+        return None
+    elif total_pixels <= THRESHOLD_ONE_AXIS:
+        # Tile only the longer edge
+        if target_w >= target_h:
+            return (1, 2)   # 2 tiles along width (cols)
+        else:
+            return (2, 1)   # 2 tiles along height (rows)
+    else:
+        return (2, 2)
+
+
 # =============================================================================
 # Single-chunk processing
 # =============================================================================
@@ -329,13 +369,15 @@ def process_video_pix_chunked(
 
     num_chunks = len(read_windows)
 
-    # Auto-determine spatial DiT tiling from resolution
+    # Auto-determine spatial DiT tiling from target output resolution
     if dit_tiles is None:
-        dit_tiles = (2, 2) if resolution >= 1800 else None
+        _, in_h, in_w, _ = frames.shape
+        dit_tiles = _compute_dit_tiles(in_h, in_w, resolution)
+
 
     logger.info(
-        "Pixel-space chunking: %d chunk(s), batch_size=%d, temporal_overlap=%d, step=%d",
-        num_chunks, chunk_size, overlap, step,
+        "Pixel-space chunking: %d chunk(s), batch_size=%d, temporal_overlap=%d, step=%d, dit_tiles=%s",
+        num_chunks, chunk_size, overlap, step, dit_tiles,
     )
 
     # --- Process each chunk through encode -> DiT -> decode ---

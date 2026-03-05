@@ -181,6 +181,35 @@ class FFMPEGVideoWriter:
             self.proc = None
 
 
+def get_video_sar(video_path: str) -> float:
+    """
+    Read the Sample Aspect Ratio (SAR / pixel aspect ratio) from a video file
+    using ffprobe.  Returns the SAR as a float (>0).  1.0 means square pixels.
+
+    Reference: old_code.py – VideoReader reads ``stream.sample_aspect_ratio``
+    via PyAV and FrameProcessor multiplies the width by SAR to convert to
+    square-pixel space before computing the output resolution.
+    """
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
+             '-show_entries', 'stream=sample_aspect_ratio',
+             '-of', 'csv=p=0', video_path],
+            capture_output=True, text=True, timeout=10,
+        )
+        sar_str = result.stdout.strip()
+        if not sar_str or sar_str in ('N/A', '0:1', '0:0'):
+            return 1.0
+        if ':' in sar_str:
+            num, den = sar_str.split(':')
+            sar = float(num) / float(den)
+        else:
+            sar = float(sar_str)
+        return sar if sar > 0 else 1.0
+    except Exception:
+        return 1.0
+
+
 def compute_resolution(input_w: int, input_h: int, target_w: int, target_h: int) -> Tuple[int, int]:
     """
     Compute final (width, height) that fits within *target_w × target_h*
@@ -226,6 +255,19 @@ def extract_video_frames(video_path: str, skip_frames: int = 0, load_cap: int = 
 
     if not frames:
         raise ValueError("No frames read")
+
+    # SAR pre-stretching: convert non-square pixels to square-pixel space
+    # (mirrors old_code.py FrameProcessor: width = sar * width)
+    sar = get_video_sar(video_path)
+    if sar != 1.0:
+        h, w = frames[0].shape[:2]
+        new_w = round(w * sar)
+        if new_w != w:
+            debug.log(
+                f"SAR={sar:.4f}, pre-stretching {w}x{h} → {new_w}x{h}",
+                category="file", force=True,
+            )
+            frames = [cv2.resize(f, (new_w, h), interpolation=cv2.INTER_CUBIC) for f in frames]
 
     tensor = torch.from_numpy(np.stack(frames)).to(torch.float16)
     debug.log(f"Loaded {len(frames)} frames: {tensor.shape}", category="file", force=True)
@@ -354,7 +396,7 @@ class AstraSLP3:
 
         logger.info(f"Input video: {input_path}")
         logger.info(f"Output path: {output_path}")
-        logger.info(f"Target box: {output_width}x{output_height}")
+        logger.info(f"Target box: widthxheight: {output_width}x{output_height}")
 
         if callable(getattr(self, 'progress_func', None)):
             self.progress_func(0.0, "Loading video frames...")
