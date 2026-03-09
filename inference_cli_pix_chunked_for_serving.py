@@ -124,6 +124,7 @@ import cv2
 import numpy as np
 import shutil
 import subprocess
+import tempfile
 
 from .src.core.generation_utils import setup_generation_context, prepare_runner
 from .src.core.generation_phases_pix import process_video_pix_chunked
@@ -224,6 +225,30 @@ def compute_resolution(input_w: int, input_h: int, target_w: int, target_h: int)
         final_w = target_w
         final_h = round(input_h * scale_w)
     return final_w, final_h
+
+
+def copy_audio_to_video(audio_source: str, video_target: str):
+    """Mux the audio track from *audio_source* into *video_target* (in-place)."""
+    video_dir = os.path.dirname(video_target) or "."
+    file_ext = os.path.splitext(video_target)[1]
+
+    with tempfile.NamedTemporaryFile(dir=video_dir, suffix=file_ext, delete=True) as tmp:
+        temp_output = tmp.name
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "-i", video_target,
+            "-i", audio_source,
+            "-c:v", "copy", "-c:a", "copy",
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-movflags", "+faststart",
+            temp_output, "-y",
+        ]
+        try:
+            subprocess.run(command, check=True, timeout=300)
+            shutil.copy(src=temp_output, dst=video_target)
+            logger.info("Audio copied from source into %s", video_target)
+        except Exception as e:
+            logger.warning("Could not copy audio: %s", e)
 
 
 class LazyVideoReader:
@@ -516,6 +541,8 @@ class AstraSLP3:
 
         if writer_holder[0] is not None:
             writer_holder[0].release()
+
+        copy_audio_to_video(input_path, output_path)
 
         if callable(getattr(self, 'progress_func', None)):
             self.progress_func(0.95, "Finalising...")

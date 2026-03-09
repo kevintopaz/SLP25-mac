@@ -114,6 +114,7 @@ import cv2
 import numpy as np
 import shutil
 import subprocess
+import tempfile
 
 from .src.core.generation_utils import setup_generation_context, prepare_runner
 from .src.core.generation_phases_latent import (
@@ -296,6 +297,30 @@ def save_video(tensor: torch.Tensor, path: str, fps: float, backend: str = "open
     debug.log(f"Saved {T} frames: {path}", category="file", force=True)
 
 
+def copy_audio_to_video(audio_source: str, video_target: str):
+    """Mux the audio track from *audio_source* into *video_target* (in-place)."""
+    video_dir = os.path.dirname(video_target) or "."
+    file_ext = os.path.splitext(video_target)[1]
+
+    with tempfile.NamedTemporaryFile(dir=video_dir, suffix=file_ext, delete=True) as tmp:
+        temp_output = tmp.name
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "-i", video_target,
+            "-i", audio_source,
+            "-c:v", "copy", "-c:a", "copy",
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-movflags", "+faststart",
+            temp_output, "-y",
+        ]
+        try:
+            subprocess.run(command, check=True, timeout=300)
+            shutil.copy(src=temp_output, dst=video_target)
+            logger.info("Audio copied from source into %s", video_target)
+        except Exception as e:
+            logger.warning("Could not copy audio: %s", e)
+
+
 # =============================================================================
 # Upscaler Class
 # =============================================================================
@@ -441,6 +466,8 @@ class AstraSLP3:
         t_save_start = time.time()
         save_video(result, output_path, fps, VIDEO_BACKEND, USE_10BIT)
         t_save_end = time.time()
+
+        copy_audio_to_video(input_path, output_path)
 
         logger.info(f"Saved output to {output_path}")
         logger.info(
