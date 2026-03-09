@@ -705,6 +705,21 @@ def decode_whole_latent(
         debug.log(f"Trimming temporal: {sample.shape[0]} → {T_original} frames", category="vae")
         sample = sample[:T_original]
     
+    # Trim spatial padding added by DivisiblePad to recover true target dims.
+    # Also trim the colour-correction reference (transformed_video) to match.
+    true_dims = ctx.get('true_target_dims')  # (true_h, true_w)
+    if true_dims is not None:
+        true_h, true_w = true_dims
+        current_h, current_w = sample.shape[1], sample.shape[2]
+        if current_h != true_h or current_w != true_w:
+            debug.log(f"Trimming spatial padding: {current_w}x{current_h} → {true_w}x{true_h}",
+                      category="vae", force=True)
+            # decoded sample is [T, H, W, C]
+            sample = sample[:, :true_h, :true_w, :]
+            # transformed_video is [C, T, H, W] — trim to match
+            if 'transformed_video' in ctx:
+                ctx['transformed_video'] = ctx['transformed_video'][:, :, :true_h, :true_w]
+    
     ctx['decoded_video'] = sample
     del ctx['upscaled_latent']
     
