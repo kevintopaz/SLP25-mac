@@ -31,7 +31,7 @@ dit:
     mlp_type: swiglu
     msa_type: None
     block_type: ${eval:'${.num_layers} * ["mmdit_sr"]'}
-    window: ${eval:'${.num_layers} * [(4,3,3)]'}
+    window: ${eval:'${.num_layers} * [(1,3,3)]'}
     window_method: ${eval:'${.num_layers} // 2 * ["720pwin_by_size_bysize","720pswin_by_size_bysize"]'}
     rope_type: mmrope3d
     rope_dim: 128

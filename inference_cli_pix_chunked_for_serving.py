@@ -61,8 +61,8 @@ LOAD_CAP = 0
 # PIX_OVERLAP = temporal_overlap: context frames prepended from previous chunk's tail
 #   for smooth blending between chunks.  Must be < PIX_CHUNK_SIZE.
 #   New frames per chunk (stride) = PIX_CHUNK_SIZE - PIX_OVERLAP.
-PIX_CHUNK_SIZE = 61               # batch_size (4*12+1 = 49) — reduced for 32GB VRAM
-PIX_OVERLAP = 6                  # temporal_overlap
+PIX_CHUNK_SIZE = 33               # batch_size (4*12+1 = 49) — reduced for 32GB VRAM
+PIX_OVERLAP = 8                  # temporal_overlap
 DIT_TILE_OVERLAP = 0.1 
 
 # Post-processing
@@ -390,8 +390,8 @@ class AstraSLP3:
             return args
         else:
             args.model_dir = "models"
-            args.dit_name = "ema_3b_fp16.safetensors"
-            args.vae_name = "ema_vae_fp16.safetensors"
+            args.dit_name = "ema_3b_bf16.safetensors"
+            args.vae_name = "ema_vae_bf16.pth"
             return args
 
     def __init__(self, **kwargs):

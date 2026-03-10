@@ -22,8 +22,8 @@
 #     exit 1
 # fi
 
-INPUT_FOLDER="./landscape_test"
-OUTPUT_FOLDER="./landscape_test_4k_threadedcolor_pixchunk"
+INPUT_FOLDER="/home/topaz/yuan/astra_precision_3/debug_voom"
+OUTPUT_FOLDER="./debug_voom_2k_7_switchckpt3"
 OUTPUT_WIDTH="3840"
 OUTPUT_HEIGHT="2160"
 
