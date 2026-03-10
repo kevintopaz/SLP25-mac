@@ -113,23 +113,25 @@ def load_quantized_state_dict(checkpoint_path: Union[str, bytes], device: torch.
     device_str = str(device)
     
     if isinstance(checkpoint_path, bytes):
-        if not SAFETENSORS_AVAILABLE or load_safetensors_bytes is None:
-            error_msg = "Cannot load from bytes: SafeTensors library is required"
-            if debug:
-                debug.log(error_msg, level="ERROR", category="dit", force=True)
-            raise ImportError(error_msg)
+        # Try safetensors first, fall back to torch.load for .pth bytes
+        if SAFETENSORS_AVAILABLE and load_safetensors_bytes is not None:
+            try:
+                state = load_safetensors_bytes(checkpoint_path)
+                state = {k: v.to(device) for k, v in state.items()}
+                return state
+            except Exception as e:
+                if debug:
+                    debug.log(f"SafeTensors load failed ({e}), trying torch.load fallback", 
+                             category="info", indent_level=1)
         
         try:
-            state = load_safetensors_bytes(checkpoint_path)
-            state = {k: v.to(device) for k, v in state.items()}
-        except RuntimeError as e:
-            if device.type == "mps" and any(k in str(e).lower() for k in ["watermark", "allocat", "memory"]):
-                if debug:
-                    debug.log("Using CPU intermediate loading for MPS compatibility", 
-                            category="info", indent_level=1)
-                state = load_safetensors_bytes(checkpoint_path)
-            else:
-                raise
+            import io
+            state = torch.load(io.BytesIO(checkpoint_path), map_location=device_str, weights_only=True)
+        except Exception as e:
+            error_msg = f"Cannot load decrypted bytes as safetensors or pth: {e}"
+            if debug:
+                debug.log(error_msg, level="ERROR", category="dit", force=True)
+            raise RuntimeError(error_msg)
         return state
     
     if checkpoint_path.endswith('.safetensors'):
