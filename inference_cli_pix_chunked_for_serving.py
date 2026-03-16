@@ -67,7 +67,7 @@ DIT_TILE_OVERLAP = 0.1
 
 # Post-processing
 COLOR_CORRECTION = "wavelet" # "lab", "lab_reinhard", "wavelet", "hsv", "wavelet_adaptive", "adain", "none"
-USM_WEIGHT = 0.5                  # 0 = disabled. Typical: 0.3-1.0
+USM_WEIGHT = 0.0                  # 0 = disabled. Typical: 0.3-1.0
 USM_RADIUS = 10                   # Gaussian blur kernel size (must be odd)
 USM_THRESHOLD = 10                # Pixel-difference threshold
 
