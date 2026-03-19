@@ -521,6 +521,7 @@ class AstraSLP3:
         #    become available so we never hold the full output in RAM. ──
         writer_holder = [None]   # lazily initialised on first callback
         saved_frames = [0]
+        total_frames = reader.shape[0]
 
         def _output_callback(frames_tensor: torch.Tensor):
             """Receive post-processed frames [N, H, W, C] float16 [0,1] and save."""
@@ -534,6 +535,11 @@ class AstraSLP3:
                 writer_holder[0].write(cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR))
             saved_frames[0] += frames_tensor.shape[0]
 
+            if callable(getattr(self, 'progress_func', None)):
+                frac = saved_frames[0] / total_frames
+                progress = 0.05 + frac * 0.85
+                self.progress_func(progress, f"Processed {saved_frames[0]}/{total_frames} frames...")
+
         _, timings = self._process_video(
             reader, min(resolution_w, resolution_h),
             output_callback=_output_callback,
@@ -542,10 +548,13 @@ class AstraSLP3:
         if writer_holder[0] is not None:
             writer_holder[0].release()
 
+        if callable(getattr(self, 'progress_func', None)):
+            self.progress_func(0.92, "Copying audio track...")
+
         copy_audio_to_video(input_path, output_path)
 
         if callable(getattr(self, 'progress_func', None)):
-            self.progress_func(0.95, "Finalising...")
+            self.progress_func(0.97, "Finalising...")
 
         logger.info(f"Saved {saved_frames[0]} frames to {output_path}")
         logger.info(
