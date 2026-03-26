@@ -112,14 +112,15 @@ if platform.system() == "Darwin":
     os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
     os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.0")
 else:
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     if CUDA_DEVICE is not None:
         device_list_env = [x.strip() for x in CUDA_DEVICE.split(',') if x.strip() != '']
         if os.environ.get("CUDA_VISIBLE_DEVICES") is None and len(device_list_env) == 1:
             os.environ["CUDA_VISIBLE_DEVICES"] = device_list_env[0]
 
 import torch
-# torch.cuda.set_per_process_memory_fraction(0.9375)  # Limit VRAM to ~30GB on 32GB GPU
+# torch.cuda.set_per_process_memory_fraction(0.50)  # Limit VRAM to ~16GB on 32GB GPU
+import av
 import cv2
 import numpy as np
 import shutil
@@ -258,6 +259,11 @@ class LazyVideoReader:
     Exposes ``.shape`` and ``__getitem__`` (slice) so it can be used as a
     drop-in replacement for the eager ``torch.Tensor`` returned by
     ``extract_video_frames``.
+
+    Frames are decoded strictly forward via a background thread (like
+    ``VideoDiffusion-2.5/videodiffusion_utils.py``'s ``VideoReader``).
+    A small buffer keeps recently-decoded frames so overlapping chunk
+    windows can be served without seeking.
     """
 
     def __init__(self, video_path: str, skip_frames: int = 0, load_cap: int = 0):
@@ -267,15 +273,15 @@ class LazyVideoReader:
         self.video_path = video_path
         self.skip_frames = skip_frames
 
-        # Probe metadata
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise ValueError(f"Cannot open: {video_path}")
-        self.fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        raw_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        raw_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        cap.release()
+        # Open container and probe metadata
+        self._container = av.open(video_path, 'r')
+        stream = self._container.streams.video[0]
+        self.fps = float(stream.average_rate or stream.guessed_rate or 30)
+        raw_w = stream.width
+        raw_h = stream.height
+        total = stream.frames
+        if total <= 0 and stream.duration and stream.time_base:
+            total = round(float(stream.duration * stream.time_base) * self.fps)
 
         available = max(0, total - skip_frames)
         if load_cap > 0:
@@ -291,6 +297,22 @@ class LazyVideoReader:
         self._display_h = raw_h
         self._raw_w = raw_w
 
+        # Forward-only decode state: background thread feeds a queue,
+        # main thread drains it into _buffer keyed by frame index.
+        import queue as _queue_mod, threading as _threading_mod
+        self._queue = _queue_mod.Queue(maxsize=16)
+        self._buffer: dict[int, np.ndarray] = {}
+        self._decode_pos = 0        # next frame the consumer will label
+        self._exhausted = False
+
+        self._thread = _threading_mod.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+        # Skip initial frames
+        for _ in range(skip_frames):
+            if not self._advance_one():
+                break
+
         if self._sar != 1.0:
             debug.log(
                 f"SAR={self._sar:.4f}, will pre-stretch {raw_w}x{raw_h} → {self._display_w}x{raw_h}",
@@ -300,6 +322,38 @@ class LazyVideoReader:
             f"LazyVideoReader: {self._total_frames} frames, {self._display_w}x{self._display_h}, fps={self.fps}",
             category="file", force=True,
         )
+
+    def _worker(self):
+        """Decode all packets in a background thread, push frames to queue."""
+        stream = self._container.streams.video[0]
+        stream.thread_type = "AUTO"
+        try:
+            for packet in self._container.demux(stream):
+                for frame in packet.decode():
+                    self._queue.put(frame)
+        except Exception as e:
+            debug.log(f"Decode thread error: {e}", level="ERROR", force=True)
+        self._queue.put(None)
+
+    def _advance_one(self) -> bool:
+        """Pull one frame from the decode queue.  Returns False at EOF."""
+        if self._exhausted:
+            return False
+        item = self._queue.get()
+        if item is None:
+            self._exhausted = True
+            return False
+        idx = self._decode_pos
+        self._buffer[idx] = (
+            item.to_ndarray(format='rgb24').astype(np.float32) / 255.0
+        )
+        self._decode_pos += 1
+        return True
+
+    def _decode_up_to(self, frame_idx: int):
+        """Advance the decoder until ``frame_idx`` is in the buffer (or EOF)."""
+        while frame_idx not in self._buffer and not self._exhausted:
+            self._advance_one()
 
     @property
     def shape(self):
@@ -316,19 +370,27 @@ class LazyVideoReader:
 
     def _read_range(self, start: int, end: int) -> torch.Tensor:
         """Read frames ``[start, end)`` and return ``[T, H, W, C]`` float16 ``[0, 1]``."""
-        cap = cv2.VideoCapture(self.video_path)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, self.skip_frames + start)
+        abs_end = self.skip_frames + end - 1
+        self._decode_up_to(abs_end)
 
+        abs_start = self.skip_frames + start
         frames = []
-        for _ in range(end - start):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0)
-        cap.release()
+        for i in range(abs_start, abs_start + (end - start)):
+            if i in self._buffer:
+                frames.append(self._buffer[i])
+
+        # Prune frames we'll never need again (before this window's start)
+        for k in list(self._buffer):
+            if k < abs_start:
+                del self._buffer[k]
 
         if not frames:
-            raise ValueError(f"No frames read for range [{start}, {end})")
+            debug.log(
+                f"No frames readable for range [{start}, {end}) — "
+                f"video likely shorter than reported ({self._total_frames} frames)",
+                category="file", force=True,
+            )
+            return torch.empty(0, self._display_h, self._display_w, 3, dtype=torch.float16)
 
         # SAR pre-stretching
         if self._sar != 1.0:
@@ -338,6 +400,17 @@ class LazyVideoReader:
                 frames = [cv2.resize(f, (new_w, h), interpolation=cv2.INTER_CUBIC) for f in frames]
 
         return torch.from_numpy(np.stack(frames)).to(torch.float16)
+
+    def close(self):
+        if self._container is not None:
+            if self._thread.is_alive():
+                self._thread.join(timeout=2)
+            self._container.close()
+            self._container = None
+            self._buffer.clear()
+
+    def __del__(self):
+        self.close()
 
 
 def save_video(tensor: torch.Tensor, path: str, fps: float, backend: str = "opencv", use_10bit: bool = False):
@@ -545,6 +618,8 @@ class AstraSLP3:
             output_callback=_output_callback,
         )
 
+        reader.close()
+
         if writer_holder[0] is not None:
             writer_holder[0].release()
 
@@ -562,6 +637,11 @@ class AstraSLP3:
             f"DiT: {timings['dit']:.2f}s, "
             f"Decode: {timings['decode']:.2f}s, "
             f"Post: {timings['post']:.2f}s"
+        )
+        logger.info(
+            f"[Profile] Peak VRAM -- Encode: {timings.get('vram_encode', 0):.2f}GB, "
+            f"DiT: {timings.get('vram_dit', 0):.2f}GB, "
+            f"Decode: {timings.get('vram_decode', 0):.2f}GB"
         )
 
         if callable(getattr(self, 'progress_func', None)):

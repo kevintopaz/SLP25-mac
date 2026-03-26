@@ -211,17 +211,20 @@ def process_pix_chunk(
     _reset_ctx(ctx)
 
     # Phase 1 -- VAE Encode
+    torch.cuda.reset_peak_memory_stats()
     t_enc_start = time.time()
     ctx = encode_whole_video(
         runner, ctx, chunk_frames, debug, resolution, max_resolution
     )
     t_enc_end = time.time()
+    vram_encode = torch.cuda.max_memory_allocated() / (1024 ** 3)
 
     # Release fragmented CUDA cache between phases so DiT has contiguous blocks
     torch.cuda.empty_cache()
 
     # Phase 2 -- DiT Upscale  (chunk_size=0 -> process full latent in one shot)
     # cache_model=True keeps runner.dit alive for subsequent chunks
+    torch.cuda.reset_peak_memory_stats()
     t_dit_start = time.time()
     ctx = upscale_latent_chunked(
         runner, ctx, debug,
@@ -237,15 +240,18 @@ def process_pix_chunk(
         cache_model=True,
     )
     t_dit_end = time.time()
+    vram_dit = torch.cuda.max_memory_allocated() / (1024 ** 3)
 
     # Release fragmented CUDA cache between phases so VAE decode has contiguous blocks
     torch.cuda.empty_cache()
 
     # Phase 3 -- VAE Decode
     # cache_model=True keeps runner.vae alive for subsequent chunks
+    torch.cuda.reset_peak_memory_stats()
     t_dec_start = time.time()
     ctx = decode_whole_latent(runner, ctx, debug, cache_model=True)
     t_dec_end = time.time()
+    vram_decode = torch.cuda.max_memory_allocated() / (1024 ** 3)
 
     # Move results to CPU
     decoded = ctx['decoded_video']
@@ -260,6 +266,9 @@ def process_pix_chunk(
         "encode": t_enc_end - t_enc_start,
         "dit": t_dit_end - t_dit_start,
         "decode": t_dec_end - t_dec_start,
+        "vram_encode": vram_encode,
+        "vram_dit": vram_dit,
+        "vram_decode": vram_decode,
     }
 
     return decoded, transformed, chunk_timings
@@ -525,6 +534,9 @@ def process_video_pix_chunked(
     total_dit_time = 0.0
     total_decode_time = 0.0
     total_post_time = 0.0
+    peak_vram_encode = 0.0
+    peak_vram_dit = 0.0
+    peak_vram_decode = 0.0
 
     # ------------------------------------------------------------------
     # Helper: post-process and emit (streaming) or just return (accum.)
@@ -554,6 +566,14 @@ def process_video_pix_chunked(
             chunk_input = frames[ws:we]
             chunk_len = chunk_input.shape[0]
 
+            if chunk_len == 0:
+                logger.warning(
+                    "Chunk %d/%d: no readable frames at [%d, %d), "
+                    "stopping (video shorter than reported)",
+                    ci + 1, num_chunks, ws, we,
+                )
+                break
+
             logger.info(
                 "Chunk %d/%d: input frames [%d, %d) (%d frames)",
                 ci + 1, num_chunks, ws, we, chunk_len,
@@ -571,10 +591,15 @@ def process_video_pix_chunked(
             total_encode_time += chunk_timings["encode"]
             total_dit_time += chunk_timings["dit"]
             total_decode_time += chunk_timings["decode"]
+            peak_vram_encode = max(peak_vram_encode, chunk_timings["vram_encode"])
+            peak_vram_dit = max(peak_vram_dit, chunk_timings["vram_dit"])
+            peak_vram_decode = max(peak_vram_decode, chunk_timings["vram_decode"])
             logger.info(
-                "[Profile] Chunk %d/%d: %.2fs (encode=%.2fs, dit=%.2fs, decode=%.2fs)",
+                "[Profile] Chunk %d/%d: %.2fs (encode=%.2fs, dit=%.2fs, decode=%.2fs) "
+                "| Peak VRAM: encode=%.2fGB, dit=%.2fGB, decode=%.2fGB",
                 ci + 1, num_chunks, t1 - t0,
                 chunk_timings["encode"], chunk_timings["dit"], chunk_timings["decode"],
+                chunk_timings["vram_encode"], chunk_timings["vram_dit"], chunk_timings["vram_decode"],
             )
 
             is_last = (ci == num_chunks - 1)
@@ -669,9 +694,11 @@ def process_video_pix_chunked(
 
         t_pipeline_end = time.time()
         logger.info(
-            "[Profile] All %d chunks total: %.2fs (encode=%.2fs, dit=%.2fs, decode=%.2fs, post=%.2fs)",
+            "[Profile] All %d chunks total: %.2fs (encode=%.2fs, dit=%.2fs, decode=%.2fs, post=%.2fs) "
+            "| Peak VRAM: encode=%.2fGB, dit=%.2fGB, decode=%.2fGB",
             num_chunks, t_pipeline_end - t_pipeline_start,
             total_encode_time, total_dit_time, total_decode_time, total_post_time,
+            peak_vram_encode, peak_vram_dit, peak_vram_decode,
         )
 
         timings = {
@@ -680,6 +707,9 @@ def process_video_pix_chunked(
             "dit": total_dit_time,
             "decode": total_decode_time,
             "post": total_post_time,
+            "vram_encode": peak_vram_encode,
+            "vram_dit": peak_vram_dit,
+            "vram_decode": peak_vram_decode,
         }
         return None, timings
 
@@ -692,6 +722,14 @@ def process_video_pix_chunked(
         for ci, (ws, we) in enumerate(read_windows):
             chunk_input = frames[ws:we]
             chunk_len = chunk_input.shape[0]
+
+            if chunk_len == 0:
+                logger.warning(
+                    "Chunk %d/%d: no readable frames at [%d, %d), "
+                    "stopping (video shorter than reported)",
+                    ci + 1, num_chunks, ws, we,
+                )
+                break
 
             logger.info(
                 "Chunk %d/%d: input frames [%d, %d) (%d frames)",
@@ -710,10 +748,15 @@ def process_video_pix_chunked(
             total_encode_time += chunk_timings["encode"]
             total_dit_time += chunk_timings["dit"]
             total_decode_time += chunk_timings["decode"]
+            peak_vram_encode = max(peak_vram_encode, chunk_timings["vram_encode"])
+            peak_vram_dit = max(peak_vram_dit, chunk_timings["vram_dit"])
+            peak_vram_decode = max(peak_vram_decode, chunk_timings["vram_decode"])
             logger.info(
-                "[Profile] Chunk %d/%d: %.2fs (encode=%.2fs, dit=%.2fs, decode=%.2fs)",
+                "[Profile] Chunk %d/%d: %.2fs (encode=%.2fs, dit=%.2fs, decode=%.2fs) "
+                "| Peak VRAM: encode=%.2fGB, dit=%.2fGB, decode=%.2fGB",
                 ci + 1, num_chunks, t1 - t0,
                 chunk_timings["encode"], chunk_timings["dit"], chunk_timings["decode"],
+                chunk_timings["vram_encode"], chunk_timings["vram_dit"], chunk_timings["vram_decode"],
             )
 
             decoded_frames = decoded.shape[0]
@@ -774,9 +817,11 @@ def process_video_pix_chunked(
 
         t_pipeline_end = time.time()
         logger.info(
-            "[Profile] All %d chunks total: %.2fs (encode=%.2fs, dit=%.2fs, decode=%.2fs)",
+            "[Profile] All %d chunks total: %.2fs (encode=%.2fs, dit=%.2fs, decode=%.2fs) "
+            "| Peak VRAM: encode=%.2fGB, dit=%.2fGB, decode=%.2fGB",
             num_chunks, t_pipeline_end - t_pipeline_start,
             total_encode_time, total_dit_time, total_decode_time,
+            peak_vram_encode, peak_vram_dit, peak_vram_decode,
         )
 
         # --- Post-process (color correction + USM) on the whole assembled video ---
@@ -804,6 +849,9 @@ def process_video_pix_chunked(
             "dit": total_dit_time,
             "decode": total_decode_time,
             "post": t_post_end - t_post_start,
+            "vram_encode": peak_vram_encode,
+            "vram_dit": peak_vram_dit,
+            "vram_decode": peak_vram_decode,
         }
 
         result = ctx['final_video']
