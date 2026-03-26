@@ -463,8 +463,8 @@ class AstraSLP3:
             return args
         else:
             args.model_dir = "models"
-            args.dit_name = "kevin_checkpoint-15400_merged.safetensors"
-            args.vae_name = "ema_vae_bf16.safetensors"
+            args.dit_name = "ema_3b_bf16.safetensors"
+            args.vae_name = "ema_vae_bf16.pth"
             return args
 
     def __init__(self, **kwargs):
