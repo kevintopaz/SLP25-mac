@@ -210,21 +210,24 @@ def process_pix_chunk(
     """
     _reset_ctx(ctx)
 
+    def _peak_vram_gb():
+        """Total GPU memory in use (PyTorch + TRT + any other allocator)."""
+        free, total = torch.cuda.mem_get_info()
+        return (total - free) / (1024 ** 3)
+
     # Phase 1 -- VAE Encode
-    torch.cuda.reset_peak_memory_stats()
     t_enc_start = time.time()
     ctx = encode_whole_video(
         runner, ctx, chunk_frames, debug, resolution, max_resolution
     )
     t_enc_end = time.time()
-    vram_encode = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    vram_encode = getattr(runner, '_trt_vram_encode', None) or _peak_vram_gb()
 
     # Release fragmented CUDA cache between phases so DiT has contiguous blocks
     torch.cuda.empty_cache()
 
     # Phase 2 -- DiT Upscale  (chunk_size=0 -> process full latent in one shot)
     # cache_model=True keeps runner.dit alive for subsequent chunks
-    torch.cuda.reset_peak_memory_stats()
     t_dit_start = time.time()
     ctx = upscale_latent_chunked(
         runner, ctx, debug,
@@ -240,18 +243,17 @@ def process_pix_chunk(
         cache_model=True,
     )
     t_dit_end = time.time()
-    vram_dit = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    vram_dit = _peak_vram_gb()
 
     # Release fragmented CUDA cache between phases so VAE decode has contiguous blocks
     torch.cuda.empty_cache()
 
     # Phase 3 -- VAE Decode
     # cache_model=True keeps runner.vae alive for subsequent chunks
-    torch.cuda.reset_peak_memory_stats()
     t_dec_start = time.time()
     ctx = decode_whole_latent(runner, ctx, debug, cache_model=True)
     t_dec_end = time.time()
-    vram_decode = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    vram_decode = getattr(runner, '_trt_vram_decode', None) or _peak_vram_gb()
 
     # Move results to CPU
     decoded = ctx['decoded_video']
