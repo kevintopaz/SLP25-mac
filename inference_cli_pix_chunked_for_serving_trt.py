@@ -28,6 +28,7 @@ import logging
 import multiprocessing as mp
 from typing import Tuple, Dict, Any
 from pathlib import Path
+from utils.getData import get_path_or_bytes, get_path_or_bytesio
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -229,8 +230,9 @@ def _precompute_blend_weights(h_starts, w_starts, h_lat, w_lat,
 
 
 def load_trt_engine(path, input_shape):
-    with open(path, "rb") as f:
-        serialized = f.read()
+    # with open(path, "rb") as f:
+    #     serialized = f.read()
+    serialized = get_path_or_bytes(path)
     runtime = trt.Runtime(TRT_LOGGER)
     engine = runtime.deserialize_cuda_engine(serialized)
     ctx = engine.create_execution_context()
@@ -673,9 +675,14 @@ class AstraSLP3:
         after, so TRT and DiT never compete for VRAM.
         """
         from omegaconf import ListConfig
-
-        enc_path = os.path.join(script_dir, self._enc_engine_name)
-        dec_path = os.path.join(script_dir, self._dec_engine_name)
+        if os.environ.get('CLOUD_RUN') == 'true':
+            enc_path = os.path.join('/app/data', self._enc_engine_name)
+            dec_path = os.path.join('/app/data', self._dec_engine_name)
+        else:
+            enc_path = os.path.join(script_dir, self._enc_engine_name)
+            dec_path = os.path.join(script_dir, self._dec_engine_name)
+        # enc_path = os.path.join(script_dir, self._enc_engine_name)
+        # dec_path = os.path.join(script_dir, self._dec_engine_name)
         if not os.path.isfile(enc_path) or not os.path.isfile(dec_path):
             raise FileNotFoundError(
                 f"TRT engines not found. Expected:\n  {enc_path}\n  {dec_path}\n"
@@ -686,10 +693,12 @@ class AstraSLP3:
         self._enc_in_shape = (1, 3, PIX_CHUNK_SIZE, TRT_ENC_TILE_PIX, TRT_ENC_TILE_PIX)
         self._dec_in_shape = (1, 16, T_lat, TRT_DEC_TILE_LAT, TRT_DEC_TILE_LAT)
 
-        with open(enc_path, "rb") as f:
-            self._enc_bytes = f.read()
-        with open(dec_path, "rb") as f:
-            self._dec_bytes = f.read()
+        # with open(enc_path, "rb") as f:
+        #     self._enc_bytes = f.read()
+        # with open(dec_path, "rb") as f:
+        #     self._dec_bytes = f.read()
+        self._enc_bytes = get_path_or_bytes(enc_path)
+        self._dec_bytes = get_path_or_bytes(dec_path)
 
         # Probe output shapes by briefly loading each engine
         _, _, _, self._enc_out_shape, _ = load_trt_engine(enc_path, self._enc_in_shape)
