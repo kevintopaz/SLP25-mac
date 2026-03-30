@@ -750,7 +750,8 @@ def configure_runner(
     tile_debug: str = "false",
     attention_mode: str = 'sdpa',
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
-    torch_compile_args_vae: Optional[Dict[str, Any]] = None
+    torch_compile_args_vae: Optional[Dict[str, Any]] = None,
+    skip_vae_weights: bool = False
 ) -> Tuple[VideoDiffusionInfer, Dict[str, Any]]:
     """
     Configure VideoDiffusionInfer runner with model loading and settings.
@@ -778,6 +779,7 @@ def configure_runner(
         attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
+        skip_vae_weights: If True, skip loading VAE model weights (for TRT VAE).
         
     Returns:
         Tuple[VideoDiffusionInfer, Dict[str, Any]]: (configured runner, cache context dict)
@@ -829,7 +831,8 @@ def configure_runner(
     # Phase 4: Setup models (load from cache or create new)
     _setup_models(
         runner, cache_context, dit_model, vae_model, 
-        base_cache_dir, block_swap_config, debug
+        base_cache_dir, block_swap_config, debug,
+        skip_vae_weights=skip_vae_weights
     )
     
     return runner, cache_context
@@ -917,7 +920,8 @@ def _setup_models(
     vae_model: str,
     base_cache_dir: str,
     block_swap_config: Optional[Dict[str, Any]],
-    debug: Optional['Debug'] = None
+    debug: Optional['Debug'] = None,
+    skip_vae_weights: bool = False
 ) -> None:
     """
     Setup DiT and VAE models from cache or create new structures.
@@ -943,6 +947,7 @@ def _setup_models(
         base_cache_dir: Base directory containing model files
         block_swap_config: BlockSwap configuration (passed to DiT setup)
         debug: Debug instance for logging and timing
+        skip_vae_weights: If True, skip loading VAE model weights (for TRT VAE).
     """
     debug.start_timer("model_structures")
     
@@ -966,7 +971,8 @@ def _setup_models(
             runner.dit._config_attn = runner._new_dit_attention_mode
     
     # Setup VAE
-    vae_created = _setup_vae_model(runner, cache_context, vae_model, base_cache_dir, debug)
+    vae_created = _setup_vae_model(runner, cache_context, vae_model, base_cache_dir, debug,
+                                   skip_vae_weights=skip_vae_weights)
     
     # Only update VAE config if model was cached/reused (not newly created)
     if not vae_created and hasattr(runner, 'vae') and runner.vae is not None:
@@ -1068,7 +1074,8 @@ def _setup_vae_model(
     cache_context: Dict[str, Any],
     vae_model: str,
     base_cache_dir: str,
-    debug: Optional['Debug'] = None
+    debug: Optional['Debug'] = None,
+    skip_vae_weights: bool = False
 ) -> bool:
     """
     Setup VAE model from cache or create new meta device structure.
@@ -1086,6 +1093,8 @@ def _setup_vae_model(
         vae_model: VAE model filename (e.g., "ema_vae_fp16.safetensors")
         base_cache_dir: Base directory containing model files
         debug: Debug instance for logging
+        skip_vae_weights: If True, configure VAE config on the runner but skip
+            loading model weights (useful when VAE is replaced by TRT engines).
         
     Returns:
         bool: True if new model structure was created, False if cached model reused
@@ -1099,7 +1108,7 @@ def _setup_vae_model(
                      category="cache", force=True)
             cleanup_vae(runner=runner, debug=debug, cache_model=False)
     
-    if cache_context['cached_vae'] is not None:
+    if not skip_vae_weights and cache_context['cached_vae'] is not None:
         # Reuse cached VAE model
         debug.log(f"Reusing cached VAE ({cache_context['vae_id']}): {vae_model}", 
                 category="reuse", force=True)
@@ -1113,8 +1122,7 @@ def _setup_vae_model(
         
         return False
     elif not hasattr(runner, 'vae') or runner.vae is None:
-        # Create new VAE model
-        # Configure VAE
+        # Configure VAE config on runner
         vae_config = load_config_from_string(VAE_CONFIG_YAML)
         
         spatial_downsample_factor = vae_config.get('spatial_downsample_factor', 8)
@@ -1130,9 +1138,14 @@ def _setup_vae_model(
         runner.config.vae.dtype = vae_dtype_str
         runner._vae_dtype_override = compute_dtype
         
-        vae_checkpoint_path = find_model_file(vae_model, base_cache_dir)
-        runner = prepare_model_structure(runner, "vae", vae_checkpoint_path, 
-                                        runner.config, debug, None)
+        if skip_vae_weights:
+            debug.log("Skipping VAE weight loading (TRT engines will be used)",
+                     category="vae", force=True)
+            runner.vae = None
+        else:
+            vae_checkpoint_path = find_model_file(vae_model, base_cache_dir)
+            runner = prepare_model_structure(runner, "vae", vae_checkpoint_path, 
+                                            runner.config, debug, None)
         
         debug.log(
             f"VAE downsample factors configured "
