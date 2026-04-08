@@ -791,7 +791,7 @@ class AstraSLP3:
             inn, outn = io_names[0], io_names[1]
             ctx.set_input_shape(inn, upscaler._dec_in_shape)
 
-            samples = []
+            decoded_f32 = []
             for latent in latents_in:
                 lat = latent.unsqueeze(0) if latent.ndim == 4 else latent
                 lat = lat / scale + shift
@@ -809,13 +809,21 @@ class AstraSLP3:
                         upscaler._dec_out_shape, upscaler._dec_in_shape,
                         lat, h_starts, w_starts, bw, H_lat, W_lat,
                     )
-                sample = decoded_bcthw.squeeze(0).to(vae_dtype)  # CTHW
-                samples.append(sample)
+                del lat, bw
+                decoded_f32.append(decoded_bcthw)
+
+            del ctx, engine, runtime
+            torch.cuda.empty_cache()
+
+            samples = []
+            for raw in decoded_f32:
+                samples.append(raw.squeeze(0).to(vae_dtype))  # CTHW
+                del raw
+            del decoded_f32
+            torch.cuda.empty_cache()
 
             free, total = torch.cuda.mem_get_info()
             runner._trt_vram_decode = (total - free) / (1024 ** 3)
-            del ctx, engine, runtime
-            torch.cuda.empty_cache()
             return samples
 
         runner.vae_encode = _trt_vae_encode
