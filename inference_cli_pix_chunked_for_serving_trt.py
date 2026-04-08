@@ -28,8 +28,6 @@ import logging
 import multiprocessing as mp
 from typing import Tuple, Dict, Any
 from pathlib import Path
-from utils.getData import get_path_or_bytes, get_path_or_bytesio
-
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
 if os.environ.get('CLOUD_RUN', 'false') == 'true':
@@ -46,6 +44,17 @@ if matrix_root not in sys.path:
 
 if __name__ == '__main__' and __package__ is None:
     __package__ = _package_name
+
+if os.environ.get('CLOUD_RUN', 'false') == 'true':
+    from utils.getData import get_path_or_bytes, get_path_or_bytesio
+else:
+    from io import BytesIO
+    def get_path_or_bytes(fpath, name_map=None, download_only=False):
+        with open(fpath, "rb") as f:
+            return f.read()
+    def get_path_or_bytesio(fpath, name_map=None):
+        with open(fpath, "rb") as f:
+            return BytesIO(f.read())
 
 # =============================================================================
 # Hardcoded Configuration
@@ -268,7 +277,8 @@ def trt_tiled_encode(enc_ctx, enc_inn, enc_outn, enc_out_shape, enc_in_shape,
             output[:, :, :, h0:h0 + tile_lat, w0:w0 + tile_lat] += tout * bw[(h0, w0)]
             wsum[:, :, :, h0:h0 + tile_lat, w0:w0 + tile_lat] += bw[(h0, w0)]
     del tin, tout
-    output /= wsum.clamp(min=1e-6)
+    wsum.clamp_(min=1e-6)
+    torch.div(output, wsum, out=output)
     del wsum
     return output[:, :16, :, :, :]
 
@@ -300,9 +310,10 @@ def trt_tiled_decode(dec_ctx, dec_inn, dec_outn, dec_out_shape, dec_in_shape,
             output[:, :, :, ph0:ph1, pw0:pw1] += tout * bw[(h0, w0)]
             wsum[:, :, :, ph0:ph1, pw0:pw1] += bw[(h0, w0)]
     del tin, tout
-    result = output / wsum.clamp(min=1e-6)
-    del output, wsum
-    return result
+    wsum.clamp_(min=1e-6)
+    torch.div(output, wsum, out=output)
+    del wsum
+    return output
 
 
 # =============================================================================
@@ -627,6 +638,7 @@ class AstraSLP3:
     def __init__(self, **kwargs):
         args = argparse.Namespace()
         args = self.init_args(args)
+        self.model_dir = args.model_dir
 
         device = kwargs.get('device', 'cuda:0')
         self.device = device
@@ -679,10 +691,8 @@ class AstraSLP3:
             enc_path = os.path.join('/app/data', self._enc_engine_name)
             dec_path = os.path.join('/app/data', self._dec_engine_name)
         else:
-            enc_path = os.path.join(script_dir, self._enc_engine_name)
-            dec_path = os.path.join(script_dir, self._dec_engine_name)
-        # enc_path = os.path.join(script_dir, self._enc_engine_name)
-        # dec_path = os.path.join(script_dir, self._dec_engine_name)
+            enc_path = os.path.join(script_dir, self.model_dir, self._enc_engine_name)
+            dec_path = os.path.join(script_dir, self.model_dir, self._dec_engine_name)
         if not os.path.isfile(enc_path) or not os.path.isfile(dec_path):
             raise FileNotFoundError(
                 f"TRT engines not found. Expected:\n  {enc_path}\n  {dec_path}\n"
