@@ -757,6 +757,16 @@ class AstraSLP3:
                         pad = pixel[:, :, -1:, :, :].expand(-1, -1, pad_count, -1, -1)
                     pixel = torch.cat([pixel, pad], dim=2)
 
+                orig_H_pix, orig_W_pix = H_pix, W_pix
+                enc_pad_h = max(0, TRT_ENC_TILE_PIX - H_pix)
+                enc_pad_w = max(0, TRT_ENC_TILE_PIX - W_pix)
+                if enc_pad_h > 0 or enc_pad_w > 0:
+                    if enc_pad_w > 0:
+                        pixel = torch.cat([pixel, pixel[:, :, :, :, -1:].expand(-1, -1, -1, -1, enc_pad_w)], dim=4)
+                    if enc_pad_h > 0:
+                        pixel = torch.cat([pixel, pixel[:, :, :, -1:, :].expand(-1, -1, -1, enc_pad_h, -1)], dim=3)
+                    _, _, _, H_pix, W_pix = pixel.shape
+
                 h_lat = H_pix // SPATIAL_DS
                 w_lat = W_pix // SPATIAL_DS
                 h_starts = _compute_tile_starts(h_lat, TRT_ENC_TILE_LAT, TRT_ENC_OVERLAP_LAT)
@@ -770,6 +780,12 @@ class AstraSLP3:
                         upscaler._enc_out_shape, upscaler._enc_in_shape,
                         pixel, h_starts, w_starts, bw, h_lat, w_lat,
                     )
+                if enc_pad_h > 0 or enc_pad_w > 0:
+                    latent_bcthw = latent_bcthw[
+                        :, :, :,
+                        :orig_H_pix // SPATIAL_DS,
+                        :orig_W_pix // SPATIAL_DS,
+                    ]
                 latent_bcthw = latent_bcthw.to(vae_dtype)
                 latent = latent_bcthw.permute(0, 2, 3, 4, 1)  # BCTHW → BTHWC
                 latent = (latent - shift) * scale
@@ -798,6 +814,15 @@ class AstraSLP3:
                 lat = lat.permute(0, 4, 1, 2, 3)  # BTHWC → BCTHW
                 lat = lat.squeeze(2) if lat.ndim == 6 else lat
                 _, _, T_lat_cur, H_lat, W_lat = lat.shape
+                orig_H_lat, orig_W_lat = H_lat, W_lat
+                dec_pad_h = max(0, TRT_DEC_TILE_LAT - H_lat)
+                dec_pad_w = max(0, TRT_DEC_TILE_LAT - W_lat)
+                if dec_pad_h > 0 or dec_pad_w > 0:
+                    if dec_pad_w > 0:
+                        lat = torch.cat([lat, lat[:, :, :, :, -1:].expand(-1, -1, -1, -1, dec_pad_w)], dim=4)
+                    if dec_pad_h > 0:
+                        lat = torch.cat([lat, lat[:, :, :, -1:, :].expand(-1, -1, -1, dec_pad_h, -1)], dim=3)
+                    _, _, _, H_lat, W_lat = lat.shape
                 h_starts = _compute_tile_starts(H_lat, TRT_DEC_TILE_LAT, TRT_DEC_OVERLAP_LAT)
                 w_starts = _compute_tile_starts(W_lat, TRT_DEC_TILE_LAT, TRT_DEC_OVERLAP_LAT)
                 bw = _precompute_blend_weights(h_starts, w_starts, H_lat, W_lat,
@@ -809,6 +834,12 @@ class AstraSLP3:
                         upscaler._dec_out_shape, upscaler._dec_in_shape,
                         lat, h_starts, w_starts, bw, H_lat, W_lat,
                     )
+                if dec_pad_h > 0 or dec_pad_w > 0:
+                    decoded_bcthw = decoded_bcthw[
+                        :, :, :,
+                        :orig_H_lat * SPATIAL_DS,
+                        :orig_W_lat * SPATIAL_DS,
+                    ]
                 del lat, bw
                 decoded_f32.append(decoded_bcthw)
 
