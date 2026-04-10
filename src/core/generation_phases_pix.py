@@ -576,6 +576,14 @@ def process_video_pix_chunked(
                 )
                 break
 
+            video_ended_early = chunk_len < (we - ws)
+            if video_ended_early:
+                logger.warning(
+                    "Chunk %d/%d: got %d frames instead of %d at [%d, %d), "
+                    "video ended early — treating as last chunk",
+                    ci + 1, num_chunks, chunk_len, we - ws, ws, we,
+                )
+
             logger.info(
                 "Chunk %d/%d: input frames [%d, %d) (%d frames)",
                 ci + 1, num_chunks, ws, we, chunk_len,
@@ -604,7 +612,7 @@ def process_video_pix_chunked(
                 chunk_timings["vram_encode"], chunk_timings["vram_dit"], chunk_timings["vram_decode"],
             )
 
-            is_last = (ci == num_chunks - 1)
+            is_last = (ci == num_chunks - 1) or video_ended_early
             t_pp0 = time.time()
 
             if ci == 0:
@@ -685,6 +693,8 @@ def process_video_pix_chunked(
             del decoded, transformed, chunk_input
             if not is_last:
                 clear_memory(debug=debug, force=True)
+            elif video_ended_early:
+                break
 
         # Flush any remaining overlap buffer (shouldn't normally happen)
         if overlap_dec is not None and overlap_dec.shape[0] > 0:
@@ -732,6 +742,14 @@ def process_video_pix_chunked(
                     ci + 1, num_chunks, ws, we,
                 )
                 break
+
+            video_ended_early = chunk_len < (we - ws)
+            if video_ended_early:
+                logger.warning(
+                    "Chunk %d/%d: got %d frames instead of %d at [%d, %d), "
+                    "video ended early — treating as last chunk",
+                    ci + 1, num_chunks, chunk_len, we - ws, ws, we,
+                )
 
             logger.info(
                 "Chunk %d/%d: input frames [%d, %d) (%d frames)",
@@ -814,6 +832,8 @@ def process_video_pix_chunked(
                 current_write_idx = write_end
 
             del decoded, transformed, chunk_input
+            if video_ended_early:
+                break
             if ci < num_chunks - 1:
                 clear_memory(debug=debug, force=True)
 
@@ -825,6 +845,13 @@ def process_video_pix_chunked(
             total_encode_time, total_dit_time, total_decode_time,
             peak_vram_encode, peak_vram_dit, peak_vram_decode,
         )
+
+        # Trim pre-allocated buffer to the actual number of written frames
+        if current_write_idx < T_total and final_video is not None:
+            logger.info("Trimming final video: %d → %d frames (video ended early)", T_total, current_write_idx)
+            final_video = final_video[:current_write_idx]
+            if final_transformed is not None:
+                final_transformed = final_transformed[:, :current_write_idx]
 
         # --- Post-process (color correction + USM) on the whole assembled video ---
         _reset_ctx(ctx)
