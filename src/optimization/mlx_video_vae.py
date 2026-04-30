@@ -10,6 +10,13 @@ ops (norm + silu + conv) into single Metal kernels.
 Provides:
   * MLXVideoVAE: high-level wrapper that accepts/returns numpy/PyTorch tensors
   * tiled_encode / tiled_decode with spatial overlap blending
+
+Forward policy: same operations as the reference path. Per-frame causal conv
+assembles time with a preallocated ``[B, T, Ho, Wo, Co]`` (lower peak VRAM)
+instead of ``mx.stack``; values match in real arithmetic; fp16 may differ by
+ULPs vs ``stack`` (same caveat as batched vs per-frame in MLX_VAE_BATCHED_MAX_GB).
+We only insert mx.eval where it materializes the same tensor values earlier
+(e.g. enc_out before blend). No approximate spatial conv tiling.
 """
 
 import math
@@ -47,6 +54,58 @@ _BATCHED_MAX_BYTES = int(float(os.environ.get("MLX_VAE_BATCHED_MAX_GB", "0")) * 
 # Like TRT path empty_cache between tiles: drop MLX buffer pool between spatial
 # tiles (slower). Set MLX_VAE_CLEAR_CACHE_PER_TILE=1 when chasing peak footprint.
 _CLEAR_CACHE_PER_TILE = os.environ.get("MLX_VAE_CLEAR_CACHE_PER_TILE", "0") == "1"
+
+# Very detailed VRAM logging for the first spatial tile only (encoder + blend).
+# Set MLX_VAE_MEM_PROFILE_FIRST_TILE=1. Each line resets peak before the segment,
+# then logs peak during that segment (MiB), plus active/cache after mx.eval.
+# Run: python profile_mlx_vae_encoder_tile.py (see script docstring).
+_MEM_PROFILE_FIRST_TILE = os.environ.get("MLX_VAE_MEM_PROFILE_FIRST_TILE", "0") == "1"
+
+# Profiling shows peak segments at full-res 480²: enc.down[0].resnet[0] / resnet[1]
+# (Metal conv workspace). Optional cache flush between ResNets (slower).
+_CLEAR_CACHE_BETWEEN_RESNETS = os.environ.get(
+    "MLX_VAE_CLEAR_CACHE_BETWEEN_RESNETS", "0"
+) == "1"
+_enc_mem_profiling = False  # toggled around encoder + first-tile blend in tiled_encode
+
+
+def _mem_prof_active() -> bool:
+    return _enc_mem_profiling and _MEM_PROFILE_FIRST_TILE
+
+
+def _mem_seg_reset():
+    if _mem_prof_active():
+        mx.reset_peak_memory()
+
+
+def _mem_seg_dump(tag: str, *arrays):
+    """Log segment peak (since last _mem_seg_reset), active, cache; optional shapes."""
+    if not _mem_prof_active():
+        return
+    if arrays:
+        mx.eval(*arrays)
+    peak = mx.get_peak_memory() / (1024 * 1024)
+    active = mx.get_active_memory() / (1024 * 1024)
+    cache = mx.get_cache_memory() / (1024 * 1024)
+    shp = tuple(arrays[0].shape) if arrays else ()
+    logger.info(
+        "[MLX_VAE_MEM] %-52s shape=%-28s seg_peak=%8.2f MiB  active=%8.2f MiB  cache=%8.2f MiB",
+        tag, str(shp), peak, active, cache,
+    )
+
+
+def _mem_tile_dump(tag: str, *arrays, do_eval: bool = True):
+    """First-tile-only summary line (caller gates with prof). peak = since last global reset_peak."""
+    if do_eval and arrays:
+        mx.eval(*arrays)
+    peak = mx.get_peak_memory() / (1024 * 1024)
+    active = mx.get_active_memory() / (1024 * 1024)
+    cache = mx.get_cache_memory() / (1024 * 1024)
+    shp = tuple(arrays[0].shape) if arrays else ()
+    logger.info(
+        "[MLX_VAE_MEM_TILE] %-50s shape=%-26s peak=%8.2f MiB  active=%8.2f MiB  cache=%8.2f MiB",
+        tag, str(shp), peak, active, cache,
+    )
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -193,7 +252,7 @@ class CausalConv(nn.Module):
             return self._batched(x)
         pad_n = self.temporal_padding * 2
         # Preallocate [B, T, Ho, Wo, Co] and fill per frame — avoids mx.stack
-        # retaining T separate arrays plus a contiguous concat (TRT-style bound).
+        # retaining T separate arrays plus a contiguous concat (lower peak VRAM).
         o0 = self._do_conv(
             mx.concatenate(
                 [x[:, max(0, 0 + k - pad_n)] for k in range(self.kT)],
@@ -341,10 +400,7 @@ class ResnetBlock(nn.Module):
         h = self.conv2(h, low_mem=low_mem)
         if self.has_shortcut:
             x = self.conv_shortcut(x, low_mem=low_mem)
-        out = x + h
-        if low_mem:
-            mx.eval(out)
-        return out
+        return x + h
 
 
 class SelfAttention(nn.Module):
@@ -386,14 +442,31 @@ class MidBlock(nn.Module):
 
     def __call__(self, x, low_mem=False):
         B, T, H, W, C = x.shape
+        if _mem_prof_active():
+            _mem_seg_reset()
         x = self.resnets[0](x, low_mem=low_mem)
         if low_mem: mx.eval(x)
+        if _mem_prof_active():
+            _mem_seg_dump("enc.mid.resnet[0]", x)
+
         flat = x.reshape(B * T, H, W, C)
+        if _mem_prof_active():
+            _mem_seg_reset()
         flat = self.attentions[0](flat)
+        if _mem_prof_active():
+            _mem_seg_dump("enc.mid.attention", flat)
+
         x = flat.reshape(B, T, H, W, C)
         if low_mem: mx.eval(x)
+        if _mem_prof_active():
+            _mem_seg_dump("enc.mid.after_reshape", x)
+
+        if _mem_prof_active():
+            _mem_seg_reset()
         x = self.resnets[1](x, low_mem=low_mem)
         if low_mem: mx.eval(x)
+        if _mem_prof_active():
+            _mem_seg_dump("enc.mid.resnet[1]", x)
         return x
 
 
@@ -523,13 +596,23 @@ class DownEncoderBlock(nn.Module):
             if add_downsample else []
         )
 
-    def __call__(self, x, low_mem=False):
-        for r in self.resnets:
+    def __call__(self, x, low_mem=False, mem_tag=None):
+        for j, r in enumerate(self.resnets):
+            if _mem_prof_active() and mem_tag:
+                _mem_seg_reset()
             x = r(x, low_mem=low_mem)
             if low_mem: mx.eval(x)
-        for d in self.downsamplers:
+            if _mem_prof_active() and mem_tag:
+                _mem_seg_dump(f"{mem_tag}.resnet[{j}]", x)
+            if low_mem and _CLEAR_CACHE_BETWEEN_RESNETS and j + 1 < len(self.resnets):
+                mx.clear_cache()
+        for k, d in enumerate(self.downsamplers):
+            if _mem_prof_active() and mem_tag:
+                _mem_seg_reset()
             x = d(x, low_mem=low_mem)
             if low_mem: mx.eval(x)
+            if _mem_prof_active() and mem_tag:
+                _mem_seg_dump(f"{mem_tag}.downsample[{k}]", x)
         return x
 
 
@@ -558,14 +641,43 @@ class Encoder(nn.Module):
         self.conv_out = CausalConv(out_ch, block_channels[-1], kT, 3, 3, 1, 1)
 
     def __call__(self, x, low_mem=False):
+        if _mem_prof_active():
+            mx.eval(x)
+            _mem_seg_reset()
+
+        if _mem_prof_active():
+            _mem_seg_reset()
         x = self.conv_in(x, low_mem=low_mem)
         if low_mem: mx.eval(x)
-        for blk in self.down_blocks:
-            x = blk(x, low_mem=low_mem)
+        if _mem_prof_active():
+            _mem_seg_dump("enc.01_conv_in", x)
+
+        for i, blk in enumerate(self.down_blocks):
+            if _mem_prof_active():
+                _mem_seg_reset()
+            x = blk(x, low_mem=low_mem, mem_tag=f"enc.down[{i}]")
+            if _mem_prof_active():
+                _mem_seg_dump(f"enc.02_down_block[{i}]_all", x)
+
+        if _mem_prof_active():
+            _mem_seg_reset()
         x = self.mid_block(x, low_mem=low_mem)
+        if _mem_prof_active():
+            _mem_seg_dump("enc.03_mid_block", x)
+
+        if _mem_prof_active():
+            _mem_seg_reset()
         x = _silu_gn5d(self.conv_norm_out, x)
         if low_mem: mx.eval(x)
-        return self.conv_out(x, low_mem=low_mem)
+        if _mem_prof_active():
+            _mem_seg_dump("enc.04_conv_norm_silu", x)
+
+        if _mem_prof_active():
+            _mem_seg_reset()
+        x = self.conv_out(x, low_mem=low_mem)
+        if _mem_prof_active():
+            _mem_seg_dump("enc.05_conv_out", x)
+        return x
 
 
 # ── Weight Loading ───────────────────────────────────────────────────────────
@@ -697,23 +809,33 @@ class MLXVideoVAE:
 
         t0 = time.perf_counter()
         tc = 0
+        global _enc_mem_profiling
         for ti in range(n_h):
             for tj in range(n_w):
                 hs = min(ti * (tile_H - ov_H), H - tile_H)
                 ws = min(tj * (tile_W - ov_W), W - tile_W)
                 tile = frames_f16_np[:, hs:hs+tile_H, ws:ws+tile_W, :]
                 tile_mx = mx.array(tile[np.newaxis])
+                prof = _MEM_PROFILE_FIRST_TILE and ti == 0 and tj == 0
+                if prof:
+                    _enc_mem_profiling = True
                 enc_out = self.encoder(tile_mx, low_mem=self.low_mem).astype(mx.float32)
+                if prof:
+                    _enc_mem_profiling = False
                 # Materialize the tile latent before blending. Otherwise the blend
                 # stays fused into the full encoder lazy graph until mx.eval below,
                 # which retains every encoder intermediate and can push peak VRAM
                 # far above what low_mem + per-frame convs were designed for.
                 mx.eval(enc_out)
+                if prof:
+                    _mem_tile_dump("tile.after_encoder_mx_eval", enc_out, do_eval=False)
 
                 lh, lw = hs // 8, ws // 8
                 bw = _make_blend_weight(lat_tile_H, lat_tile_W,
                                         (lat_ov_H, lat_ov_W), n_h, n_w, ti, tj)
                 bw5d = mx.array(bw[None, None, :, :, None])
+                if prof:
+                    mx.reset_peak_memory()
                 latent, lat_wt = _gpu_blend_paste(
                     latent, lat_wt, enc_out, bw5d,
                     slice(0, T_lat),
@@ -723,6 +845,8 @@ class MLXVideoVAE:
                 # Eval canvas after each tile (encoder graph already released via
                 # mx.eval(enc_out) above).
                 mx.eval(latent, lat_wt)
+                if prof:
+                    _mem_tile_dump("tile.after_blend_paste_mx_eval", latent, lat_wt, do_eval=False)
                 if _CLEAR_CACHE_PER_TILE:
                     mx.clear_cache()
                 tc += 1
