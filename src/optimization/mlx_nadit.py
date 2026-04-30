@@ -794,6 +794,10 @@ def transformer_block_forward(
     if txt_ada is not None:
         txt_a = txt_ada.in_modulate(txt_a, emb, "attn", [L_txt])
 
+    # Flush norm+modulate so fp32 RMSNorm intermediates are freed before
+    # the large QKV projection allocates ~2 GB in the attention function.
+    mx.eval(vid_a, txt_a)
+
     vid_a, txt_a = windowed_swin_attention(
         vid_a, txt_a, vid_b, None if block.shared else block.txt,
         vid_shape, txt_len, win_info, vid_freqs, txt_freqs_full,
@@ -823,6 +827,8 @@ def transformer_block_forward(
     vid_m = vid_ada.in_modulate(vid_m, emb, "mlp", [L_vid])
     if not is_last_layer:
         txt_m = txt_ada.in_modulate(txt_m, emb, "mlp", [L_txt])
+
+    mx.eval(vid_m, txt_m)  # flush norm+modulate before MLP allocates
 
     vid_mlp = MLXSwiGLUMLP(vid_b.mlp_gate_w, vid_b.mlp_up_w, vid_b.mlp_down_w)
     vid_m = vid_mlp(vid_m)
@@ -1269,6 +1275,55 @@ class MLXNaDiT(torch_nn.Module):
         out_t = torch.from_numpy(out_np).to(device=target_device, dtype=target_dtype)
         return NaDiTOutput(vid_sample=out_t)
 
+    def forward_tiles(self, tile_vids, tile_vid_shapes, txt, txt_shape, timestep):
+        """Block-first multi-tile forward: each block loaded once, all tiles processed.
+
+        Args:
+            tile_vids:       list of PyTorch tensors (L_i, C) per spatial tile
+            tile_vid_shapes: list of PyTorch tensors [[T, H, W]] per tile
+            txt:             PyTorch tensor (L_txt, txt_dim) shared text
+            txt_shape:       PyTorch tensor [[txt_len]]
+            timestep:        PyTorch tensor or float
+
+        Returns:
+            list of NaDiTOutput, one per tile
+        """
+        import torch
+        from src.models.dit_3b.nadit import NaDiTOutput
+
+        target_device = tile_vids[0].device
+        target_dtype = tile_vids[0].dtype
+
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+
+        # Convert inputs to MLX
+        tile_vids_mx = [_t_to_mx(v, dtype=self.dtype) for v in tile_vids]
+        tile_shapes = [
+            (int(s[0, 0].item()), int(s[0, 1].item()), int(s[0, 2].item()))
+            for s in tile_vid_shapes
+        ]
+        txt_mx = _t_to_mx(txt, dtype=self.dtype)
+        txt_len = int(txt_shape[0, 0].item())
+        if torch.is_tensor(timestep):
+            ts = float(timestep.float().cpu().item()) if timestep.ndim == 0 else float(timestep[0].float().cpu().item())
+        else:
+            ts = float(timestep)
+
+        out_list_mx = run_full_dit_streaming_tiled(
+            tile_vids_mx, tile_shapes, txt_mx, ts, txt_len,
+            self.io, self.block_pool, self.cfg, self.num_blocks,
+        )
+
+        # Convert outputs back to PyTorch
+        results = []
+        for out_mx in out_list_mx:
+            out_np = np.asarray(out_mx.astype(mx.float32))
+            out_t = torch.from_numpy(out_np).to(device=target_device, dtype=target_dtype)
+            results.append(NaDiTOutput(vid_sample=out_t))
+        del out_list_mx, tile_vids_mx, txt_mx
+        return results
+
     # nn.Module's ``__call__`` would route to ``forward`` already, but our
     # ``forward`` takes a custom signature without **kwargs hooks etc., so we
     # override ``__call__`` to bypass nn.Module's hook machinery.
@@ -1375,3 +1430,127 @@ def run_full_dit_streaming(
     vid_h = vid_h * (scale + io.vid_out_ada_scale) + (shift + io.vid_out_ada_shift)
     vid_out, _ = vid_out_forward(vid_h, vid_shape_pat, io, cfg.patch)
     return vid_out
+
+
+def _output_head(vid_h: mx.array, emb: mx.array, vid_shape_pat: Tuple[int, int, int],
+                 io: IOWeights, cfg: NaDiTConfig) -> mx.array:
+    """Shared output head: vid_out_norm → vid_out_ada → vid_out (un-patch)."""
+    vid_h = MLXRMSNorm(io.vid_out_norm_w, eps=cfg.norm_eps)(vid_h)
+    b = emb.shape[0]
+    emb_r = emb.reshape(b, cfg.vid_dim, 2, 3)[:, :, 0, :]
+    shiftA = emb_r[..., 0]
+    scaleA = emb_r[..., 1]
+    L_vid = vid_h.shape[0]
+    shift = mx.broadcast_to(shiftA, (L_vid, cfg.vid_dim))
+    scale = mx.broadcast_to(scaleA, (L_vid, cfg.vid_dim))
+    vid_h = vid_h * (scale + io.vid_out_ada_scale) + (shift + io.vid_out_ada_shift)
+    vid_out, _ = vid_out_forward(vid_h, vid_shape_pat, io, cfg.patch)
+    return vid_out
+
+
+def run_full_dit_streaming_tiled(
+    tile_vids: List[mx.array],
+    tile_vid_shapes: List[Tuple[int, int, int]],
+    txt: mx.array,
+    timestep: float,
+    txt_len: int,
+    io: IOWeights,
+    block_pool: MLXBlockPool,
+    cfg: NaDiTConfig,
+    num_blocks: int,
+) -> List[mx.array]:
+    """Block-first multi-tile streaming: load each block once, process all tiles.
+
+    For N tiles and M blocks this does M block loads instead of N*M.
+    Each tile's peak activation stays at the single-tile level (~6.5 GB at 1080p fp16).
+
+    Args:
+        tile_vids: list of (L_vid_i, in_channels) per tile
+        tile_vid_shapes: list of (T, H, W) per tile (latent space, before patch)
+        txt: (L_txt, txt_in_dim) shared text embedding
+        timestep: diffusion timestep
+        txt_len: number of text tokens
+        io: IO weights (always resident)
+        block_pool: streaming block pool
+        cfg: model config
+        num_blocks: number of transformer blocks
+
+    Returns:
+        list of (L_vid_i, out_channels) per tile
+    """
+    num_tiles = len(tile_vids)
+    log_mem = os.environ.get("MLX_DIT_LOG_MEM", "0") == "1"
+
+    # Shared: text projection + time embedding (tiny, shared across tiles)
+    txt_proj = MLXLinear(io.txt_in_w, io.txt_in_b)(txt)
+    t_arr = mx.array([timestep], dtype=mx.float32)
+    emb = emb_in_forward(t_arr, io)
+
+    # Per-tile: vid_in + RoPE freqs + window info
+    tile_states = []
+    for i in range(num_tiles):
+        vid_proj, vid_shape_pat = vid_in_forward(tile_vids[i], tile_vid_shapes[i], io, cfg.patch)
+        vid_freqs, txt_freqs = build_rope_freqs(vid_shape_pat, txt_len, cfg.head_dim)
+        win_even = make_window_info(vid_shape_pat, cfg.window, shifted=False)
+        win_odd = make_window_info(vid_shape_pat, cfg.window, shifted=True)
+        mx.eval(vid_proj)
+        tile_states.append({
+            "vid_h": vid_proj,
+            "txt_h": txt_proj,  # shared reference, will diverge per-tile
+            "vid_shape_pat": vid_shape_pat,
+            "vid_freqs": vid_freqs,
+            "txt_freqs": txt_freqs,
+            "win_even": win_even,
+            "win_odd": win_odd,
+        })
+    # Each tile gets its own txt_h copy (txt diverges per-tile through blocks)
+    for ts in tile_states[1:]:
+        ts["txt_h"] = txt_proj  # same initial value; will diverge in the loop
+
+    if log_mem:
+        am = mx.get_active_memory() / 1024**3
+        print(f"[mlx-dit-tiled] {num_tiles} tiles, before blocks: active={am:.2f}GB", flush=True)
+
+    block_pool.prefetch_block(0)
+
+    for block_idx in range(num_blocks):
+        if block_idx < num_blocks - 1:
+            block_pool.prefetch_block(block_idx + 1)
+
+        block_pool.wait_for_load(block_idx)
+        block = block_pool.get_block(block_idx)
+
+        win_info_key = "win_even" if (block_idx % 2 == 0) else "win_odd"
+        is_last = (block_idx == num_blocks - 1)
+
+        # Process ALL tiles through this block
+        for tile_idx in range(num_tiles):
+            ts = tile_states[tile_idx]
+            ts["vid_h"], ts["txt_h"] = transformer_block_forward(
+                ts["vid_h"], ts["txt_h"], emb, ts["vid_shape_pat"], txt_len,
+                block, ts[win_info_key], ts["vid_freqs"], ts["txt_freqs"],
+                cfg.heads, cfg.head_dim, cfg.vid_dim,
+                norm_eps=cfg.norm_eps, is_last_layer=is_last,
+            )
+            mx.eval(ts["vid_h"], ts["txt_h"])
+
+        # Release block after all tiles are done with it
+        if not block_pool.full_pool:
+            block_pool.release_block(block_idx)
+            del block
+            mx.clear_cache()
+
+        if log_mem:
+            am = mx.get_active_memory() / 1024**3
+            pm = mx.get_peak_memory() / 1024**3
+            print(f"[mlx-dit-tiled] after block {block_idx:2d}: active={am:.2f}GB peak={pm:.2f}GB",
+                  flush=True)
+
+    # Output head per tile
+    results = []
+    for ts in tile_states:
+        out = _output_head(ts["vid_h"], emb, ts["vid_shape_pat"], io, cfg)
+        mx.eval(out)
+        results.append(out)
+
+    return results

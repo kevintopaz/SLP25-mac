@@ -564,6 +564,126 @@ def _create_tile_weight_mask(
     return weight_2d.unsqueeze(0).unsqueeze(-1)  # (1, tile_h, tile_w, 1)
 
 
+def _get_tile_overlap(tiles_info, dit_tiles):
+    """Compute spatial overlap in pixels from tile grid."""
+    tile_rows, tile_cols = dit_tiles
+    y0, x0, tile_h, tile_w = tiles_info[0]
+    if tile_cols > 1:
+        _, x1, _, _ = tiles_info[1]
+        overlap_w = tile_w - (x1 - x0)
+    else:
+        overlap_w = 0
+    if tile_rows > 1:
+        y_next, _, _, _ = tiles_info[tile_cols]
+        overlap_h = tile_h - (y_next - y0)
+    else:
+        overlap_h = 0
+    return max(0, overlap_h), max(0, overlap_w)
+
+
+def _blend_tiles(tiles_info, tile_outputs, T, H, W, C, overlap_h, overlap_w,
+                 device, dtype, accum_device):
+    """Weighted-blend tile outputs onto a full-resolution canvas."""
+    result = torch.zeros((T, H, W, C), device=accum_device, dtype=dtype)
+    weight_sum = torch.zeros((1, H, W, 1), device=accum_device, dtype=dtype)
+    for (y_start, x_start, tile_h, tile_w), tile_out in zip(tiles_info, tile_outputs):
+        weight_mask = _create_tile_weight_mask(
+            tile_h, tile_w, y_start, x_start, H, W,
+            overlap_h, overlap_w, tile_out.device, dtype,
+        )
+        tile_weighted = tile_out * weight_mask
+        if accum_device != tile_weighted.device:
+            tile_weighted = tile_weighted.to(accum_device)
+            weight_mask = weight_mask.to(accum_device)
+        result[:, y_start:y_start + tile_h, x_start:x_start + tile_w, :] += tile_weighted
+        weight_sum[:, y_start:y_start + tile_h, x_start:x_start + tile_w, :] += weight_mask
+        del tile_weighted, weight_mask
+    result = result / weight_sum.clamp(min=1e-6)
+    if result.device != device:
+        result = result.to(device)
+    return result
+
+
+def _tiled_dit_block_first(
+    runner, noises, conditions, text_embeds, ctx,
+    tiles_info, T, H, W, C, overlap_h, overlap_w, debug,
+):
+    """Block-first tiled DiT: load each block once, process all tiles through it.
+
+    Requires the underlying DiT to expose ``forward_tiles()``.
+    Falls back to per-tile ``runner.inference()`` if not available.
+    """
+    from .generation_phases import _compute_dit_tile_params
+    from ..models.dit_3b import na
+
+    device = noises[0].device
+    dtype = noises[0].dtype
+    accum_device = ctx.get('tensor_offload_device') or device
+    num_tiles = len(tiles_info)
+
+    dit_model = runner.dit.dit_model if hasattr(runner.dit, 'dit_model') else runner.dit
+
+    # -- Prepare per-tile flattened inputs -----------------------------------
+    tile_vids = []
+    tile_vid_shapes = []
+    tile_noises_flat = []
+
+    for y_start, x_start, tile_h, tile_w in tiles_info:
+        t_noise = noises[0][:, y_start:y_start + tile_h, x_start:x_start + tile_w, :]
+        t_cond = conditions[0][:, y_start:y_start + tile_h, x_start:x_start + tile_w, :]
+        flat_noise, shapes = na.flatten([t_noise])
+        flat_cond, _ = na.flatten([t_cond])
+        vid = torch.cat([flat_noise, flat_cond], dim=-1)
+        tile_vids.append(vid)
+        tile_vid_shapes.append(shapes)
+        tile_noises_flat.append(flat_noise)
+
+    # -- Shared text embeddings (flatten once) --------------------------------
+    texts_pos = text_embeds['texts_pos']
+    if isinstance(texts_pos[0], tuple):
+        tp_list = []
+        tp_shapes = []
+        for pos in zip(*texts_pos):
+            emb, shape = na.flatten(pos)
+            tp_list.append(emb)
+            tp_shapes.append(shape)
+        txt_embed = tp_list
+        txt_shape = tp_shapes
+    else:
+        txt_embed, txt_shape = na.flatten(texts_pos)
+
+    # -- Timestep (use sampler's schedule) ------------------------------------
+    timesteps = runner.sampler.timesteps.timesteps
+    t_final = timesteps[-1]
+
+    debug.log(f"Block-first tiled DiT: {num_tiles} tiles, timestep={t_final.item():.1f}",
+             category="dit", indent_level=1)
+
+    # -- Block-first forward --------------------------------------------------
+    dit_outputs = dit_model.forward_tiles(
+        tile_vids, tile_vid_shapes, txt_embed, txt_shape, t_final,
+    )
+
+    # -- Sampler denoising per tile -------------------------------------------
+    tile_results = []
+    sampler = runner.sampler
+    for i in range(num_tiles):
+        pred = dit_outputs[i].vid_sample
+        x_0, _ = sampler.schedule.convert_from_pred(
+            pred, sampler.prediction_type, tile_noises_flat[i], t_final,
+        )
+        tile_out = na.unflatten(x_0, tile_vid_shapes[i])[0]
+        tile_results.append(tile_out)
+        del pred, x_0
+
+    del dit_outputs, tile_vids, tile_vid_shapes, tile_noises_flat
+
+    result = _blend_tiles(tiles_info, tile_results, T, H, W, C,
+                          overlap_h, overlap_w, device, dtype, accum_device)
+    debug.log(f"Block-first tiled DiT: merged {num_tiles} tiles", category="dit", indent_level=1)
+    return [result]
+
+
 def _tiled_dit_inference(
     runner, latent: torch.Tensor, noises: List[torch.Tensor],
     conditions: List[torch.Tensor], text_embeds: Dict[str, Any],
@@ -581,38 +701,22 @@ def _tiled_dit_inference(
     dtype = latent.dtype
     accum_device = ctx.get('tensor_offload_device') or device
     
-    # Calculate overlap from tile grid structure
-    # tiles_info is arranged row-major: [(0,0), (0,1), ..., (1,0), (1,1), ...]
-    tile_rows, tile_cols = dit_tiles
-    y0, x0, tile_h, tile_w = tiles_info[0]
+    overlap_h, overlap_w = _get_tile_overlap(tiles_info, dit_tiles)
     
-    # Get horizontal overlap (from tiles in same row, adjacent columns)
-    if tile_cols > 1:
-        y1, x1, _, _ = tiles_info[1]  # Second tile (same row, next column)
-        stride_w = x1 - x0
-        overlap_w = tile_w - stride_w
-    else:
-        overlap_w = 0
-    
-    # Get vertical overlap (from tiles in adjacent rows)
-    if tile_rows > 1:
-        y_next, x_next, _, _ = tiles_info[tile_cols]  # First tile of second row
-        stride_h = y_next - y0
-        overlap_h = tile_h - stride_h
-    else:
-        overlap_h = 0
-    
-    # Ensure non-negative
-    overlap_h = max(0, overlap_h)
-    overlap_w = max(0, overlap_w)
-    
-    debug.log(f"Tile blending: overlap=({overlap_h}x{overlap_w}), tile=({tile_h}x{tile_w})",
+    debug.log(f"Tile blending: overlap=({overlap_h}x{overlap_w}), tile=({tiles_info[0][2]}x{tiles_info[0][3]})",
              category="dit", indent_level=1)
     
-    result = torch.zeros((T, H, W, C), device=accum_device, dtype=dtype)
-    weight_sum = torch.zeros((1, H, W, 1), device=accum_device, dtype=dtype)
+    # Block-first path: load each block once, process all tiles through it.
+    dit_model = runner.dit.dit_model if hasattr(runner.dit, 'dit_model') else runner.dit
+    if hasattr(dit_model, 'forward_tiles'):
+        return _tiled_dit_block_first(
+            runner, noises, conditions, text_embeds, ctx,
+            tiles_info, T, H, W, C, overlap_h, overlap_w, debug,
+        )
     
+    # Tile-first fallback: process each tile independently through all blocks.
     num_tiles = len(tiles_info)
+    tile_outputs = []
     for tile_idx, (y_start, x_start, tile_h, tile_w) in enumerate(tiles_info):
         debug.log(f"  Tile {tile_idx + 1}/{num_tiles}: pos=({y_start},{x_start}), size=({tile_h}x{tile_w})",
                  category="dit", indent_level=2)
@@ -623,35 +727,12 @@ def _tiled_dit_inference(
         with torch.no_grad():
             tile_result = runner.inference(noises=tile_noises, conditions=tile_conditions, **text_embeds)
         
-        tile_upscaled = tile_result[0]
-        
-        # Create smooth weight mask for this tile
-        weight_mask = _create_tile_weight_mask(
-            tile_h, tile_w, y_start, x_start, H, W,
-            overlap_h, overlap_w, tile_upscaled.device, dtype
-        )
-        
-        # Apply weight to tile
-        tile_weighted = tile_upscaled * weight_mask
-        
-        if accum_device != tile_weighted.device:
-            tile_weighted = tile_weighted.to(accum_device)
-            weight_mask = weight_mask.to(accum_device)
-        
-        # Accumulate weighted result and weights
-        result[:, y_start:y_start + tile_h, x_start:x_start + tile_w, :] += tile_weighted
-        weight_sum[:, y_start:y_start + tile_h, x_start:x_start + tile_w, :] += weight_mask
-        
-        del tile_noises, tile_conditions, tile_result, tile_upscaled, tile_weighted, weight_mask
+        tile_outputs.append(tile_result[0])
+        del tile_noises, tile_conditions, tile_result
     
-    # Normalize by accumulated weights
-    result = result / weight_sum.clamp(min=1e-6)
-    
-    if result.device != device:
-        result = result.to(device)
-    
+    result = _blend_tiles(tiles_info, tile_outputs, T, H, W, C,
+                          overlap_h, overlap_w, device, dtype, accum_device)
     debug.log(f"Tiled DiT: merged {num_tiles} tiles with cosine blending", category="dit", indent_level=1)
-    
     return [result]
 
 
