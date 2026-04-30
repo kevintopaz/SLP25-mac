@@ -22,10 +22,10 @@
 #     exit 1
 # fi
 
-INPUT_FOLDER="/home/topaz/yuan/astra_precision_3/debug_voom"
-OUTPUT_FOLDER="./debug_voom_2k_7_switchckpt3"
-OUTPUT_WIDTH="3840"
-OUTPUT_HEIGHT="2160"
+INPUT_FOLDER="./assets/test"
+OUTPUT_FOLDER="./assets/test_output"
+OUTPUT_WIDTH="1920"
+OUTPUT_HEIGHT="1080"
 
 # Validate input folder
 if [ ! -d "$INPUT_FOLDER" ]; then

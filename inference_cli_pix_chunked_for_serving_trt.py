@@ -630,7 +630,7 @@ class AstraSLP3:
             return args
         else:
             args.model_dir = "models"
-            args.dit_name = "kevin_checkpoint-15400_merged.safetensors"
+            args.dit_name = "checkpoint-15400_merged.safetensors"
             args.enc_engine_name = "seedvr_vae_encode_33f_fp16.trt"
             args.dec_engine_name = "seedvr_vae_decode_33f_fp16.trt"
             return args

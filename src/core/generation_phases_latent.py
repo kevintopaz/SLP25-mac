@@ -828,17 +828,20 @@ def postprocess_latent_output(
                           level="WARNING", category="color", force=True)
             
             video_chunk.clamp_(-1, 1).mul_(0.5).add_(0.5)
-            video_chunk = video_chunk.permute(0, 2, 3, 1).to(dtype=torch.float16).cpu()
+            video_chunk = video_chunk.permute(0, 2, 3, 1).float().to(dtype=torch.float16).cpu()
             result_chunks.append(video_chunk)
             del ref_chunk
         
         del video  # free the GPU source tensor before CPU concat
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
         video = torch.cat(result_chunks, dim=0)  # [T, H, W, C] in [0, 1] on CPU
         del result_chunks, reference_cpu
     else:
         video.clamp_(-1, 1).mul_(0.5).add_(0.5)
-        video = video.to(dtype=torch.float16).cpu()
+        video = video.float().to(dtype=torch.float16).cpu()
     
     # ── USM Sharpening (GPU, separable Gaussian conv) ──
     if usm_weight > 0:
@@ -891,9 +894,12 @@ def postprocess_latent_output(
             out = soft_mask * sharp + (1.0 - soft_mask) * chunk
             del residual, soft_mask, sharp, chunk
 
-            video[start:end] = out.permute(0, 2, 3, 1).to(dtype=torch.float16).cpu()
+            video[start:end] = out.permute(0, 2, 3, 1).float().to(dtype=torch.float16).cpu()
             del out
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif torch.backends.mps.is_available():
+                torch.mps.empty_cache()
 
         del kernel_h, kernel_v, gauss_1d
         debug.log("USM sharpening completed (GPU)", category="color", force=True)

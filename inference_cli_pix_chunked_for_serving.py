@@ -86,11 +86,11 @@ TENSOR_OFFLOAD_DEVICE = "cpu"     # "none" → mapped to None
 
 # VAE tiling
 VAE_ENCODE_TILED = True
-VAE_ENCODE_TILE_SIZE = 1024
-VAE_ENCODE_TILE_OVERLAP = 128
+VAE_ENCODE_TILE_SIZE = 640
+VAE_ENCODE_TILE_OVERLAP = 80
 VAE_DECODE_TILED = True
-VAE_DECODE_TILE_SIZE = 768
-VAE_DECODE_TILE_OVERLAP = 128
+VAE_DECODE_TILE_SIZE = 480
+VAE_DECODE_TILE_OVERLAP = 60
 
 # Attention
 ATTENTION_MODE = "sdpa"           # "sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"
@@ -463,7 +463,7 @@ class AstraSLP3:
             return args
         else:
             args.model_dir = "models"
-            args.dit_name = "ema_3b_bf16.safetensors"
+            args.dit_name = "checkpoint-15400_merged.safetensors"
             args.vae_name = "ema_vae_bf16.pth"
             return args
 

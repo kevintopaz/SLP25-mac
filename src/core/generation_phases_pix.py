@@ -212,8 +212,12 @@ def process_pix_chunk(
 
     def _peak_vram_gb():
         """Total GPU memory in use (PyTorch + TRT + any other allocator)."""
-        free, total = torch.cuda.mem_get_info()
-        return (total - free) / (1024 ** 3)
+        if torch.backends.mps.is_available():
+            return torch.mps.driver_allocated_memory() / (1024 ** 3) if hasattr(torch.mps, 'driver_allocated_memory') else 0.0
+        if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info()
+            return (total - free) / (1024 ** 3)
+        return 0.0
 
     # Phase 1 -- VAE Encode
     t_enc_start = time.time()
@@ -223,8 +227,10 @@ def process_pix_chunk(
     t_enc_end = time.time()
     vram_encode = getattr(runner, '_trt_vram_encode', None) or _peak_vram_gb()
 
-    # Release fragmented CUDA cache between phases so DiT has contiguous blocks
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
     # Phase 2 -- DiT Upscale  (chunk_size=0 -> process full latent in one shot)
     # cache_model=True keeps runner.dit alive for subsequent chunks
@@ -245,8 +251,10 @@ def process_pix_chunk(
     t_dit_end = time.time()
     vram_dit = _peak_vram_gb()
 
-    # Release fragmented CUDA cache between phases so VAE decode has contiguous blocks
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
     # Phase 3 -- VAE Decode
     # cache_model=True keeps runner.vae alive for subsequent chunks
@@ -350,14 +358,17 @@ def _postprocess_frames_inline(
                 vc = adaptive_instance_normalization(vc, rc)
 
             vc.clamp_(-1, 1).mul_(0.5).add_(0.5)
-            result_chunks.append(vc.permute(0, 2, 3, 1).to(dtype=torch.float16).cpu())
+            result_chunks.append(vc.permute(0, 2, 3, 1).float().to(dtype=torch.float16).cpu())
             del rc
         del video
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
         video_out = torch.cat(result_chunks, dim=0)
         del result_chunks, reference_cpu
     else:
-        video_out = decoded.clamp(-1, 1).mul(0.5).add(0.5).to(dtype=torch.float16)
+        video_out = decoded.clamp(-1, 1).mul(0.5).add(0.5).float().to(dtype=torch.float16)
 
     # ── USM sharpening ──
     if usm_weight > 0:
@@ -394,9 +405,12 @@ def _postprocess_frames_inline(
             sharp = (chunk + usm_weight * residual).clamp_(0, 1)
             out = soft_mask * sharp + (1.0 - soft_mask) * chunk
             del residual, soft_mask, sharp, chunk
-            video_out[s:e] = out.permute(0, 2, 3, 1).to(dtype=torch.float16).cpu()
+            video_out[s:e] = out.permute(0, 2, 3, 1).float().to(dtype=torch.float16).cpu()
             del out
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif torch.backends.mps.is_available():
+                torch.mps.empty_cache()
 
         del kernel_h, kernel_v, gauss_1d
 
