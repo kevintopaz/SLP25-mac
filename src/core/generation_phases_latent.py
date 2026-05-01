@@ -201,7 +201,6 @@ def encode_whole_video(
     debug.log("━━━━━━━━ Phase 1: VAE Encode (whole video) ━━━━━━━━", category="none", force=True)
     debug.start_timer("phase1_encode_whole")
     
-    ctx['input_images'] = images
     ctx['total_frames'] = len(images)
     
     if 'true_target_dims' not in ctx:
@@ -224,9 +223,21 @@ def encode_whole_video(
     transform = ctx['video_transform']
     video_transformed = transform(video)
     
+    # Free original pixel-value frames immediately — only the transformed
+    # [-1, 1] version is needed from here on.
+    del images, video
+    if 'input_images' in ctx:
+        del ctx['input_images']
+    import gc; gc.collect()
+
     debug.log(f"Transformed shape: {video_transformed.shape}", category="vae")
-    ctx['transformed_video'] = video_transformed.cpu().to(torch.float16)
-    
+
+    # Keep exactly ONE fp16 copy: used for VAE encode now and color
+    # correction later. No separate bf16 full-frame cast — tiled_encode
+    # converts each spatial crop to the model dtype per-tile.
+    video_transformed = video_transformed.cpu().to(torch.float16)
+    ctx['transformed_video'] = video_transformed
+
     # VAE requires temporal dimension to satisfy 4n+1 constraint
     # video_transformed is CTHW format, temporal_dim=1
     T_original = video_transformed.shape[1]
@@ -236,22 +247,17 @@ def encode_whole_video(
         video_transformed = pad_video_temporal(video_transformed, count=0, temporal_dim=1, prepend=False, debug=debug)
         T_padded = video_transformed.shape[1]
         debug.log(f"Padded temporal: {T_original} → {T_padded} frames (4n+1 constraint)", category="vae")
-    
+
+    # Move to VAE device (stays fp16; per-tile dtype cast happens inside
+    # tiled_encode, avoiding a full-frame bf16 copy).
     video_transformed = manage_tensor(
         tensor=video_transformed,
         target_device=ctx['vae_device'],
         tensor_name="video_for_encode",
-        dtype=ctx['compute_dtype'],
+        dtype=None,
         debug=debug,
         reason="VAE encoding"
     )
-    
-    # Free fp32 input frames before encoding — not needed again in the latent
-    # pipeline, and they occupy ~0.77 GB on unified memory.
-    del images, video
-    if 'input_images' in ctx:
-        del ctx['input_images']
-    import gc; gc.collect()
 
     if progress_callback:
         progress_callback(0, 1, ctx['total_frames'], "Phase 1: Encoding")
@@ -716,8 +722,15 @@ def _tiled_dit_inference(
              category="dit", indent_level=1)
     
     # Block-first path: load each block once, process all tiles through it.
+    # Holds num_tiles × per-block-activation simultaneously between blocks
+    # — fast but high RAM peak. Tile-first (below) holds only one tile at
+    # a time, ~4 GB cheaper at 4K, but re-loads each block per tile.
+    # Override with MLX_DIT_TILE_FIRST=1 to force the low-RAM path on
+    # systems where memory is tighter than disk bandwidth (e.g. <24 GB Macs).
+    import os as _os
+    _force_tile_first = _os.environ.get("MLX_DIT_TILE_FIRST", "0") == "1"
     dit_model = runner.dit.dit_model if hasattr(runner.dit, 'dit_model') else runner.dit
-    if hasattr(dit_model, 'forward_tiles'):
+    if hasattr(dit_model, 'forward_tiles') and not _force_tile_first:
         return _tiled_dit_block_first(
             runner, noises, conditions, text_embeds, ctx,
             tiles_info, T, H, W, C, overlap_h, overlap_w, debug,

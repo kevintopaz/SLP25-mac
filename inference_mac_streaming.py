@@ -76,6 +76,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# ─── MLX wavelet color correction monkey-patch ─────────────────────────────
+# generation_phases_pix.py imports ``wavelet_reconstruction`` from
+# ``src.utils.color_fix`` at function-call time. We replace the module-level
+# symbol with the MLX-native version so the post-decode color correction runs
+# on Apple GPU (~5x faster on 4K than torch CPU). Disable with
+# MLX_WAVELET=0 to fall back to the torch implementation.
+if os.environ.get("MLX_WAVELET", "1") == "1":
+    try:
+        from astra_precision_3_kevin.src.utils import color_fix as _color_fix_mod
+        from astra_precision_3_kevin.src.utils.color_fix_mlx import wavelet_reconstruction_mlx
+        _color_fix_mod.wavelet_reconstruction = wavelet_reconstruction_mlx
+        logger.info("Patched wavelet_reconstruction with MLX implementation")
+    except ImportError:
+        # Fallback to relative import path if the package layout differs
+        try:
+            import src.utils.color_fix as _color_fix_mod
+            from src.utils.color_fix_mlx import wavelet_reconstruction_mlx
+            _color_fix_mod.wavelet_reconstruction = wavelet_reconstruction_mlx
+            logger.info("Patched wavelet_reconstruction with MLX implementation")
+        except Exception as _e:
+            logger.warning(f"Failed to patch wavelet_reconstruction: {_e}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Configuration
 # ═══════════════════════════════════════════════════════════════════════════
@@ -95,6 +119,18 @@ ATTENTION_MODE = "sdpa"
 # Total unified RAM (Apple Silicon shares CPU/GPU memory). Used to auto-tier
 # the MLX cache cap and VAE tile sizes — both are RAM-sensitive.
 def _system_ram_gb() -> float:
+    # SIMULATE_RAM_GB env var: pretend the system has this much RAM, so the
+    # auto-tier picks the smaller-tile / smaller-cache / tile-first-DiT path.
+    # Useful for benchmarking how the pipeline would behave on a 16 / 24 GB
+    # Mac without actually owning one. Compute speeds won't be slowed by
+    # simulated memory pressure, but tile counts, cache cap, and DiT execution
+    # mode all switch to the simulated tier.
+    sim = os.environ.get("SIMULATE_RAM_GB")
+    if sim:
+        try:
+            return float(sim)
+        except ValueError:
+            pass
     try:
         return (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / 1024**3
     except (ValueError, OSError):
@@ -102,6 +138,22 @@ def _system_ram_gb() -> float:
 
 
 _TOTAL_RAM_GB = _system_ram_gb()
+
+
+# DiT spatial-tile execution mode (only applies when dit_tiles > 1, i.e. >1080p
+# output). Block-first holds num_tiles × per-block-activation simultaneously
+# between blocks — fast but ~4 GB extra peak at 4K. Tile-first runs one tile
+# fully through the DiT before the next tile, peaking at one tile's working
+# set. Block-first re-loads each block from disk only once total (32 loads at
+# 4K (2,2)); tile-first re-loads per tile (32 × num_tiles), so it's slower on
+# systems where SSD bandwidth is the bottleneck. Auto-tier:
+#
+#   < 24 GB RAM -> tile-first (memory-constrained, accept slower disk loads)
+#   >= 24 GB    -> block-first (memory available, optimize for speed)
+#
+# Override with MLX_DIT_TILE_FIRST=1 (force tile-first) or =0 (force block-first).
+if "MLX_DIT_TILE_FIRST" not in os.environ:
+    os.environ["MLX_DIT_TILE_FIRST"] = "1" if _TOTAL_RAM_GB < 24 else "0"
 
 
 # VAE tile sizes: (H, W) tuples in pixels. MLX tiled_encode / tiled_decode
@@ -134,9 +186,9 @@ VAE_TILE_SIZE, VAE_TILE_OVERLAP, VAE_DECODE_TILE_SIZE, VAE_DECODE_TILE_OVERLAP =
 #
 # Override with --vae-cache-gb on the CLI.
 def _auto_mlx_cache_gb() -> float:
-    if _TOTAL_RAM_GB < 16:
-        return 2.0
-    if _TOTAL_RAM_GB < 24:
+    if _TOTAL_RAM_GB <= 16:
+        return 1.0
+    if _TOTAL_RAM_GB <= 24:
         return 4.0
     return 6.0
 
@@ -620,12 +672,16 @@ class VideoUpscaler:
         )
 
         # Setup generation context
-        # MLX VAE runs on Metal via MLX (not torch MPS), so set vae_device="cpu"
-        # to prevent the pipeline from moving the full video to MPS unnecessarily.
-        # compute_dtype=bf16 to match DiT's native bf16 — eliminates the
-        # fp16↔bf16 boundary casts that used to happen between VAE and DiT.
+        # MLX VAE runs on Metal via MLX (not torch MPS), so keep vae_device="cpu"
+        # so the pipeline does not move full-resolution video to MPS.
+        # dit_device follows constructor `device` (mps on Mac): embeddings,
+        # diffusion config, and sampler tensors live on MPS so torch.mps.empty_cache()
+        # can reclaim the MPS allocator pool between phases (dit_device=cpu made
+        # those calls no-ops). Tradeoff: ~1–3 GB more MPS pool vs cpu dit.
+        # compute_dtype=bf16 to match DiT's native bf16.
+        dit_dev = device
         self.ctx = setup_generation_context(
-            dit_device=device, vae_device="cpu",
+            dit_device=dit_dev, vae_device="cpu",
             dit_offload_device=None, vae_offload_device=None,
             tensor_offload_device=None, debug=self.debug,
         )
@@ -780,25 +836,23 @@ class VideoUpscaler:
 
             latents = []
             for i, sample in enumerate(samples):
-                # sample arrives as bf16 CPU (compute_dtype=bf16, vae_device=cpu).
-                # Numpy has no bf16 dtype, so we transport through fp16 — the
-                # values are in [-1, 1] where fp16 has ~3× more mantissa than
-                # bf16, so this hop is effectively lossless before MLX casts
-                # to its bf16 compute dtype inside tiled_encode.
-                frames_np = sample.permute(1, 2, 3, 0).contiguous().cpu()
-                if frames_np.dtype != torch.float16:
-                    frames_np = frames_np.to(torch.float16)
+                # sample: fp16 CTHW CPU (no full-frame bf16 cast any more).
+                # Permute to THWC; tiled_encode converts each spatial tile to
+                # NumPy/MLX individually — no full-frame NumPy copy.
+                frames_torch = sample.permute(1, 2, 3, 0).contiguous().cpu()
+                if frames_torch.dtype != torch.float16:
+                    frames_torch = frames_torch.to(torch.float16)
                 samples[i] = None
                 del sample
                 gc.collect()
                 torch.mps.empty_cache()
-                frames_np = frames_np.numpy()
 
                 latent_np = mlx_vae.tiled_encode(
-                    frames_np,
+                    frames_torch,
                     tile_size=VAE_TILE_SIZE,
                     tile_overlap=VAE_TILE_OVERLAP,
                 )
+                del frames_torch
                 # latent_np: [1, T_lat, H_lat, W_lat, 32] (mean+logvar)
                 # Take mean (first 16 channels), apply scaling
                 mean = latent_np[:, :, :, :, :16]  # [1, T_lat, H_lat, W_lat, 16]
@@ -806,7 +860,7 @@ class VideoUpscaler:
                 latent_t = (latent_t - shift) * scale
                 latent_t = latent_t.to(dtype=torch.bfloat16)
                 latents.append(latent_t)
-                del frames_np, latent_np, mean
+                del latent_np, mean
                 debug.log(f"MLX Encode: latent {list(latent_t.shape)}", category="vae")
 
             # Full cleanup: free all encode-phase memory before DiT starts
@@ -868,6 +922,7 @@ class VideoUpscaler:
                 sample_t = sample_t.permute(3, 0, 1, 2)  # [C, T, H, W]
                 samples.append(sample_t)
                 del lat_np, frames_np
+                mx.clear_cache()
                 debug.log(f"MLX Decode: {list(sample_t.shape)}", category="vae")
 
             # Full cleanup after decode
@@ -1029,12 +1084,17 @@ def main():
     output = args.output or str(Path(args.input).with_stem(Path(args.input).stem + "_upscaled"))
     os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
 
+    # MLX DiT/VAE compute on MLX Metal; Torch still uses MPS for embeddings,
+    # diffusion setup, and small tensors so torch.mps.empty_cache() can release
+    # the MPS allocator pool between phases.
+    upscaler_device = "mps"
+
     try:
         upscaler = VideoUpscaler(
             split_dir=args.split_dir,
             model_dir=args.model_dir,
             vae_path=args.vae_path,
-            device="mps",
+            device=upscaler_device,
             full_pool=args.full_pool,
             debug_enabled=args.debug,
             use_mlx_dit=args.mlx_dit,

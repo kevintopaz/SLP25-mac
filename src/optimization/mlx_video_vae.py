@@ -23,6 +23,7 @@ import math
 import os
 import time
 import logging
+from typing import Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -814,11 +815,19 @@ class MLXVideoVAE:
         mx.eval(self.decoder.parameters())
         logger.info(f"MLX Video VAE ready ({dtype})")
 
-    def tiled_encode(self, frames_np, tile_size=480, tile_overlap=48):
+    def tiled_encode(
+        self,
+        frames: Union[np.ndarray, "torch.Tensor"],
+        tile_size=480,
+        tile_overlap=48,
+    ):
         """Encode video frames to latent using spatial tiling.
 
         Args:
-            frames_np: numpy array [T, H, W, 3] in [-1, 1] (float16 or float32)
+            frames: numpy ``[T, H, W, 3]`` in [-1, 1] (float16/float32), **or**
+                a PyTorch **CPU** tensor with the same layout. When a tensor is
+                passed, each spatial tile is converted to NumPy only for that
+                tile (avoids a second full-frame NumPy copy of the whole video).
             tile_size: int (square) or (tile_H, tile_W) tuple in pixels
             tile_overlap: int (square) or (overlap_H, overlap_W) tuple in pixels
 
@@ -842,8 +851,26 @@ class MLXVideoVAE:
 
         tile_H, tile_W = _as_hw(tile_size)
         ov_H, ov_W = _as_hw(tile_overlap)
-        frames_f16_np = frames_np  # keep legacy local name for minimal diff
-        T, H, W, _ = frames_f16_np.shape
+
+        torch_frames = None
+        frames_np = None
+        try:
+            import torch
+
+            _torch_ok = isinstance(frames, torch.Tensor)
+        except ImportError:
+            _torch_ok = False
+
+        if _torch_ok:
+            torch_frames = frames.contiguous()
+            if torch_frames.dtype == torch.bfloat16:
+                torch_frames = torch_frames.to(torch.float16)
+            elif torch_frames.dtype not in (torch.float16, torch.float32):
+                torch_frames = torch_frames.float()
+            T, H, W, _ = torch_frames.shape
+        else:
+            frames_np = np.asarray(frames)
+            T, H, W, _ = frames_np.shape
         lat_tile_H = tile_H // 8
         lat_tile_W = tile_W // 8
         lat_ov_H = ov_H // 8
@@ -864,10 +891,17 @@ class MLXVideoVAE:
             for tj in range(n_w):
                 hs = min(ti * (tile_H - ov_H), H - tile_H)
                 ws = min(tj * (tile_W - ov_W), W - tile_W)
-                tile = frames_f16_np[:, hs:hs+tile_H, ws:ws+tile_W, :]
-                # Numpy can't carry bf16 — cast on the MLX side so encoder dtype
-                # matches weights (bf16 by default; fp16 if explicitly requested).
-                tile_mx = mx.array(tile[np.newaxis]).astype(self.dtype)
+                if torch_frames is not None:
+                    # One tile worth of host memory at a time (no full-frame np).
+                    tile_np = (
+                        torch_frames[:, hs : hs + tile_H, ws : ws + tile_W, :]
+                        .contiguous()
+                        .numpy()
+                    )
+                else:
+                    tile_np = frames_np[:, hs : hs + tile_H, ws : ws + tile_W, :]
+                tile_mx = mx.array(tile_np[np.newaxis]).astype(self.dtype)
+                del tile_np
                 prof = _MEM_PROFILE_FIRST_TILE and ti == 0 and tj == 0
                 if prof:
                     _enc_mem_profiling = True
@@ -902,6 +936,9 @@ class MLXVideoVAE:
                 mx.clear_cache()
                 tc += 1
                 logger.info(f"  Enc tile {tc}/{n_h*n_w}: {time.perf_counter()-t0:.1f}s")
+
+        if torch_frames is not None:
+            del torch_frames
 
         latent = latent / mx.maximum(lat_wt, 1e-8)
         mean = latent[:, :, :, :, :16]
@@ -949,16 +986,19 @@ class MLXVideoVAE:
         n_h = max(1, int(math.ceil((lat_H - lat_ov_H) / (lat_tile_H - lat_ov_H))))
         n_w = max(1, int(math.ceil((lat_W - lat_ov_W) / (lat_tile_W - lat_ov_W))))
 
-        # Output canvas in bf16 (matches all-bf16 pipeline): tile values are
-        # in [-1, 1] and at most 4 tiles overlap at corners, so accumulation
-        # error stays below 8-bit quantization. bf16 has 3 fewer mantissa bits
-        # than fp16 in this range, so seam banding is slightly more likely on
-        # synthetic gradients than with fp16 — but invisible on natural video.
-        # Weight canvas stays fp32 because it feeds the divisor
-        # (output / max(out_wt, 1e-8)) and a 16-bit ramp can lose ~½ ULP per
-        # add, producing seam banding regardless of fp16 vs bf16.
-        output = mx.zeros((1, T_out, pixel_H, pixel_W, 3), dtype=mx.bfloat16)
-        out_wt = mx.zeros((1, T_out, pixel_H, pixel_W, 3), dtype=mx.float32)
+        # Output canvases live in numpy (libc heap), not MLX. Reasoning:
+        #   * Physical RAM is the same on Apple Silicon's unified memory — the
+        #     bytes go in the same pool either way.
+        #   * BUT keeping them out of MLX's allocator pool gives the per-tile
+        #     conv workspaces the full cache_limit budget instead of fighting
+        #     the canvases for it. At 4K the canvases are ~5 GB; that's
+        #     significant working room reclaimed.
+        #   * libc malloc is pageable — under memory pressure macOS can
+        #     compress or page these. Metal allocations are typically wired.
+        # The blend math is plain numpy: tile_out (mlx) is materialized, cast
+        # to numpy, and accumulated in-place into the canvas. No torch.
+        output = np.zeros((1, T_out, pixel_H, pixel_W, 3), dtype=np.float16)
+        out_wt = np.zeros((1, T_out, pixel_H, pixel_W, 3), dtype=np.float32)
 
         t0 = time.perf_counter()
         tc = 0
@@ -975,21 +1015,21 @@ class MLXVideoVAE:
                 ph, pw = lh * 8, lw * 8
                 bw = _make_blend_weight(tile_H, tile_W,
                                         (ov_H, ov_W), n_h, n_w, ti, tj)
-                bw5d = mx.array(bw[None, None, :, :, None])
-                output, out_wt = _gpu_blend_paste(
-                    output, out_wt, tile_out, bw5d,
-                    slice(0, T_out),
-                    slice(ph, ph + tile_H),
-                    slice(pw, pw + tile_W),
+                # Materialize the tile to numpy and free the MLX-side buffer.
+                tile_np = np.asarray(tile_out)  # fp32 numpy
+                del tile_out
+                # Blend on CPU (numpy in-place add). bw is fp32 [tile_H, tile_W].
+                bw5d = bw[None, None, :, :, None]
+                output[:, :, ph:ph+tile_H, pw:pw+tile_W, :] += (
+                    (tile_np * bw5d).astype(np.float16)
                 )
-                mx.eval(output, out_wt)
+                out_wt[:, :, ph:ph+tile_H, pw:pw+tile_W, :] += bw5d
+                del tile_np
                 mx.clear_cache()
                 tc += 1
                 logger.info(f"  Dec tile {tc}/{n_h*n_w}: {time.perf_counter()-t0:.1f}s")
 
-        output = output / mx.maximum(out_wt, 1e-8)
-        mx.eval(output)
-        output_np = np.array(output).astype(np.float32)
+        output_np = (output.astype(np.float32) / np.maximum(out_wt, 1e-8)).astype(np.float32)
         del output, out_wt
         mx.clear_cache()
         elapsed = time.perf_counter() - t0
