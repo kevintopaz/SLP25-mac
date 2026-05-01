@@ -284,6 +284,30 @@ def encode_whole_video(
     
     ctx['full_latent'] = latent
     
+    # Offload transformed_video to a memory-mapped file so it doesn't
+    # consume physical RAM during DiT (Phase 2) and decode (Phase 3).
+    # The OS will page it back in when color correction reads it.
+    if 'transformed_video' in ctx:
+        import tempfile, numpy as np
+        tv = ctx['transformed_video']
+        tv_shape = tuple(tv.shape)
+        tv_np = tv.numpy()
+        tmp = tempfile.NamedTemporaryFile(suffix='.dat', delete=False)
+        mm = np.memmap(tmp.name, dtype=tv_np.dtype, mode='w+', shape=tv_np.shape)
+        mm[:] = tv_np
+        mm.flush()
+        del mm, tv_np, tv
+        ctx['_transformed_video_memmap'] = {
+            'path': tmp.name,
+            'dtype': np.float16,
+            'shape': tv_shape,
+        }
+        del ctx['transformed_video']
+        tmp.close()
+        import gc; gc.collect()
+        debug.log(f"Offloaded transformed_video to memmap: {tmp.name} "
+                  f"(shape={tv_shape})", category="memory", force=True)
+
     if ctx['vae_offload_device'] is not None:
         manage_model_device(model=runner.vae, target_device=ctx['vae_offload_device'],
                            model_name="VAE", debug=debug, reason="VAE offload", runner=runner)
@@ -819,7 +843,10 @@ def decode_whole_latent(
                       category="vae", force=True)
             # decoded sample is [T, H, W, C]
             sample = sample[:, :true_h, :true_w, :]
-            # transformed_video is [C, T, H, W] — trim to match
+            # Record trim dims so the memmap-backed transformed_video
+            # can be trimmed when reloaded in Phase 4.
+            ctx['_transformed_video_trim'] = (true_h, true_w)
+            # Legacy path: if transformed_video is still in-memory (no memmap)
             if 'transformed_video' in ctx:
                 ctx['transformed_video'] = ctx['transformed_video'][:, :, :true_h, :true_w]
     
@@ -873,6 +900,29 @@ def postprocess_latent_output(
     if progress_callback:
         progress_callback(0, 1, T, "Phase 4: Post-processing")
     
+    # Reload transformed_video from memmap if it was offloaded
+    _mm_meta = ctx.pop('_transformed_video_memmap', None)
+    if _mm_meta is not None:
+        import numpy as np, os
+        if color_correction != "none" and 'transformed_video' not in ctx:
+            mm = np.memmap(_mm_meta['path'], dtype=_mm_meta['dtype'],
+                           mode='r', shape=_mm_meta['shape'])
+            tv = torch.from_numpy(np.array(mm))
+            del mm
+            trim = ctx.pop('_transformed_video_trim', None)
+            if trim is not None:
+                tv = tv[:, :, :trim[0], :trim[1]]
+            ctx['transformed_video'] = tv
+            del tv
+            debug.log("Reloaded transformed_video from memmap for color correction",
+                      category="memory", force=True)
+        else:
+            ctx.pop('_transformed_video_trim', None)
+        try:
+            os.unlink(_mm_meta['path'])
+        except OSError:
+            pass
+
     if color_correction != "none" and 'transformed_video' in ctx:
         from ..utils.color_fix import (
             lab_color_transfer, lab_reinhard_transfer, wavelet_reconstruction,

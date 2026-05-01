@@ -190,7 +190,7 @@ def _auto_mlx_cache_gb() -> float:
         return 2.0
     if _TOTAL_RAM_GB <= 24:
         return 4.0
-    return 8.0
+    return 6.0
 
 
 MLX_VAE_CACHE_LIMIT_GB = _auto_mlx_cache_gb()

@@ -985,19 +985,25 @@ class MLXVideoVAE:
         n_h = max(1, int(math.ceil((lat_H - lat_ov_H) / (lat_tile_H - lat_ov_H))))
         n_w = max(1, int(math.ceil((lat_W - lat_ov_W) / (lat_tile_W - lat_ov_W))))
 
-        # Output canvases live in numpy (libc heap), not MLX. Reasoning:
-        #   * Physical RAM is the same on Apple Silicon's unified memory — the
-        #     bytes go in the same pool either way.
-        #   * BUT keeping them out of MLX's allocator pool gives the per-tile
-        #     conv workspaces the full cache_limit budget instead of fighting
-        #     the canvases for it. At 4K the canvases are ~5 GB; that's
-        #     significant working room reclaimed.
-        #   * libc malloc is pageable — under memory pressure macOS can
-        #     compress or page these. Metal allocations are typically wired.
-        # The blend math is plain numpy: tile_out (mlx) is materialized, cast
-        # to numpy, and accumulated in-place into the canvas. No torch.
+        # Precompute 2D total blend-weight map (~16 MB at 4K vs ~1.6 GB for a
+        # full 5D out_wt canvas).  Blend weights are purely spatial — identical
+        # across T and channels — so a [pixel_H, pixel_W] accumulator suffices.
+        total_wt = np.zeros((pixel_H, pixel_W), dtype=np.float32)
+        for ti in range(n_h):
+            for tj in range(n_w):
+                lh = min(ti * (lat_tile_H - lat_ov_H), lat_H - lat_tile_H)
+                lw = min(tj * (lat_tile_W - lat_ov_W), lat_W - lat_tile_W)
+                ph, pw = lh * 8, lw * 8
+                bw = _make_blend_weight(tile_H, tile_W,
+                                        (ov_H, ov_W), n_h, n_w, ti, tj)
+                total_wt[ph:ph+tile_H, pw:pw+tile_W] += bw
+        total_wt = np.maximum(total_wt, 1e-4).astype(np.float16)
+
+        # Output canvas lives in numpy (libc heap), not MLX — pageable under
+        # memory pressure, and keeps MLX's cache_limit budget free for conv
+        # workspaces.  Each tile's blend weight is pre-normalized by total_wt
+        # so we accumulate directly into the final result (no separate out_wt).
         output = np.zeros((1, T_out, pixel_H, pixel_W, 3), dtype=np.float16)
-        out_wt = np.zeros((1, T_out, pixel_H, pixel_W, 3), dtype=np.float16)
 
         t0 = time.perf_counter()
         tc = 0
@@ -1014,21 +1020,20 @@ class MLXVideoVAE:
                 ph, pw = lh * 8, lw * 8
                 bw = _make_blend_weight(tile_H, tile_W,
                                         (ov_H, ov_W), n_h, n_w, ti, tj)
-                # Materialize the tile to numpy and free the MLX-side buffer.
-                tile_np = np.asarray(tile_out)  # fp32 numpy
+                tile_np = np.asarray(tile_out)
                 del tile_out
-                # Blend on CPU (numpy in-place add). bw is fp32 [tile_H, tile_W].
-                bw5d = bw[None, None, :, :, None].astype(np.float16)
+                # Normalize blend weight by precomputed total, then accumulate.
+                norm_bw = (bw / total_wt[ph:ph+tile_H, pw:pw+tile_W]).astype(np.float16)
+                bw5d = norm_bw[None, None, :, :, None]
                 output[:, :, ph:ph+tile_H, pw:pw+tile_W, :] += (
                     (tile_np * bw5d).astype(np.float16)
                 )
-                out_wt[:, :, ph:ph+tile_H, pw:pw+tile_W, :] += bw5d
                 del tile_np
                 tc += 1
                 logger.info(f"  Dec tile {tc}/{n_h*n_w}: {time.perf_counter()-t0:.1f}s")
 
-        output_np = (output / np.maximum(out_wt, np.float16(1e-4))).astype(np.float16)
-        del output, out_wt
+        output_np = output
+        del output, total_wt
         mx.clear_cache()
         elapsed = time.perf_counter() - t0
         frames = output_np[0]

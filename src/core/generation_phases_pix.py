@@ -268,6 +268,22 @@ def process_pix_chunk(
     if decoded.is_cuda or (hasattr(decoded, 'is_mps') and decoded.is_mps):
         decoded = decoded.cpu()
 
+    # Reload transformed_video from memmap if it was offloaded during encode
+    _mm_meta = ctx.pop('_transformed_video_memmap', None)
+    if _mm_meta is not None and 'transformed_video' not in ctx:
+        import numpy as np, os
+        mm = np.memmap(_mm_meta['path'], dtype=_mm_meta['dtype'],
+                       mode='r', shape=_mm_meta['shape'])
+        ctx['transformed_video'] = torch.from_numpy(np.array(mm))
+        del mm
+        trim = ctx.pop('_transformed_video_trim', None)
+        if trim is not None:
+            ctx['transformed_video'] = ctx['transformed_video'][:, :, :trim[0], :trim[1]]
+        try:
+            os.unlink(_mm_meta['path'])
+        except OSError:
+            pass
+
     transformed = ctx.get('transformed_video')
     if transformed is not None:
         transformed = transformed.cpu()
