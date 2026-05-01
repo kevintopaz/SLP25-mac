@@ -914,7 +914,7 @@ class VideoUpscaler:
                     tile_overlap=VAE_DECODE_TILE_OVERLAP,
                 )
                 # frames_np: [T_out, H, W, 3] in [-1, 1]
-                sample_t = torch.from_numpy(frames_np.astype(np.float32))
+                sample_t = torch.from_numpy(frames_np)
                 # Convert to CTHW
                 sample_t = sample_t.permute(3, 0, 1, 2)  # [C, T, H, W]
                 samples.append(sample_t)

@@ -997,7 +997,7 @@ class MLXVideoVAE:
         # The blend math is plain numpy: tile_out (mlx) is materialized, cast
         # to numpy, and accumulated in-place into the canvas. No torch.
         output = np.zeros((1, T_out, pixel_H, pixel_W, 3), dtype=np.float16)
-        out_wt = np.zeros((1, T_out, pixel_H, pixel_W, 3), dtype=np.float32)
+        out_wt = np.zeros((1, T_out, pixel_H, pixel_W, 3), dtype=np.float16)
 
         t0 = time.perf_counter()
         tc = 0
@@ -1018,7 +1018,7 @@ class MLXVideoVAE:
                 tile_np = np.asarray(tile_out)  # fp32 numpy
                 del tile_out
                 # Blend on CPU (numpy in-place add). bw is fp32 [tile_H, tile_W].
-                bw5d = bw[None, None, :, :, None]
+                bw5d = bw[None, None, :, :, None].astype(np.float16)
                 output[:, :, ph:ph+tile_H, pw:pw+tile_W, :] += (
                     (tile_np * bw5d).astype(np.float16)
                 )
@@ -1027,7 +1027,7 @@ class MLXVideoVAE:
                 tc += 1
                 logger.info(f"  Dec tile {tc}/{n_h*n_w}: {time.perf_counter()-t0:.1f}s")
 
-        output_np = (output.astype(np.float32) / np.maximum(out_wt, 1e-8)).astype(np.float32)
+        output_np = (output / np.maximum(out_wt, np.float16(1e-4))).astype(np.float16)
         del output, out_wt
         mx.clear_cache()
         elapsed = time.perf_counter() - t0
