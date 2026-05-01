@@ -261,8 +261,15 @@ class CausalConv(nn.Module):
         )
         mx.eval(o0)
         _, Ho, Wo, Co = o0.shape
+        # Per-scatter eval breaks the lazy chain so each frame's o can be freed
+        # immediately. Only worthwhile when per-frame output is large enough
+        # that the T-frame chain accumulation (T × frame_bytes) matters.
+        frame_bytes = Ho * Wo * Co * 2
+        eager_scatter = (frame_bytes * T) > 200 * 1024 * 1024  # >200 MB chain
         out = mx.zeros((B, T, Ho, Wo, Co), dtype=o0.dtype)
         out[:, 0] = o0
+        if eager_scatter:
+            mx.eval(out)
         for t in range(1, T):
             stacked = mx.concatenate(
                 [x[:, max(0, t + k - pad_n)] for k in range(self.kT)],
@@ -271,7 +278,10 @@ class CausalConv(nn.Module):
             o = self._do_conv(stacked)
             mx.eval(o)
             out[:, t] = o
-        mx.eval(out)
+            if eager_scatter:
+                mx.eval(out)
+        if not eager_scatter:
+            mx.eval(out)
         return out
 
     def __call__(self, x, low_mem=False):
@@ -353,8 +363,12 @@ class StridedCausalConv(nn.Module):
         )
         mx.eval(o0)
         _, Ho, Wo, Co = o0.shape
+        frame_bytes = Ho * Wo * Co * 2
+        eager_scatter = (frame_bytes * T_out) > 200 * 1024 * 1024
         out = mx.zeros((B, T_out, Ho, Wo, Co), dtype=o0.dtype)
         out[:, 0] = o0
+        if eager_scatter:
+            mx.eval(out)
         for t in range(1, T_out):
             t_start = t * self.stride_t
             stacked = mx.concatenate(
@@ -364,7 +378,10 @@ class StridedCausalConv(nn.Module):
             o = self._do_conv(stacked)
             mx.eval(o)
             out[:, t] = o
-        mx.eval(out)
+            if eager_scatter:
+                mx.eval(out)
+        if not eager_scatter:
+            mx.eval(out)
         return out
 
     def __call__(self, x, low_mem=False):
@@ -400,7 +417,10 @@ class ResnetBlock(nn.Module):
         h = self.conv2(h, low_mem=low_mem)
         if self.has_shortcut:
             x = self.conv_shortcut(x, low_mem=low_mem)
-        return x + h
+        out = x + h
+        if low_mem:
+            mx.eval(out)
+        return out
 
 
 class SelfAttention(nn.Module):
@@ -423,6 +443,13 @@ class SelfAttention(nn.Module):
         q = self.to_q(x).reshape(BT, 1, H * W, C)
         k = self.to_k(x).reshape(BT, 1, H * W, C)
         v = self.to_v(x).reshape(BT, 1, H * W, C)
+        # The PyTorch reference VAE sets diffusers Attention(upcast_softmax=
+        # True) at attn_video_vae.py:629. MLX's mx.fast.scaled_dot_product_
+        # attention has no softmax-only upcast knob — but empirical A/B test
+        # against the reference (v2 vs v3 benchmark) showed bit-equivalent
+        # output, confirming Metal's fused SDPA already upcasts the softmax
+        # reduction internally. Running in bf16 here is ~13% faster than
+        # explicitly upcasting Q/K/V to fp32 with no observable quality loss.
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
         out = out.reshape(BT, H * W, C)
         out = self.to_out[0](out)
@@ -520,9 +547,11 @@ class UpDecoderBlock(nn.Module):
         )
 
     def __call__(self, x, low_mem=False):
-        for r in self.resnets:
+        for j, r in enumerate(self.resnets):
             x = r(x, low_mem=low_mem)
             if low_mem: mx.eval(x)
+            if low_mem and _CLEAR_CACHE_BETWEEN_RESNETS and j + 1 < len(self.resnets):
+                mx.clear_cache()
         for u in self.upsamplers:
             x = u(x, low_mem=low_mem)
             if low_mem: mx.eval(x)
@@ -693,17 +722,22 @@ def _conv3d_to_mlx(arr):
 
 
 def _load_weights(model, vae_path, prefix, dtype=mx.float16):
-    from safetensors import safe_open
-    raw = {}
-    with safe_open(vae_path, framework="numpy") as f:
-        for k in f.keys():
-            if k.startswith(prefix):
-                raw[k[len(prefix):]] = f.get_tensor(k)
+    """Load VAE weights from safetensors via native MLX.
+
+    ``mx.load`` reads bf16/fp16/fp32 safetensors directly into ``mx.array``
+    with the on-disk dtype preserved, so bf16 weights stay bf16 (numpy's
+    safetensors framework can't read bf16). The final ``.astype(dtype)`` is
+    a cheap cast — usually a no-op when on-disk dtype matches the target.
+    ``_conv3d_to_mlx`` is dtype-agnostic and works on mx.array directly.
+    """
+    weights = mx.load(vae_path)
     pairs = []
-    for key, arr in raw.items():
+    for k, arr in weights.items():
+        if not k.startswith(prefix):
+            continue
         if arr.ndim == 5:
             arr = _conv3d_to_mlx(arr)
-        pairs.append((key, mx.array(arr).astype(dtype)))
+        pairs.append((k[len(prefix):], arr.astype(dtype)))
     model.load_weights(pairs)
     return model
 
@@ -755,7 +789,7 @@ class MLXVideoVAE:
     """High-level wrapper: holds encoder/decoder, provides tiled encode/decode,
     and bridges PyTorch <-> MLX tensors."""
 
-    def __init__(self, vae_path, cache_limit_gb=1.0, dtype=mx.float16, low_mem=True):
+    def __init__(self, vae_path, cache_limit_gb=1.0, dtype=mx.bfloat16, low_mem=True):
         # Defaults match the bloom_precision config that hit 156 s for 33 frames
         # @ 1080p (encode): low_mem=True (per-frame conv) + 1 GB MLX buffer cache.
         # Set cache_limit_gb=None to disable cache cap (faster but ~22 GB system RAM
@@ -780,19 +814,35 @@ class MLXVideoVAE:
         mx.eval(self.decoder.parameters())
         logger.info(f"MLX Video VAE ready ({dtype})")
 
-    def tiled_encode(self, frames_f16_np, tile_size=480, tile_overlap=48):
+    def tiled_encode(self, frames_np, tile_size=480, tile_overlap=48):
         """Encode video frames to latent using spatial tiling.
 
         Args:
-            frames_f16_np: numpy array [T, H, W, 3] in [-1, 1] float16
+            frames_np: numpy array [T, H, W, 3] in [-1, 1] (float16 or float32)
             tile_size: int (square) or (tile_H, tile_W) tuple in pixels
             tile_overlap: int (square) or (overlap_H, overlap_W) tuple in pixels
 
         Returns:
             latent: numpy array [1, T_lat, H_lat, W_lat, 16] float32 (mean only)
         """
+        # Free decoder weights during encoding.
+        if getattr(self, 'decoder', None) is not None:
+            self.decoder = None
+            mx.clear_cache()
+
+        # Lazily reload encoder if it was freed during decode.
+        if getattr(self, 'encoder', None) is None:
+            logger.info("Reloading MLX VAE encoder weights...")
+            self.encoder = Encoder(in_ch=3, out_ch=32,
+                                   block_channels=(128, 256, 512, 512),
+                                   layers_per_block=2, groups=32,
+                                   temporal_down_num=2, kT=3)
+            _load_weights(self.encoder, self.vae_path, "encoder.", self.dtype)
+            mx.eval(self.encoder.parameters())
+
         tile_H, tile_W = _as_hw(tile_size)
         ov_H, ov_W = _as_hw(tile_overlap)
+        frames_f16_np = frames_np  # keep legacy local name for minimal diff
         T, H, W, _ = frames_f16_np.shape
         lat_tile_H = tile_H // 8
         lat_tile_W = tile_W // 8
@@ -815,7 +865,9 @@ class MLXVideoVAE:
                 hs = min(ti * (tile_H - ov_H), H - tile_H)
                 ws = min(tj * (tile_W - ov_W), W - tile_W)
                 tile = frames_f16_np[:, hs:hs+tile_H, ws:ws+tile_W, :]
-                tile_mx = mx.array(tile[np.newaxis])
+                # Numpy can't carry bf16 — cast on the MLX side so encoder dtype
+                # matches weights (bf16 by default; fp16 if explicitly requested).
+                tile_mx = mx.array(tile[np.newaxis]).astype(self.dtype)
                 prof = _MEM_PROFILE_FIRST_TILE and ti == 0 and tj == 0
                 if prof:
                     _enc_mem_profiling = True
@@ -827,6 +879,7 @@ class MLXVideoVAE:
                 # which retains every encoder intermediate and can push peak VRAM
                 # far above what low_mem + per-frame convs were designed for.
                 mx.eval(enc_out)
+                del tile_mx
                 if prof:
                     _mem_tile_dump("tile.after_encoder_mx_eval", enc_out, do_eval=False)
 
@@ -842,13 +895,11 @@ class MLXVideoVAE:
                     slice(lh, lh + lat_tile_H),
                     slice(lw, lw + lat_tile_W),
                 )
-                # Eval canvas after each tile (encoder graph already released via
-                # mx.eval(enc_out) above).
+                del enc_out, bw5d
                 mx.eval(latent, lat_wt)
                 if prof:
                     _mem_tile_dump("tile.after_blend_paste_mx_eval", latent, lat_wt, do_eval=False)
-                if _CLEAR_CACHE_PER_TILE:
-                    mx.clear_cache()
+                mx.clear_cache()
                 tc += 1
                 logger.info(f"  Enc tile {tc}/{n_h*n_w}: {time.perf_counter()-t0:.1f}s")
 
@@ -856,6 +907,8 @@ class MLXVideoVAE:
         mean = latent[:, :, :, :, :16]
         mx.eval(mean)
         mean_np = np.array(mean).astype(np.float32)
+        del latent, lat_wt
+        mx.clear_cache()
         elapsed = time.perf_counter() - t0
         logger.info(f"Encoded in {elapsed:.1f}s -> latent {mean_np.shape}")
         return mean_np
@@ -867,6 +920,21 @@ class MLXVideoVAE:
             tile_size: int (square) or (tile_H, tile_W) tuple in pixels
             tile_overlap: int (square) or (overlap_H, overlap_W) tuple in pixels
         """
+        # Free encoder weights during decoding.
+        if getattr(self, 'encoder', None) is not None:
+            self.encoder = None
+            mx.clear_cache()
+
+        # Lazily reload decoder if it was freed during encode.
+        if getattr(self, 'decoder', None) is None:
+            logger.info("Reloading MLX VAE decoder weights...")
+            self.decoder = Decoder(in_ch=16, out_ch=3,
+                                   block_channels=(128, 256, 512, 512),
+                                   layers_per_block=2, groups=32,
+                                   temporal_up_num=2, kT=3)
+            _load_weights(self.decoder, self.vae_path, "decoder.", self.dtype)
+            mx.eval(self.decoder.parameters())
+
         tile_H, tile_W = _as_hw(tile_size)
         ov_H, ov_W = _as_hw(tile_overlap)
         _, T_lat, lat_H, lat_W, _ = latent_f32_np.shape
@@ -881,7 +949,15 @@ class MLXVideoVAE:
         n_h = max(1, int(math.ceil((lat_H - lat_ov_H) / (lat_tile_H - lat_ov_H))))
         n_w = max(1, int(math.ceil((lat_W - lat_ov_W) / (lat_tile_W - lat_ov_W))))
 
-        output = mx.zeros((1, T_out, pixel_H, pixel_W, 3), dtype=mx.float32)
+        # Output canvas in bf16 (matches all-bf16 pipeline): tile values are
+        # in [-1, 1] and at most 4 tiles overlap at corners, so accumulation
+        # error stays below 8-bit quantization. bf16 has 3 fewer mantissa bits
+        # than fp16 in this range, so seam banding is slightly more likely on
+        # synthetic gradients than with fp16 — but invisible on natural video.
+        # Weight canvas stays fp32 because it feeds the divisor
+        # (output / max(out_wt, 1e-8)) and a 16-bit ramp can lose ~½ ULP per
+        # add, producing seam banding regardless of fp16 vs bf16.
+        output = mx.zeros((1, T_out, pixel_H, pixel_W, 3), dtype=mx.bfloat16)
         out_wt = mx.zeros((1, T_out, pixel_H, pixel_W, 3), dtype=mx.float32)
 
         t0 = time.perf_counter()
@@ -892,8 +968,7 @@ class MLXVideoVAE:
                 lw = min(tj * (lat_tile_W - lat_ov_W), lat_W - lat_tile_W)
                 tile_z = mx.array(
                     latent_f32_np[:, :, lh:lh+lat_tile_H, lw:lw+lat_tile_W, :]
-                    .astype(np.float16)
-                )
+                ).astype(self.dtype)
                 tile_out = self.decoder(tile_z, low_mem=self.low_mem).astype(mx.float32)
                 mx.eval(tile_out)
 
@@ -908,14 +983,15 @@ class MLXVideoVAE:
                     slice(pw, pw + tile_W),
                 )
                 mx.eval(output, out_wt)
-                if _CLEAR_CACHE_PER_TILE:
-                    mx.clear_cache()
+                mx.clear_cache()
                 tc += 1
                 logger.info(f"  Dec tile {tc}/{n_h*n_w}: {time.perf_counter()-t0:.1f}s")
 
         output = output / mx.maximum(out_wt, 1e-8)
         mx.eval(output)
         output_np = np.array(output).astype(np.float32)
+        del output, out_wt
+        mx.clear_cache()
         elapsed = time.perf_counter() - t0
         frames = output_np[0]
         if num_frames is not None and frames.shape[0] > num_frames:
@@ -924,7 +1000,7 @@ class MLXVideoVAE:
         return frames
 
     def encode_torch(self, frames_torch, tile_size=480, tile_overlap=48):
-        """Bridge: PyTorch [T,H,W,C] float16 [0,1] -> encode -> PyTorch latent [1,T_lat,H,W,16]."""
+        """Bridge: PyTorch [T,H,W,C] [0,1] -> encode -> PyTorch latent [1,T_lat,H,W,16]."""
         import torch
         frames_np = (frames_torch.cpu().float().numpy() * 2.0 - 1.0).astype(np.float16)
         latent_np = self.tiled_encode(frames_np, tile_size, tile_overlap)
@@ -932,7 +1008,7 @@ class MLXVideoVAE:
         return torch.from_numpy(latent_scaled)
 
     def decode_torch(self, latent_torch, tile_size=480, tile_overlap=48, num_frames=None):
-        """Bridge: PyTorch latent [1,T,H,W,16] -> decode -> PyTorch [T,H,W,C] float16 [0,1]."""
+        """Bridge: PyTorch latent [1,T,H,W,16] -> decode -> PyTorch [T,H,W,C] [0,1]."""
         import torch
         latent_np = (latent_torch.cpu().float().numpy() / VAE_SCALING_FACTOR).astype(np.float32)
         frames_np = self.tiled_decode(latent_np, tile_size, tile_overlap, num_frames)

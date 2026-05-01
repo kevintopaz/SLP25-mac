@@ -116,7 +116,7 @@ _TOTAL_RAM_GB = _system_ram_gb()
 #   >= 24 GB RAM -> encoder (640, 640), decoder (480, 480)
 def _auto_tile_sizes():
     if _TOTAL_RAM_GB >= 24:
-        return (640, 640), (64, 64), (480, 480), (48, 48)
+        return (480, 720), (48, 72), (480, 480), (48, 48)
     return (480, 320), (48, 32), (480, 320), (48, 32)
 
 

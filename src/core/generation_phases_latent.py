@@ -225,7 +225,7 @@ def encode_whole_video(
     video_transformed = transform(video)
     
     debug.log(f"Transformed shape: {video_transformed.shape}", category="vae")
-    ctx['transformed_video'] = video_transformed.cpu()
+    ctx['transformed_video'] = video_transformed.cpu().to(torch.float16)
     
     # VAE requires temporal dimension to satisfy 4n+1 constraint
     # video_transformed is CTHW format, temporal_dim=1
@@ -246,16 +246,25 @@ def encode_whole_video(
         reason="VAE encoding"
     )
     
+    # Free fp32 input frames before encoding — not needed again in the latent
+    # pipeline, and they occupy ~0.77 GB on unified memory.
+    del images, video
+    if 'input_images' in ctx:
+        del ctx['input_images']
+    import gc; gc.collect()
+
     if progress_callback:
-        progress_callback(0, 1, len(images), "Phase 1: Encoding")
+        progress_callback(0, 1, ctx['total_frames'], "Phase 1: Encoding")
     
     debug.start_timer("vae_encode")
-    latents = runner.vae_encode([video_transformed])
+    encode_input = [video_transformed]
+    del video_transformed
+    latents = runner.vae_encode(encode_input)
+    del encode_input
     latent = latents[0]
     debug.end_timer("vae_encode", "VAE encode")
     
     debug.log(f"Encoded latent shape: {latent.shape}", category="vae", force=True)
-    del video_transformed
     
     if ctx['tensor_offload_device'] is not None:
         latent = manage_tensor(
