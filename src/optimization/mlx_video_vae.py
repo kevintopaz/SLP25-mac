@@ -933,7 +933,6 @@ class MLXVideoVAE:
                 mx.eval(latent, lat_wt)
                 if prof:
                     _mem_tile_dump("tile.after_blend_paste_mx_eval", latent, lat_wt, do_eval=False)
-                mx.clear_cache()
                 tc += 1
                 logger.info(f"  Enc tile {tc}/{n_h*n_w}: {time.perf_counter()-t0:.1f}s")
 
@@ -1025,7 +1024,6 @@ class MLXVideoVAE:
                 )
                 out_wt[:, :, ph:ph+tile_H, pw:pw+tile_W, :] += bw5d
                 del tile_np
-                mx.clear_cache()
                 tc += 1
                 logger.info(f"  Dec tile {tc}/{n_h*n_w}: {time.perf_counter()-t0:.1f}s")
 

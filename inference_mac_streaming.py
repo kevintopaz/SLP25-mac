@@ -187,10 +187,10 @@ VAE_TILE_SIZE, VAE_TILE_OVERLAP, VAE_DECODE_TILE_SIZE, VAE_DECODE_TILE_OVERLAP =
 # Override with --vae-cache-gb on the CLI.
 def _auto_mlx_cache_gb() -> float:
     if _TOTAL_RAM_GB <= 16:
-        return 1.0
+        return 2.0
     if _TOTAL_RAM_GB <= 24:
         return 4.0
-    return 6.0
+    return 8.0
 
 
 MLX_VAE_CACHE_LIMIT_GB = _auto_mlx_cache_gb()
@@ -328,7 +328,7 @@ class LazyVideoReader:
         if item is None:
             self._exhausted = True
             return False
-        self._buffer[self._decode_pos] = item.to_ndarray(format='rgb24').astype(np.float32) / 255.0
+        self._buffer[self._decode_pos] = (item.to_ndarray(format='rgb24').astype(np.float16) / np.float16(255.0))
         self._decode_pos += 1
         return True
 
@@ -361,8 +361,8 @@ class LazyVideoReader:
             h, w = frames[0].shape[:2]
             new_w = round(w * self._sar)
             if new_w != w:
-                frames = [cv2.resize(f, (new_w, h), interpolation=cv2.INTER_CUBIC) for f in frames]
-        return torch.from_numpy(np.stack(frames)).to(torch.float16)
+                frames = [cv2.resize(f.astype(np.float32), (new_w, h), interpolation=cv2.INTER_CUBIC).astype(np.float16) for f in frames]
+        return torch.from_numpy(np.stack(frames))
 
     def close(self):
         if self._container is not None:
@@ -844,8 +844,6 @@ class VideoUpscaler:
                     frames_torch = frames_torch.to(torch.float16)
                 samples[i] = None
                 del sample
-                gc.collect()
-                torch.mps.empty_cache()
 
                 latent_np = mlx_vae.tiled_encode(
                     frames_torch,
@@ -909,7 +907,6 @@ class VideoUpscaler:
                 lat_np = lat_unscaled.cpu().numpy()[np.newaxis]  # [1, T, H, W, 16]
                 # Latent now lives in numpy/host; release the MPS-side copy.
                 del lat_unscaled, latent
-                torch.mps.empty_cache()
 
                 frames_np = mlx_vae.tiled_decode(
                     lat_np,
@@ -922,7 +919,6 @@ class VideoUpscaler:
                 sample_t = sample_t.permute(3, 0, 1, 2)  # [C, T, H, W]
                 samples.append(sample_t)
                 del lat_np, frames_np
-                mx.clear_cache()
                 debug.log(f"MLX Decode: {list(sample_t.shape)}", category="vae")
 
             # Full cleanup after decode
