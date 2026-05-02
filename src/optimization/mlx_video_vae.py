@@ -38,18 +38,16 @@ VAE_SCALING_FACTOR = 0.9152
 def _detach_copy(arr):
     """Create an independent MLX array, breaking any view/slice reference.
 
-    MLX slices (e.g. ``xp[:, -2:]``) share the source buffer. Even after
-    ``mx.eval``, the view keeps the entire source alive.  This helper
-    round-trips through numpy to guarantee a fresh allocation so the
-    source buffer can be freed.
+    MLX slices (e.g. ``xp[:, -2:]``) share the source buffer.  This helper
+    stacks individual frames along dim-1 to produce a fresh contiguous
+    allocation so the source buffer can be freed.  Stays entirely on GPU
+    (no numpy round-trip).
     """
-    mx.eval(arr)
-    dt = arr.dtype
-    if dt == mx.bfloat16:
-        np_arr = np.array(arr.astype(mx.float32))
-        out = mx.array(np_arr).astype(mx.bfloat16)
+    if arr.ndim >= 2 and arr.shape[1] > 0:
+        frames = [arr[:, i] for i in range(arr.shape[1])]
+        out = mx.stack(frames, axis=1)
     else:
-        out = mx.array(np.array(arr))
+        out = arr + 0  # fallback: arithmetic forces new buffer
     mx.eval(out)
     return out
 
@@ -70,6 +68,12 @@ _USE_COMPILE = os.environ.get("MLX_VAE_USE_COMPILE", "1") == "1"
 #          (one-tile bench: ~6.7% faster, +0.01 GB peak)
 #   8.0  -> batched everywhere (fastest, ~30 GB peak — needs lots of VRAM)
 _BATCHED_MAX_BYTES = int(float(os.environ.get("MLX_VAE_BATCHED_MAX_GB", "0")) * 1024**3)
+
+# Streaming-mode adaptive threshold: use fast batched conv when the stacked
+# intermediate fits within this budget.  Later encoder stages (160x160,
+# 80x80) have small intermediates that are much faster batched than per-frame.
+# Default 1 GB: batched at stages 2/3/mid, per-frame at stages 0/1.
+_STREAMING_BATCHED_MAX = int(float(os.environ.get("MLX_VAE_STREAMING_BATCHED_MAX_GB", "1.0")) * 1024**3)
 
 # Like TRT path empty_cache between tiles: drop MLX buffer pool between spatial
 # tiles (slower). Set MLX_VAE_CLEAR_CACHE_PER_TILE=1 when chasing peak footprint.
@@ -341,7 +345,10 @@ class CausalConv(nn.Module):
 
         T_out = xp.shape[1] - self.kT + 1  # == T (stride=1)
 
-        if not low_mem:
+        # Adaptive: use fast batched path when the stacked intermediate is
+        # small enough (later encoder stages).  Same heuristic as __call__.
+        stacked_bytes = B * T_out * H * W * self.kT * C * 2
+        if not low_mem or stacked_bytes <= _STREAMING_BATCHED_MAX:
             windows = [xp[:, i : i + T_out] for i in range(self.kT)]
             stacked = mx.concatenate(windows, axis=-1)
             flat = stacked.reshape(B * T_out, H, W, self.kT * C)
@@ -349,15 +356,18 @@ class CausalConv(nn.Module):
             _, Ho, Wo, Co = out.shape
             return out.reshape(B, T_out, Ho, Wo, Co)
 
-        # Per-frame path: one conv2d at a time, eval after each scatter.
+        # Per-frame path — mirrors _per_frame's eager_scatter heuristic.
         o0 = self._do_conv(
             mx.concatenate([xp[:, 0 + k] for k in range(self.kT)], axis=-1)
         )
         mx.eval(o0)
         _, Ho, Wo, Co = o0.shape
+        frame_bytes = Ho * Wo * Co * 2
+        eager_scatter = (frame_bytes * T_out) > 200 * 1024 * 1024
         out = mx.zeros((B, T_out, Ho, Wo, Co), dtype=o0.dtype)
         out[:, 0] = o0
-        mx.eval(out)
+        if eager_scatter:
+            mx.eval(out)
         del o0
         for t in range(1, T_out):
             ot = self._do_conv(
@@ -365,8 +375,11 @@ class CausalConv(nn.Module):
             )
             mx.eval(ot)
             out[:, t] = ot
-            mx.eval(out)
+            if eager_scatter:
+                mx.eval(out)
             del ot
+        if not eager_scatter:
+            mx.eval(out)
         return out
 
     def __call__(self, x, low_mem=False, streaming=False):
@@ -517,7 +530,9 @@ class StridedCausalConv(nn.Module):
         self._cache = _detach_copy(_raw)
         del _raw
 
-        if not low_mem:
+        # Adaptive: use fast batched path when stacked intermediate is small.
+        stacked_bytes = B * T_out * H * W * self.kT * C * 2
+        if not low_mem or stacked_bytes <= _STREAMING_BATCHED_MAX:
             slices = []
             for t in range(T_out):
                 t_start = t * self.stride_t
@@ -529,16 +544,19 @@ class StridedCausalConv(nn.Module):
             _, Ho, Wo, Co = out.shape
             return out.reshape(B, T_out, Ho, Wo, Co)
 
-        # Per-frame path — eval(out) after each scatter to break the lazy chain.
+        # Per-frame path — mirrors _per_frame's eager_scatter heuristic.
         t_start0 = 0
         o0 = self._do_conv(
             mx.concatenate([xp[:, t_start0 + k] for k in range(self.kT)], axis=-1)
         )
         mx.eval(o0)
         _, Ho, Wo, Co = o0.shape
+        frame_bytes = Ho * Wo * Co * 2
+        eager_scatter = (frame_bytes * T_out) > 200 * 1024 * 1024
         out = mx.zeros((B, T_out, Ho, Wo, Co), dtype=o0.dtype)
         out[:, 0] = o0
-        mx.eval(out)
+        if eager_scatter:
+            mx.eval(out)
         del o0
         for t in range(1, T_out):
             t_start = t * self.stride_t
@@ -547,8 +565,11 @@ class StridedCausalConv(nn.Module):
             )
             mx.eval(ot)
             out[:, t] = ot
-            mx.eval(out)
+            if eager_scatter:
+                mx.eval(out)
             del ot
+        if not eager_scatter:
+            mx.eval(out)
         return out
 
     def __call__(self, x, low_mem=False, streaming=False):
