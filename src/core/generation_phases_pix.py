@@ -460,6 +460,7 @@ def process_video_pix_chunked(
     usm_threshold: int = 10,
     device: str = "cuda:0",
     output_callback: Optional[Callable[[torch.Tensor], None]] = None,
+    shift_back: bool = True,
 ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
     """
     Complete pixel-space temporal chunking pipeline.
@@ -552,7 +553,8 @@ def process_video_pix_chunked(
         # start backwards so it always processes exactly chunk_size frames.
         # The extra overlap with the previous chunk is handled by discarding
         # redundant leading output frames, then blending the standard overlap.
-        if len(read_windows) > 1:
+        # Disabled for hybrid/latent mode where mirror-padding handles 4n+1.
+        if shift_back and len(read_windows) > 1:
             last_start, last_end = read_windows[-1]
             if (last_end - last_start) < chunk_size:
                 new_start = max(0, last_end - chunk_size)
@@ -632,6 +634,20 @@ def process_video_pix_chunked(
                     ci + 1, num_chunks, ws, we,
                 )
                 break
+
+            # Free reader buffer entries that won't be needed by any
+            # future chunk so decoded frames don't linger in RAM during
+            # the heavy encode/dit/decode phases.
+            if hasattr(frames, '_buffer') and isinstance(frames._buffer, dict):
+                next_start = read_windows[ci + 1][0] if ci + 1 < num_chunks else we
+                _skip = getattr(frames, 'skip_frames', 0)
+                _freed = 0
+                for k in list(frames._buffer):
+                    if k < _skip + next_start:
+                        del frames._buffer[k]
+                        _freed += 1
+                if _freed:
+                    logger.info("Freed %d reader buffer entries (< frame %d)", _freed, next_start)
 
             video_ended_early = chunk_len < (we - ws)
             if video_ended_early:

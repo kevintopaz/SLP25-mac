@@ -259,6 +259,33 @@ def encode_whole_video(
         reason="VAE encoding"
     )
 
+    # Offload ctx['transformed_video'] to disk BEFORE encoding so that
+    # the streaming encoder doesn't have to compete with the ~1.5 GB
+    # original-frames tensor for physical RAM.
+    if 'transformed_video' in ctx:
+        import tempfile as _enc_tmpmod
+        import numpy as np
+        tv = ctx['transformed_video']
+        tv_shape = tuple(tv.shape)
+        tv_np = tv.numpy()
+        _enc_tmp = _enc_tmpmod.NamedTemporaryFile(suffix='.dat', delete=False)
+        _enc_mm = np.memmap(_enc_tmp.name, dtype=tv_np.dtype, mode='w+',
+                            shape=tv_np.shape)
+        _enc_mm[:] = tv_np
+        _enc_mm.flush()
+        del _enc_mm, tv_np, tv
+        ctx['_transformed_video_memmap'] = {
+            'path': _enc_tmp.name,
+            'dtype': np.float16,
+            'shape': tv_shape,
+        }
+        del ctx['transformed_video']
+        _enc_tmp.close()
+        import gc as _gc; _gc.collect()
+        debug.log(f"Offloaded transformed_video to memmap before encode: "
+                  f"{_enc_tmp.name} (shape={tv_shape})",
+                  category="memory", force=True)
+
     if progress_callback:
         progress_callback(0, 1, ctx['total_frames'], "Phase 1: Encoding")
     

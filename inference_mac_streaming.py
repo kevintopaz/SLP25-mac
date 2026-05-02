@@ -76,6 +76,7 @@ from .src.core.generation_phases_latent import (
 from .src.core.generation_phases_pix import process_video_pix_chunked
 from .src.core.model_loader import materialize_model
 from .src.utils.debug import Debug
+from .src.optimization.mlx_video_vae import assemble_tiles_from_disk, cleanup_tile_files
 
 logging.basicConfig(
     format='%(asctime)s %(levelname)-8s %(message)s',
@@ -115,6 +116,13 @@ if os.environ.get("MLX_WAVELET", "1") == "1":
 PIX_CHUNK_SIZE = 33
 PIX_OVERLAP = 8
 DIT_TILE_OVERLAP = 0.1
+
+# Hybrid latent-chunk mode: pixel-space outer loop with streaming VAE
+HYBRID_CHUNK_SIZE = 121       # 4*30+1 pixel frames per outer chunk
+HYBRID_OVERLAP = 21           # pixel-space overlap between outer chunks
+HYBRID_FIXED_WT = 3           # temporal attention window size for full-latent DiT
+HYBRID_TEMPORAL_ENCODE_SLICE = 17   # pixel frames per streaming encode slice
+HYBRID_TEMPORAL_DECODE_SLICE = 5    # latent frames per streaming decode slice
 COLOR_CORRECTION = "wavelet"
 USM_WEIGHT = 0.0
 USM_RADIUS = 10
@@ -146,6 +154,12 @@ def _system_ram_gb() -> float:
 
 
 _TOTAL_RAM_GB = _system_ram_gb()
+
+# Hybrid mode uses smaller VAE tiles than the non-streaming path because
+# conv caches from streaming accumulate across all temporal slices and stay
+# alive alongside the current slice's stage-0 activations.
+HYBRID_VAE_TILE_SIZE = (640, 640) if _TOTAL_RAM_GB >= 24 else (480, 320)
+HYBRID_VAE_TILE_OVERLAP = (64, 64) if _TOTAL_RAM_GB >= 24 else (48, 32)
 
 
 # DiT spatial-tile execution mode (only applies when dit_tiles > 1, i.e. >1080p
@@ -1157,6 +1171,12 @@ class VideoUpscaler:
         else:
             load_cap = 0
 
+        # --- Chunking mode ---
+        chunking_mode = str(model_parameters.get('chunking_mode', 'pixel'))
+        if chunking_mode not in ('pixel', 'latent'):
+            logger.warning(f"Unknown chunking_mode={chunking_mode!r}, defaulting to 'pixel'")
+            chunking_mode = 'pixel'
+
         # --- Pipeline parameters ---
         color_correction = str(model_parameters.get('color_correction', COLOR_CORRECTION))
 
@@ -1224,12 +1244,128 @@ class VideoUpscaler:
             logger.info(f"Saved {saved_frames[0]}/{total_frames} frames")
 
         t_start = time.time()
+
+        # --- Hybrid latent-chunk mode setup ---
+        _orig_vae_encode = None
+        _orig_vae_decode = None
+        if chunking_mode == 'latent':
+            logger.info("Hybrid latent-chunk mode: chunk=%d, overlap=%d, fixed_wt=%d",
+                        HYBRID_CHUNK_SIZE, HYBRID_OVERLAP, HYBRID_FIXED_WT)
+            # Set fixed temporal window on DiT
+            dit_model = self.runner.dit.dit_model if hasattr(self.runner.dit, 'dit_model') else self.runner.dit
+            dit_model.fixed_wt = HYBRID_FIXED_WT
+
+            # Re-patch VAE encode to use streaming
+            _orig_vae_encode = self.runner.vae_encode
+            _orig_vae_decode = self.runner.vae_decode
+            mlx_vae = self.mlx_vae
+            scale = self.runner.config.vae.scaling_factor
+            shift = self.runner.config.vae.get("shifting_factor", 0.0)
+
+            @torch.no_grad()
+            def _hybrid_vae_encode(samples):
+                import mlx.core as _mx
+                runner = self.runner
+
+                # Free DiT IO weights during encode (~0.58 GB MLX Metal) —
+                # mirrors the default mlx_vae_encode path.
+                _dit = getattr(runner, 'dit', None)
+                _dit_io_freed = False
+                if _dit is not None and hasattr(_dit, 'io') and _dit.io is not None:
+                    _dit._saved_io = _dit.io
+                    _dit.io = None
+                    gc.collect()
+                    _mx.clear_cache()
+                    _dit_io_freed = True
+
+                torch.mps.empty_cache()
+
+                latents = []
+                for idx in range(len(samples)):
+                    sample = samples[idx]
+                    samples[idx] = None  # release original CTHW tensor early
+                    frames_torch = sample.permute(1, 2, 3, 0).contiguous().cpu()
+                    del sample
+                    if frames_torch.dtype != torch.float16:
+                        frames_torch = frames_torch.to(torch.float16)
+                    latent_np = mlx_vae.tiled_encode_streaming(
+                        frames_torch,
+                        tile_size=HYBRID_VAE_TILE_SIZE,
+                        tile_overlap=HYBRID_VAE_TILE_OVERLAP,
+                        temporal_slice=HYBRID_TEMPORAL_ENCODE_SLICE,
+                    )
+                    del frames_torch
+                    latent_t = torch.from_numpy(latent_np.astype(np.float32)).squeeze(0)
+                    latent_t = (latent_t - shift) * scale
+                    latent_t = latent_t.to(dtype=torch.bfloat16)
+                    latents.append(latent_t)
+                    del latent_np
+
+                mlx_vae.encoder = None
+                gc.collect()
+                _mx.clear_cache()
+                torch.mps.empty_cache()
+
+                # Restore DiT IO weights
+                if _dit_io_freed and _dit is not None:
+                    _dit.io = _dit._saved_io
+                    del _dit._saved_io
+                    _mx.eval(*[v for v in _dit.io.__dict__.values()
+                               if isinstance(v, _mx.array)])
+                return latents
+
+            @torch.no_grad()
+            def _hybrid_vae_decode(latents):
+                import mlx.core as _mx
+                samples = []
+                for latent in latents:
+                    if latent.dim() == 5:
+                        latent = latent.squeeze(0)  # [T, H, W, C]
+                    # latent shape: [T_lat, H_lat, W_lat, C]
+                    T_lat, lat_H, lat_W = latent.shape[0], latent.shape[1], latent.shape[2]
+                    pixel_H, pixel_W = lat_H * 8, lat_W * 8
+
+                    lat_unscaled = latent.float() / scale + shift
+                    lat_np = lat_unscaled.cpu().numpy()[np.newaxis].astype(np.float32)
+                    del lat_unscaled, latent
+
+                    tile_infos = mlx_vae.tiled_decode_streaming(
+                        lat_np,
+                        tile_size=VAE_DECODE_TILE_SIZE,
+                        tile_overlap=VAE_DECODE_TILE_OVERLAP,
+                        temporal_slice=HYBRID_TEMPORAL_DECODE_SLICE,
+                    )
+                    del lat_np
+
+                    frames_np = assemble_tiles_from_disk(tile_infos, pixel_H, pixel_W)
+                    cleanup_tile_files(tile_infos)
+                    sample_t = torch.from_numpy(frames_np).permute(3, 0, 1, 2)  # [C, T, H, W]
+                    samples.append(sample_t)
+                    del frames_np
+                mlx_vae.decoder = None
+                gc.collect()
+                _mx.clear_cache()
+                return samples
+
+            self.runner.vae_encode = _hybrid_vae_encode
+            self.runner.vae_decode = _hybrid_vae_decode
+
+        # --- Select chunk parameters ---
+        if chunking_mode == 'latent':
+            _chunk_size = HYBRID_CHUNK_SIZE
+            _overlap = HYBRID_OVERLAP
+            _shift_back = False
+        else:
+            _chunk_size = PIX_CHUNK_SIZE
+            _overlap = PIX_OVERLAP
+            _shift_back = True
+
         try:
             _, timings = process_video_pix_chunked(
                 runner=self.runner, ctx=self.ctx, frames=reader,
                 debug=self.debug, resolution=resolution,
                 max_resolution=0,
-                chunk_size=PIX_CHUNK_SIZE, overlap=PIX_OVERLAP,
+                chunk_size=_chunk_size, overlap=_overlap,
                 dit_tile_overlap=DIT_TILE_OVERLAP,
                 seed=SEED, latent_noise_scale=LATENT_NOISE_SCALE,
                 shared_noise=SHARED_NOISE,
@@ -1239,11 +1375,18 @@ class VideoUpscaler:
                 usm_weight=USM_WEIGHT, usm_radius=USM_RADIUS,
                 usm_threshold=USM_THRESHOLD,
                 device=self.device, output_callback=_output_callback,
+                shift_back=_shift_back,
             )
         finally:
             reader.close()
             if writer_holder[0] is not None:
                 writer_holder[0].release()
+            # Restore original VAE patches if hybrid mode was used
+            if _orig_vae_encode is not None:
+                self.runner.vae_encode = _orig_vae_encode
+                self.runner.vae_decode = _orig_vae_decode
+                dit_model = self.runner.dit.dit_model if hasattr(self.runner.dit, 'dit_model') else self.runner.dit
+                dit_model.fixed_wt = None
 
         elapsed = time.time() - t_start
 

@@ -126,14 +126,21 @@ def _apply_rotary_emb(freqs: mx.array, t: mx.array) -> mx.array:
 # ============================================================================
 
 def make_720p_windows(t: int, h: int, w: int, num_windows: Tuple[int, int, int],
-                      shifted: bool = False) -> List[Tuple[slice, slice, slice]]:
-    """Returns the window slices for 720pwin / 720pswin (matches window.py)."""
+                      shifted: bool = False,
+                      fixed_wt: Optional[int] = None) -> List[Tuple[slice, slice, slice]]:
+    """Returns the window slices for 720pwin / 720pswin (matches window.py).
+
+    Args:
+        fixed_wt: if set, overrides the computed temporal window size ``wt``
+            so that longer latent sequences still use small attention windows
+            (e.g. ``fixed_wt=3`` keeps the same window as a 9-latent-frame input).
+    """
     nt_w, nh_w, nw_w = num_windows
     scale = math.sqrt((45 * 80) / (h * w))
     resized_h, resized_w = round(h * scale), round(w * scale)
     wh = math.ceil(resized_h / nh_w)
     ww = math.ceil(resized_w / nw_w)
-    wt = math.ceil(min(t, 30) / nt_w)
+    wt = fixed_wt if fixed_wt is not None else math.ceil(min(t, 30) / nt_w)
 
     if not shifted:
         nt = math.ceil(t / wt)
@@ -595,13 +602,13 @@ class WindowInfo:
 
 
 def make_window_info(vid_shape: Tuple[int, int, int], window: Tuple[int, int, int],
-                     shifted: bool) -> WindowInfo:
+                     shifted: bool, fixed_wt: Optional[int] = None) -> WindowInfo:
     """Build per-window slicing for batch=1.
 
     Mirrors na.window_idx but specialized for B=1, returning MLX index arrays.
     """
     T, H, W = vid_shape
-    slices = make_720p_windows(T, H, W, window, shifted=shifted)
+    slices = make_720p_windows(T, H, W, window, shifted=shifted, fixed_wt=fixed_wt)
 
     # Build idx flat = arange(T*H*W) reshaped to (T,H,W); slice per window, flatten
     flat = np.arange(T * H * W, dtype=np.int32).reshape(T, H, W)
@@ -875,6 +882,7 @@ def run_full_dit(
     io: IOWeights,
     blocks: List[BlockWeights],
     cfg: NaDiTConfig,
+    fixed_wt: Optional[int] = None,
 ) -> mx.array:
     """Forward through the full NaDiT.  Returns vid output with shape (L_orig, out_channels).
 
@@ -895,8 +903,8 @@ def run_full_dit(
     vid_freqs, txt_freqs_full = build_rope_freqs(vid_shape_pat, txt_len, cfg.head_dim)
 
     # Pre-compute window info for both shifted/non-shifted
-    win_even = make_window_info(vid_shape_pat, cfg.window, shifted=False)
-    win_odd = make_window_info(vid_shape_pat, cfg.window, shifted=True)
+    win_even = make_window_info(vid_shape_pat, cfg.window, shifted=False, fixed_wt=fixed_wt)
+    win_odd = make_window_info(vid_shape_pat, cfg.window, shifted=True, fixed_wt=fixed_wt)
 
     vid_h = vid_proj
     txt_h = txt_proj
@@ -1175,6 +1183,7 @@ class MLXNaDiT(torch_nn.Module):
         self.cfg = NaDiTConfig(mm_layers=mm_layers)
         self.dtype = _resolve_dtype(dtype)
         self.full_pool = full_pool
+        self.fixed_wt: Optional[int] = None  # set externally to override temporal window size
 
         with open(os.path.join(split_dir, "block_manifest.json")) as f:
             self.manifest = json.load(f)
@@ -1256,6 +1265,7 @@ class MLXNaDiT(torch_nn.Module):
         out_mx = run_full_dit_streaming(
             vid_mx, txt_mx, ts, (T, H, W), txt_len,
             self.io, self.block_pool, self.cfg, self.num_blocks,
+            fixed_wt=self.fixed_wt,
         )
         mx.eval(out_mx)
 
@@ -1313,6 +1323,7 @@ class MLXNaDiT(torch_nn.Module):
         out_list_mx = run_full_dit_streaming_tiled(
             tile_vids_mx, tile_shapes, txt_mx, ts, txt_len,
             self.io, self.block_pool, self.cfg, self.num_blocks,
+            fixed_wt=self.fixed_wt,
         )
 
         # Convert outputs back to PyTorch
@@ -1363,6 +1374,7 @@ def run_full_dit_streaming(
     vid: mx.array, txt: mx.array, timestep: float,
     vid_shape: Tuple[int, int, int], txt_len: int,
     io: IOWeights, block_pool: MLXBlockPool, cfg: NaDiTConfig, num_blocks: int,
+    fixed_wt: Optional[int] = None,
 ) -> mx.array:
     """Same as ``run_full_dit`` but pulls each block from ``block_pool`` and
     overlaps the next-block prefetch with current-block compute.  Works in
@@ -1373,8 +1385,8 @@ def run_full_dit_streaming(
     t_arr = mx.array([timestep], dtype=mx.float32)
     emb = emb_in_forward(t_arr, io)
     vid_freqs, txt_freqs_full = build_rope_freqs(vid_shape_pat, txt_len, cfg.head_dim)
-    win_even = make_window_info(vid_shape_pat, cfg.window, shifted=False)
-    win_odd = make_window_info(vid_shape_pat, cfg.window, shifted=True)
+    win_even = make_window_info(vid_shape_pat, cfg.window, shifted=False, fixed_wt=fixed_wt)
+    win_odd = make_window_info(vid_shape_pat, cfg.window, shifted=True, fixed_wt=fixed_wt)
 
     vid_h = vid_proj
     txt_h = txt_proj
@@ -1458,6 +1470,7 @@ def run_full_dit_streaming_tiled(
     block_pool: MLXBlockPool,
     cfg: NaDiTConfig,
     num_blocks: int,
+    fixed_wt: Optional[int] = None,
 ) -> List[mx.array]:
     """Block-first multi-tile streaming: load each block once, process all tiles.
 
@@ -1474,6 +1487,7 @@ def run_full_dit_streaming_tiled(
         block_pool: streaming block pool
         cfg: model config
         num_blocks: number of transformer blocks
+        fixed_wt: if set, overrides the temporal window size for attention
 
     Returns:
         list of (L_vid_i, out_channels) per tile
@@ -1491,8 +1505,8 @@ def run_full_dit_streaming_tiled(
     for i in range(num_tiles):
         vid_proj, vid_shape_pat = vid_in_forward(tile_vids[i], tile_vid_shapes[i], io, cfg.patch)
         vid_freqs, txt_freqs = build_rope_freqs(vid_shape_pat, txt_len, cfg.head_dim)
-        win_even = make_window_info(vid_shape_pat, cfg.window, shifted=False)
-        win_odd = make_window_info(vid_shape_pat, cfg.window, shifted=True)
+        win_even = make_window_info(vid_shape_pat, cfg.window, shifted=False, fixed_wt=fixed_wt)
+        win_odd = make_window_info(vid_shape_pat, cfg.window, shifted=True, fixed_wt=fixed_wt)
         mx.eval(vid_proj)
         tile_states.append({
             "vid_h": vid_proj,
