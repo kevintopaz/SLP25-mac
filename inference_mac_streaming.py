@@ -27,6 +27,7 @@ import gc
 import math
 import logging
 import subprocess
+import shlex
 import shutil
 import tempfile
 from typing import Tuple, Dict, Any, Optional, List
@@ -34,16 +35,23 @@ from pathlib import Path
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 workspace_root = os.path.abspath(os.path.join(script_dir, '..'))
+_package_name = os.path.basename(script_dir)
 
-# workspace_root on sys.path so `astra_precision_3_kevin.src...` imports work,
-# and internal relative imports (e.g. `from ...configs_3b.main`) resolve correctly.
+# workspace_root on sys.path so relative imports resolve correctly
+# when running as a script or when imported as a package.
 if workspace_root not in sys.path:
     sys.path.insert(0, workspace_root)
 
-# Add NeuroStream to path
+if __name__ == '__main__' and __package__ is None:
+    __package__ = _package_name
+
+# Add NeuroStream to path (and PYTHONPATH so subprocess workers can
+# find `streampool` for the DiT block loader).
 neurostream_path = os.path.join(workspace_root, 'NeuroStream')
 if neurostream_path not in sys.path:
     sys.path.insert(0, neurostream_path)
+if neurostream_path not in os.environ.get('PYTHONPATH', ''):
+    os.environ['PYTHONPATH'] = neurostream_path + os.pathsep + os.environ.get('PYTHONPATH', '')
 
 # Also ensure this script's directory is on sys.path for direct `src` imports
 if script_dir not in sys.path:
@@ -55,19 +63,19 @@ import av
 import cv2
 import json
 
-from astra_precision_3_kevin.src.core.generation_utils import (
+from .src.core.generation_utils import (
     setup_generation_context,
     prepare_runner,
 )
-from astra_precision_3_kevin.src.core.generation_phases_latent import (
+from .src.core.generation_phases_latent import (
     encode_whole_video,
     upscale_latent_chunked,
     decode_whole_latent,
     postprocess_latent_output,
 )
-from astra_precision_3_kevin.src.core.generation_phases_pix import process_video_pix_chunked
-from astra_precision_3_kevin.src.core.model_loader import materialize_model
-from astra_precision_3_kevin.src.utils.debug import Debug
+from .src.core.generation_phases_pix import process_video_pix_chunked
+from .src.core.model_loader import materialize_model
+from .src.utils.debug import Debug
 
 logging.basicConfig(
     format='%(asctime)s %(levelname)-8s %(message)s',
@@ -85,8 +93,8 @@ logger = logging.getLogger(__name__)
 # MLX_WAVELET=0 to fall back to the torch implementation.
 if os.environ.get("MLX_WAVELET", "1") == "1":
     try:
-        from astra_precision_3_kevin.src.utils import color_fix as _color_fix_mod
-        from astra_precision_3_kevin.src.utils.color_fix_mlx import wavelet_reconstruction_mlx
+        from .src.utils import color_fix as _color_fix_mod
+        from .src.utils.color_fix_mlx import wavelet_reconstruction_mlx
         _color_fix_mod.wavelet_reconstruction = wavelet_reconstruction_mlx
         logger.info("Patched wavelet_reconstruction with MLX implementation")
     except ImportError:
@@ -168,7 +176,7 @@ if "MLX_DIT_TILE_FIRST" not in os.environ:
 #   >= 24 GB RAM -> encoder (640, 640), decoder (480, 480)
 def _auto_tile_sizes():
     if _TOTAL_RAM_GB >= 24:
-        return (480, 720), (48, 72), (480, 480), (48, 48)
+        return (640, 640), (64, 64), (480, 480), (48, 48)
     return (480, 320), (48, 32), (480, 320), (48, 32)
 
 
@@ -201,15 +209,80 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 # Video I/O (adapted from inference_cli_pix_chunked_for_serving.py)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _find_ffmpeg():
+    found = shutil.which('ffmpeg')
+    return found or 'ffmpeg'
+
+
+def _find_ffprobe():
+    ffmpeg_bin = _find_ffmpeg()
+    probe = os.path.join(os.path.dirname(ffmpeg_bin), 'ffprobe')
+    if os.path.exists(probe):
+        return probe
+    found = shutil.which('ffprobe')
+    return found or 'ffprobe'
+
+
+_FFMPEG_ENCODERS_CACHE = None
+
+
+def _list_ffmpeg_encoders():
+    global _FFMPEG_ENCODERS_CACHE
+    if _FFMPEG_ENCODERS_CACHE is not None:
+        return _FFMPEG_ENCODERS_CACHE
+    encoders = set()
+    try:
+        result = subprocess.run(
+            [_find_ffmpeg(), '-hide_banner', '-encoders'],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in result.stdout.splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[0].startswith('V'):
+                encoders.add(parts[1])
+    except Exception:
+        pass
+    _FFMPEG_ENCODERS_CACHE = encoders
+    return encoders
+
+
+def _select_h264_codec_args():
+    """Pick an H.264 encoder supported by the active ffmpeg build.
+
+    h264_videotoolbox is deliberately excluded: it's reported as available
+    by ffmpeg but frequently fails with "cannot create compression session"
+    on many macOS configurations.
+    """
+    encoders = _list_ffmpeg_encoders()
+    candidates = [
+        ('libx264', ['-c:v', 'libx264', '-preset', 'medium', '-crf', '15', '-pix_fmt', 'yuv420p']),
+        ('h264_nvenc', ['-c:v', 'h264_nvenc', '-preset', 'p5', '-cq', '19', '-pix_fmt', 'yuv420p']),
+        ('h264_amf', ['-c:v', 'h264_amf', '-quality', 'quality', '-rc', 'cqp', '-qp_i', '19', '-qp_p', '19', '-pix_fmt', 'yuv420p']),
+        ('mpeg4', ['-c:v', 'mpeg4', '-qscale:v', '3', '-pix_fmt', 'yuv420p']),
+    ]
+    for name, args in candidates:
+        if name in encoders:
+            logger.info(f"FFMPEGVideoWriter: selected encoder '{name}'")
+            return args
+    logger.warning("FFMPEGVideoWriter: no preferred encoder found, letting ffmpeg choose")
+    return ['-pix_fmt', 'yuv420p']
+
+
 class FFMPEGVideoWriter:
-    def __init__(self, path, width, height, fps, use_10bit=False):
-        pix_fmt = 'yuv420p10le' if use_10bit else 'yuv420p'
-        codec = 'libx265' if use_10bit else 'libx264'
+    def __init__(self, path, width, height, fps, use_10bit=False, encoding_options=""):
+        ffmpeg_bin = _find_ffmpeg()
+        if encoding_options:
+            codec_args = shlex.split(encoding_options)
+        else:
+            pix_fmt = 'yuv420p10le' if use_10bit else 'yuv420p'
+            codec = 'libx265' if use_10bit else 'libx264'
+            codec_args = ['-c:v', codec, '-pix_fmt', pix_fmt,
+                          '-preset', 'medium', '-crf', '15']
         self.proc = subprocess.Popen(
-            ['ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
+            [ffmpeg_bin, '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
              '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
-             '-c:v', codec, '-pix_fmt', pix_fmt, '-preset', 'medium', '-crf', '15', path],
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+             *codec_args, '-movflags', '+faststart', path],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
     def write(self, frame_bgr):
@@ -233,7 +306,7 @@ class FFMPEGVideoWriter:
 def get_video_sar(video_path):
     try:
         result = subprocess.run(
-            ['ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
+            [_find_ffprobe(), '-v', 'quiet', '-select_streams', 'v:0',
              '-show_entries', 'stream=sample_aspect_ratio',
              '-of', 'csv=p=0', video_path],
             capture_output=True, text=True, timeout=10)
@@ -256,29 +329,112 @@ def compute_resolution(input_w, input_h, target_w, target_h):
     return target_w, round(input_h * scale_w)
 
 
-def copy_audio_to_video(audio_source, video_target):
+def _has_audio_stream(media_path):
+    """Return True if *media_path* contains at least one audio stream."""
+    try:
+        result = subprocess.run(
+            [_find_ffprobe(), '-v', 'error', '-select_streams', 'a',
+             '-show_entries', 'stream=index', '-of', 'csv=p=0', media_path],
+            capture_output=True, text=True, timeout=10,
+        )
+        return bool(result.stdout.strip())
+    except Exception:
+        return False
+
+
+def copy_audio_to_video(audio_source, video_target,
+                        audio_start=0.0, audio_duration=None):
+    """Mux the audio track from *audio_source* into *video_target* (in-place).
+
+    When ``audio_start`` / ``audio_duration`` are provided the audio input is
+    trimmed to that range before muxing — required when the video was rendered
+    from a restricted frame range so the container duration matches the video.
+    """
+    if not _has_audio_stream(audio_source):
+        logger.info("No audio stream in %s; skipping audio mux", audio_source)
+        return
+
     video_dir = os.path.dirname(video_target) or "."
     file_ext = os.path.splitext(video_target)[1]
-    with tempfile.NamedTemporaryFile(dir=video_dir, suffix=file_ext, delete=True) as tmp:
-        temp_output = tmp.name
+    trimming = audio_start > 0.0 or (audio_duration is not None and audio_duration > 0.0)
+
+    fd, temp_output = tempfile.mkstemp(dir=video_dir, suffix=file_ext)
+    os.close(fd)
+    try:
+        command = [_find_ffmpeg(), "-hide_banner", "-loglevel", "warning",
+                   "-i", video_target]
+        if audio_start > 0.0:
+            command += ["-ss", f"{audio_start:.6f}"]
+        if audio_duration is not None and audio_duration > 0.0:
+            command += ["-t", f"{audio_duration:.6f}"]
+        command += ["-i", audio_source, "-c:v", "copy"]
+        if trimming:
+            command += ["-c:a", "aac", "-b:a", "192k"]
+        else:
+            command += ["-c:a", "copy"]
+        command += ["-map", "0:v:0", "-map", "1:a:0",
+                    "-shortest", "-movflags", "+faststart",
+                    temp_output, "-y"]
         try:
-            subprocess.run([
-                "ffmpeg", "-hide_banner", "-loglevel", "warning",
-                "-i", video_target, "-i", audio_source,
-                "-c:v", "copy", "-c:a", "copy",
-                "-map", "0:v:0", "-map", "1:a:0",
-                "-movflags", "+faststart", temp_output, "-y",
-            ], check=True, timeout=300)
+            subprocess.run(command, check=True, timeout=300)
             shutil.copy(src=temp_output, dst=video_target)
-            logger.info("Audio copied from source into %s", video_target)
+            if trimming:
+                logger.info(
+                    "Audio copied into %s (start=%.3fs, dur=%s)",
+                    video_target, audio_start,
+                    f"{audio_duration:.3f}s" if audio_duration else "n/a",
+                )
+            else:
+                logger.info("Audio copied from source into %s", video_target)
         except Exception as e:
             logger.warning("Could not copy audio: %s", e)
+    finally:
+        try:
+            os.unlink(temp_output)
+        except OSError:
+            pass
+
+
+def _parse_ffmpeg_filters(filter_string):
+    """Parse a comma-separated FFmpeg filter string into ``[(name, args_or_None), ...]``."""
+    chain = []
+    for f in filter_string.split(','):
+        f = f.strip()
+        if not f:
+            continue
+        if '=' in f:
+            name, args = f.split('=', 1)
+            chain.append((name, args))
+        else:
+            chain.append((f, None))
+    return chain
+
+
+def _build_filter_graph(video_stream, filter_chain):
+    """Build a PyAV filter graph from a parsed filter chain."""
+    graph = av.filter.Graph()
+    src = graph.add_buffer(template=video_stream)
+    sink = graph.add("buffersink")
+    prev = src
+    for name, option in filter_chain:
+        node = graph.add(name, option) if option else graph.add(name)
+        prev.link_to(node)
+        prev = node
+    prev.link_to(sink)
+    graph.configure()
+    return graph
 
 
 class LazyVideoReader:
-    """Lazy per-chunk video decoder using PyAV with background thread."""
+    """Lazy per-chunk video decoder using PyAV with background thread.
 
-    def __init__(self, video_path, skip_frames=0, load_cap=0):
+    Supports optional ``ffmpeg_preproc_filters`` — a comma-separated PyAV
+    filter chain (e.g. ``"scale=1920:1080,hflip"``) applied to every decoded
+    frame before it enters the pipeline.
+    """
+
+    def __init__(self, video_path, skip_frames=0, load_cap=0,
+                 ffmpeg_preproc_filters=""):
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video not found: {video_path}")
         self.video_path = video_path
@@ -295,9 +451,24 @@ class LazyVideoReader:
         if load_cap > 0:
             available = min(available, load_cap)
         self._total_frames = available
-        self._sar = get_video_sar(video_path)
-        self._display_w = round(raw_w * self._sar) if self._sar != 1.0 and self._sar > 0 else raw_w
-        self._display_h = raw_h
+
+        self._filter_chain = _parse_ffmpeg_filters(ffmpeg_preproc_filters) if ffmpeg_preproc_filters else []
+        self._filter_graph = None
+
+        if self._filter_chain:
+            self._sar = 1.0
+            probe_w, probe_h = self._probe_filtered_dimensions(video_path, stream, self._filter_chain)
+            self._display_w = probe_w
+            self._display_h = probe_h
+            logger.info(
+                f"LazyVideoReader: preproc filters active, "
+                f"output dims {probe_w}x{probe_h} (raw {raw_w}x{raw_h})"
+            )
+            self._filter_graph = _build_filter_graph(stream, self._filter_chain)
+        else:
+            self._sar = get_video_sar(video_path)
+            self._display_w = round(raw_w * self._sar) if self._sar != 1.0 and self._sar > 0 else raw_w
+            self._display_h = raw_h
 
         import queue as _q, threading as _t
         self._queue = _q.Queue(maxsize=16)
@@ -310,13 +481,43 @@ class LazyVideoReader:
             if not self._advance_one():
                 break
 
+    @staticmethod
+    def _probe_filtered_dimensions(video_path, video_stream, filter_chain):
+        """Decode the first frame through a throwaway filter graph to learn output dims."""
+        probe_container = av.open(video_path, 'r')
+        try:
+            probe_stream = probe_container.streams.video[0]
+            graph = _build_filter_graph(probe_stream, filter_chain)
+            for packet in probe_container.demux(probe_stream):
+                for frame in packet.decode():
+                    graph.push(frame)
+                    while True:
+                        try:
+                            out = graph.pull()
+                            return out.width, out.height
+                        except av.error.BlockingIOError:
+                            break
+        finally:
+            probe_container.close()
+        return video_stream.width, video_stream.height
+
     def _worker(self):
         stream = self._container.streams.video[0]
         stream.thread_type = "AUTO"
         try:
-            for packet in self._container.demux(stream):
-                for frame in packet.decode():
-                    self._queue.put(frame)
+            if self._filter_graph is not None:
+                for packet in self._container.demux(stream):
+                    for frame in packet.decode():
+                        self._filter_graph.push(frame)
+                        while True:
+                            try:
+                                self._queue.put(self._filter_graph.pull())
+                            except av.error.BlockingIOError:
+                                break
+            else:
+                for packet in self._container.demux(stream):
+                    for frame in packet.decode():
+                        self._queue.put(frame)
         except Exception:
             pass
         self._queue.put(None)
@@ -687,17 +888,10 @@ class VideoUpscaler:
         )
         self.ctx['compute_dtype'] = torch.bfloat16
 
-        # Prepare runner — this sets up the full config including diffusion schedule
-        _md = model_dir or os.path.join(script_dir, "models")
-        for _dit_cand in (
-            "seedvr2_ema_3b_fp16.safetensors",
-            "checkpoint-15400_merged.safetensors",
-        ):
-            if os.path.isfile(os.path.join(_md, _dit_cand)):
-                dit_name = _dit_cand
-                break
-        else:
-            dit_name = "checkpoint-15400_merged.safetensors"
+        # Prepare runner — sets up diffusion config + schedule.
+        # dit_name is only used to select the config YAML (3B vs 7B) and as a
+        # label; the actual DiT weights come from the split blocks via MLXNaDiT.
+        dit_name = "nadit_3b"
         vae_name = os.path.basename(vae_path)
         logger.info("Preparing runner...")
         self.runner, cache_ctx = prepare_runner(
@@ -731,7 +925,7 @@ class VideoUpscaler:
 
         # Initialize MLX VAE (replaces PyTorch VAE for much faster encode/decode)
         logger.info("Initializing MLX Video VAE...")
-        from astra_precision_3_kevin.src.optimization.mlx_video_vae import MLXVideoVAE
+        from .src.optimization.mlx_video_vae import MLXVideoVAE
         logger.info(
             "  MLX VAE cache_limit_gb=%s (Metal buffer pool cap)",
             f"{self.vae_cache_limit_gb:.2f}" if self.vae_cache_limit_gb is not None else "None",
@@ -760,7 +954,7 @@ class VideoUpscaler:
         # ─── Create DiT ────────────────────────────────────────────────
         self.use_mlx_dit = use_mlx_dit
         if use_mlx_dit:
-            from astra_precision_3_kevin.src.optimization.mlx_nadit import MLXNaDiT
+            from .src.optimization.mlx_nadit import MLXNaDiT
             mlx_dtype = getattr(self, "mlx_dtype", "bf16")
             mlx_stream = bool(getattr(self, "mlx_stream", False))
             logger.info(f"Creating MLX DiT (dtype={mlx_dtype}, "
@@ -942,18 +1136,54 @@ class VideoUpscaler:
         runner.vae_decode = mlx_vae_decode
         logger.info("Patched runner with MLX VAE encode/decode")
 
-    def __call__(self, input_path, output_path, model_parameters=None):
+    def __call__(self, input_path, output_path, model_parameters=None,
+                 progress_func=None):
         if model_parameters is None:
             model_parameters = {}
 
+        # --- Resolution / frame range ---
         output_width = int(model_parameters.get('output_width', 1920))
         output_height = int(model_parameters.get('output_height', 1080))
+        start_frame_idx = int(model_parameters.get('start_idx',
+                              model_parameters.get('start_frame_idx', 0)))
+        end_frame_idx = model_parameters.get('end_idx',
+                        model_parameters.get('end_frame_idx', None))
+        if end_frame_idx is not None:
+            end_frame_idx = int(end_frame_idx)
 
-        logger.info(f"Input: {input_path}")
-        logger.info(f"Output: {output_path}")
-        logger.info(f"Target: {output_width}x{output_height}")
+        skip_frames = max(0, start_frame_idx)
+        if end_frame_idx is not None and end_frame_idx > skip_frames:
+            load_cap = end_frame_idx - skip_frames + 1  # inclusive
+        else:
+            load_cap = 0
 
-        reader = LazyVideoReader(input_path)
+        # --- Pipeline parameters ---
+        color_correction = str(model_parameters.get('color_correction', COLOR_CORRECTION))
+
+        # --- Output encoding ---
+        ffmpeg_encoding = model_parameters.get('ffmpeg_encoding', "") or ""
+        ffmpeg_preproc_filters = model_parameters.get('ffmpeg_preproc_filters', "") or ""
+        use_10bit = model_parameters.get('output_bit_depth') is not None and \
+                    int(model_parameters['output_bit_depth']) >= 10
+
+        logger.info(f"Input video: {input_path}")
+        logger.info(f"Output path: {output_path}")
+        logger.info(f"Resolution: {output_width}x{output_height}")
+        logger.info(f"color_correction={color_correction}")
+        if skip_frames or load_cap:
+            logger.info(f"Frame range: start={skip_frames}, load_cap={load_cap}")
+        if ffmpeg_encoding:
+            logger.info(f"ffmpeg_encoding: {ffmpeg_encoding}")
+        if ffmpeg_preproc_filters:
+            logger.info(f"ffmpeg_preproc_filters: {ffmpeg_preproc_filters}")
+
+        if progress_func:
+            progress_func(0.0, message="Processing started...")
+
+        reader = LazyVideoReader(
+            input_path, skip_frames=skip_frames, load_cap=load_cap,
+            ffmpeg_preproc_filters=ffmpeg_preproc_filters,
+        )
         fps = reader.fps
 
         if reader.shape[0] < 5:
@@ -963,14 +1193,13 @@ class VideoUpscaler:
         input_h, input_w = reader.shape[1], reader.shape[2]
         resolution_w, resolution_h = compute_resolution(input_w, input_h, output_width, output_height)
         resolution = min(resolution_w, resolution_h)
-        logger.info(f"Input: {input_w}x{input_h} -> Target: {resolution_w}x{resolution_h}")
+        logger.info(f"Input: {input_w}x{input_h}, target: {output_width}x{output_height} -> {resolution_w}x{resolution_h}")
 
-        # Prefetch first DiT blocks during VAE encode.  For MLX-streaming this
-        # warms the disk loader; for full_pool it's a no-op because all blocks
-        # are already resident.
+        if progress_func:
+            progress_func(0.05, message="Processing video...")
+
         self.streaming_dit.stream_manager.prefetch_start(num_blocks=2)
 
-        # Streaming output writer
         writer_holder = [None]
         saved_frames = [0]
         total_frames = reader.shape[0]
@@ -978,36 +1207,58 @@ class VideoUpscaler:
         def _output_callback(frames_tensor):
             if writer_holder[0] is None:
                 _, H, W, _ = frames_tensor.shape
-                writer_holder[0] = FFMPEGVideoWriter(output_path, W, H, fps)
+                writer_holder[0] = FFMPEGVideoWriter(
+                    output_path, W, H, fps,
+                    use_10bit=use_10bit,
+                    encoding_options=ffmpeg_encoding,
+                )
             for i in range(frames_tensor.shape[0]):
-                frame_np = (frames_tensor[i].float().numpy() * 255.0).astype(np.uint8)
+                frame_np = (frames_tensor[i].cpu().float().numpy() * 255.0).astype(np.uint8)
                 writer_holder[0].write(cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR))
             saved_frames[0] += frames_tensor.shape[0]
+
+            frac = saved_frames[0] / total_frames
+            progress = 0.05 + frac * 0.85
+            if progress_func:
+                progress_func(progress, message=f"Processed {saved_frames[0]}/{total_frames} frames...")
             logger.info(f"Saved {saved_frames[0]}/{total_frames} frames")
 
         t_start = time.time()
-        _, timings = process_video_pix_chunked(
-            runner=self.runner, ctx=self.ctx, frames=reader,
-            debug=self.debug, resolution=resolution,
-            max_resolution=0,
-            chunk_size=PIX_CHUNK_SIZE, overlap=PIX_OVERLAP,
-            dit_tile_overlap=DIT_TILE_OVERLAP,
-            seed=SEED, latent_noise_scale=LATENT_NOISE_SCALE,
-            shared_noise=SHARED_NOISE,
-            prompt=None, negative_prompt=None,
-            cfg_scale=CFG_SCALE,
-            color_correction=COLOR_CORRECTION,
-            usm_weight=USM_WEIGHT, usm_radius=USM_RADIUS,
-            usm_threshold=USM_THRESHOLD,
-            device=self.device, output_callback=_output_callback,
-        )
+        try:
+            _, timings = process_video_pix_chunked(
+                runner=self.runner, ctx=self.ctx, frames=reader,
+                debug=self.debug, resolution=resolution,
+                max_resolution=0,
+                chunk_size=PIX_CHUNK_SIZE, overlap=PIX_OVERLAP,
+                dit_tile_overlap=DIT_TILE_OVERLAP,
+                seed=SEED, latent_noise_scale=LATENT_NOISE_SCALE,
+                shared_noise=SHARED_NOISE,
+                prompt=None, negative_prompt=None,
+                cfg_scale=CFG_SCALE,
+                color_correction=color_correction,
+                usm_weight=USM_WEIGHT, usm_radius=USM_RADIUS,
+                usm_threshold=USM_THRESHOLD,
+                device=self.device, output_callback=_output_callback,
+            )
+        finally:
+            reader.close()
+            if writer_holder[0] is not None:
+                writer_holder[0].release()
+
         elapsed = time.time() - t_start
 
-        reader.close()
-        if writer_holder[0] is not None:
-            writer_holder[0].release()
+        if progress_func:
+            progress_func(0.92, message="Copying audio track...")
 
-        copy_audio_to_video(input_path, output_path)
+        # Align the muxed audio with the rendered frame range
+        audio_start = (skip_frames / fps) if fps and skip_frames > 0 else 0.0
+        frames_written = saved_frames[0] if saved_frames[0] > 0 else (load_cap if load_cap > 0 else 0)
+        audio_duration = (frames_written / fps) if (fps and frames_written > 0) else None
+        copy_audio_to_video(
+            input_path, output_path,
+            audio_start=audio_start,
+            audio_duration=audio_duration,
+        )
 
         logger.info(f"Saved {saved_frames[0]} frames to {output_path}")
         logger.info(f"Total time: {elapsed:.1f}s")
@@ -1015,6 +1266,9 @@ class VideoUpscaler:
                     f"DiT: {timings.get('dit', 0):.1f}s, "
                     f"Decode: {timings.get('decode', 0):.1f}s, "
                     f"Post: {timings.get('post', 0):.1f}s")
+
+        if progress_func:
+            progress_func(0.95, message="Done")
         return output_path
 
     def cleanup(self):

@@ -548,7 +548,32 @@ def process_video_pix_chunked(
                 break
             read_windows.append((start, end))
 
+        # Shift-back: if the last chunk is shorter than chunk_size, move its
+        # start backwards so it always processes exactly chunk_size frames.
+        # The extra overlap with the previous chunk is handled by discarding
+        # redundant leading output frames, then blending the standard overlap.
+        if len(read_windows) > 1:
+            last_start, last_end = read_windows[-1]
+            if (last_end - last_start) < chunk_size:
+                new_start = max(0, last_end - chunk_size)
+                logger.info(
+                    "Shift-back: last chunk [%d, %d) (%d frames) -> [%d, %d) (%d frames)",
+                    last_start, last_end, last_end - last_start,
+                    new_start, last_end, last_end - new_start,
+                )
+                read_windows[-1] = (new_start, last_end)
+
     num_chunks = len(read_windows)
+
+    # For each consecutive chunk pair, compute how many decoded output frames
+    # from the shifted-back chunk to skip (they were already streamed).
+    # extra_skip[i] applies to chunk i and equals the overlap with the
+    # previous chunk MINUS the standard blend overlap.
+    extra_skip = [0] * num_chunks
+    if num_chunks > 1:
+        for i in range(1, num_chunks):
+            actual_pair_overlap = read_windows[i - 1][1] - read_windows[i][0]
+            extra_skip[i] = max(0, actual_pair_overlap - overlap)
 
     # Auto-determine spatial DiT tiling from target output resolution
     if dit_tiles is None:
@@ -559,6 +584,8 @@ def process_video_pix_chunked(
         "Pixel-space chunking: %d chunk(s), batch_size=%d, temporal_overlap=%d, step=%d, dit_tiles=%s, streaming=%s",
         num_chunks, chunk_size, overlap, step, dit_tiles, streaming,
     )
+    if any(s > 0 for s in extra_skip):
+        logger.info("Shift-back extra_skip per chunk: %s", extra_skip)
 
     # --- Process each chunk through encode -> DiT -> decode ---
     t_pipeline_start = time.time()
@@ -666,12 +693,23 @@ def process_video_pix_chunked(
                         _pp(decoded, transformed)
             else:
                 # ── Subsequent chunks ──
+                # For shift-back chunks, discard leading decoded frames that
+                # overlap with already-streamed content from the previous chunk.
+                skip = extra_skip[ci]
+                if skip > 0:
+                    logger.info(
+                        "Shift-back: discarding %d leading decoded frames from chunk %d",
+                        skip, ci + 1,
+                    )
+                    decoded = decoded[skip:]
+                    if transformed is not None:
+                        transformed = transformed[:, skip:]
+
                 actual_overlap = min(overlap, decoded.shape[0])
                 if overlap_dec is not None:
                     actual_overlap = min(actual_overlap, overlap_dec.shape[0])
 
                 if actual_overlap > 0 and overlap_dec is not None:
-                    # Blend the overlap region
                     blended_dec = _blend_overlapping_frames(
                         overlap_dec, decoded[:actual_overlap], actual_overlap,
                     )
@@ -687,7 +725,6 @@ def process_video_pix_chunked(
                         category="video", indent_level=1,
                     )
 
-                    # Blended overlap is now final — post-process & stream
                     _pp(blended_dec, blended_trans)
                     del blended_dec
                     if blended_trans is not None:
@@ -808,6 +845,18 @@ def process_video_pix_chunked(
                 chunk_timings["encode"], chunk_timings["dit"], chunk_timings["decode"],
                 chunk_timings["vram_encode"], chunk_timings["vram_dit"], chunk_timings["vram_decode"],
             )
+
+            # For shift-back chunks, discard leading decoded frames that
+            # overlap with already-written content from the previous chunk.
+            skip = extra_skip[ci]
+            if skip > 0:
+                logger.info(
+                    "Shift-back: discarding %d leading decoded frames from chunk %d",
+                    skip, ci + 1,
+                )
+                decoded = decoded[skip:]
+                if transformed is not None:
+                    transformed = transformed[:, skip:]
 
             decoded_frames = decoded.shape[0]
 
