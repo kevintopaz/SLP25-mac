@@ -158,7 +158,7 @@ _TOTAL_RAM_GB = _system_ram_gb()
 # Hybrid mode uses smaller VAE tiles than the non-streaming path because
 # conv caches from streaming accumulate across all temporal slices and stay
 # alive alongside the current slice's stage-0 activations.
-HYBRID_VAE_TILE_SIZE = (640, 640) if _TOTAL_RAM_GB >= 24 else (480, 320)
+HYBRID_VAE_TILE_SIZE = (720, 720) if _TOTAL_RAM_GB >= 24 else (480, 320)
 HYBRID_VAE_TILE_OVERLAP = (64, 64) if _TOTAL_RAM_GB >= 24 else (48, 32)
 
 
@@ -212,7 +212,7 @@ def _auto_mlx_cache_gb() -> float:
         return 2.0
     if _TOTAL_RAM_GB <= 24:
         return 4.0
-    return 6.0
+    return 1.0
 
 
 MLX_VAE_CACHE_LIMIT_GB = _auto_mlx_cache_gb()
@@ -1486,6 +1486,8 @@ def parse_arguments():
                              "Drops weight residency from ~6 GB to ~0.4 GB at <1%% time cost. "
                              "(Only with --mlx_dit)")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--chunking_mode", default="pixel", choices=["pixel", "latent"],
+                        help="Chunking strategy: 'pixel' (default) or 'latent' (hybrid streaming)")
     return parser.parse_args()
 
 
@@ -1526,6 +1528,7 @@ def main():
             model_parameters={
                 'output_width': args.output_width,
                 'output_height': args.output_height,
+                'chunking_mode': args.chunking_mode,
             },
         )
         logger.info("Processing complete!")
