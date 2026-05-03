@@ -209,8 +209,9 @@ def wavelet_reconstruction(content_feat: Tensor, style_feat: Tensor, debug: Opti
     """
     # Handle dimension mismatch if needed
     if content_feat.shape != style_feat.shape:
-        debug.log(f"Dimension mismatch: content {content_feat.shape} vs style {style_feat.shape}", 
-                  level="WARNING", category="precision", force=True)
+        if debug is not None:
+            debug.log(f"Dimension mismatch: content {content_feat.shape} vs style {style_feat.shape}", 
+                      level="WARNING", category="precision", force=True)
         
         # Resize style to match content spatial dimensions
         if len(content_feat.shape) >= 3:
@@ -221,7 +222,8 @@ def wavelet_reconstruction(content_feat: Tensor, style_feat: Tensor, debug: Opti
                 mode='bilinear', 
                 align_corners=False
             )
-            debug.log(f"Style resized to: {style_feat.shape}", category="precision", force=True)
+            if debug is not None:
+                debug.log(f"Style resized to: {style_feat.shape}", category="precision", force=True)
     
     # Decompose both features into frequency components
     content_high_freq, content_low_freq = wavelet_decomposition(content_feat)
@@ -232,7 +234,8 @@ def wavelet_reconstruction(content_feat: Tensor, style_feat: Tensor, debug: Opti
     
     # Safety check (should not happen after resize)
     if content_high_freq.shape != style_low_freq.shape:
-        debug.log(f"Final dimension adjustment needed", level="WARNING", category="precision", force=True)
+        if debug is not None:
+            debug.log(f"Final dimension adjustment needed", level="WARNING", category="precision", force=True)
         style_low_freq = safe_interpolate_operation(
             style_low_freq,
             size=content_high_freq.shape[-2:],
@@ -284,10 +287,11 @@ def lab_color_transfer(
     
     # Handle spatial dimension mismatch (should already match after wavelet)
     if content_feat.shape != style_feat.shape:
-        debug.log(
-            f"LAB: Resizing style {style_feat.shape} to match content {content_feat.shape}",
-            level="WARNING", category="precision", force=True
-        )
+        if debug is not None:
+            debug.log(
+                f"LAB: Resizing style {style_feat.shape} to match content {content_feat.shape}",
+                level="WARNING", category="precision", force=True
+            )
         style_feat = safe_interpolate_operation(
             style_feat,
             size=content_feat.shape[-2:],
@@ -363,7 +367,8 @@ def lab_color_transfer(
     if result.dtype != original_dtype:
         result = result.to(original_dtype)
     
-    debug.log(f"LAB color transfer completed (luminance_weight={luminance_weight})", category="video", indent_level=1)
+    if debug is not None:
+        debug.log(f"LAB color transfer completed (luminance_weight={luminance_weight})", category="video", indent_level=1)
     
     return result
 
@@ -658,10 +663,11 @@ def hsv_saturation_histogram_match(content_feat: Tensor, style_feat: Tensor, deb
     """
     # Handle spatial dimension mismatch
     if content_feat.shape != style_feat.shape:
-        debug.log(
-            f"HSV: Resizing style {style_feat.shape} to match content {content_feat.shape}",
-            level="WARNING", category="precision", force=True
-        )
+        if debug is not None:
+            debug.log(
+                f"HSV: Resizing style {style_feat.shape} to match content {content_feat.shape}",
+                level="WARNING", category="precision", force=True
+            )
         style_feat = safe_interpolate_operation(
             style_feat,
             size=content_feat.shape[-2:],
@@ -716,7 +722,8 @@ def hsv_saturation_histogram_match(content_feat: Tensor, style_feat: Tensor, deb
     if result.dtype != original_dtype:
         result = result.to(original_dtype)
     
-    debug.log("HSV hue-conditional saturation matching completed", category="video", indent_level=1)
+    if debug is not None:
+        debug.log("HSV hue-conditional saturation matching completed", category="video", indent_level=1)
     
     return result
 
@@ -903,10 +910,11 @@ def wavelet_adaptive_color_correction(content_feat: Tensor, style_feat: Tensor, 
     """
     # Handle spatial dimension mismatch
     if content_feat.shape != style_feat.shape:
-        debug.log(
-            f"Wavelet Adaptive: Resizing style {style_feat.shape} to match content {content_feat.shape}",
-            level="WARNING", category="precision", force=True
-        )
+        if debug is not None:
+            debug.log(
+                f"Wavelet Adaptive: Resizing style {style_feat.shape} to match content {content_feat.shape}",
+                level="WARNING", category="precision", force=True
+            )
         style_feat = safe_interpolate_operation(
             style_feat,
             size=content_feat.shape[-2:],
@@ -960,7 +968,8 @@ def wavelet_adaptive_color_correction(content_feat: Tensor, style_feat: Tensor, 
     if result.dtype != original_dtype:
         result = result.to(original_dtype)
     
-    debug.log(f"Wavelet Adaptive: {correction_pct:.1f}% pixels use HSV correction", category="video", indent_level=1)
+    if debug is not None:
+        debug.log(f"Wavelet Adaptive: {correction_pct:.1f}% pixels use HSV correction", category="video", indent_level=1)
     
     return result
 

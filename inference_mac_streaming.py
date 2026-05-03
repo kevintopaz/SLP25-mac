@@ -1321,6 +1321,7 @@ class VideoUpscaler:
                 del latent_np
 
                 mlx_vae.encoder = None
+                mlx_vae.decoder = None
                 gc.collect()
                 _mx.clear_cache()
                 torch.mps.empty_cache()

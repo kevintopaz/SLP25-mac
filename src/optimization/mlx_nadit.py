@@ -209,8 +209,9 @@ class MLXRMSNorm:
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        var = mx.mean(x.astype(mx.float32) * x.astype(mx.float32), axis=-1, keepdims=True)
-        x_norm = x.astype(mx.float32) * mx.rsqrt(var + self.eps)
+        xf = x.astype(mx.float32)
+        var = mx.mean(xf * xf, axis=-1, keepdims=True)
+        x_norm = xf * mx.rsqrt(var + self.eps)
         if self.weight is not None:
             x_norm = x_norm * self.weight.astype(mx.float32)
             return x_norm.astype(self.weight.dtype)
@@ -303,7 +304,87 @@ class MLXSwiGLUMLP:
 
 
 # ============================================================================
-# Branch (vid or txt) container - holds per-branch weights for one block
+# Chunked norm + modulate helpers  (cap fp32 transient memory)
+# ============================================================================
+
+_BLOCK_CHUNK = int(os.environ.get("MLX_BLOCK_CHUNK", "16384"))
+
+
+def _chunked_norm_mod(
+    x: mx.array,
+    ada: 'MLXAdaSingle',
+    emb: mx.array,
+    layer: str,
+    L: int,
+    norm_eps: float,
+    chunk_size: int = _BLOCK_CHUNK,
+) -> mx.array:
+    """RMSNorm (no affine) + in_modulate, chunked along token axis.
+
+    Each chunk is eval'd independently so the fp32 RMSNorm intermediates
+    (~2× chunk bytes in fp32) are freed before the next chunk starts.
+    """
+    if L <= chunk_size:
+        out = MLXRMSNorm(None, eps=norm_eps)(x)
+        out = ada.in_modulate(out, emb, layer, [L])
+        mx.eval(out)
+        return out
+
+    shiftA, scaleA, _ = ada._emb_for_layer(emb, layer)
+    shiftB = ada.params[f"{layer}_shift"]
+    scaleB = ada.params[f"{layer}_scale"]
+    sc = scaleA + scaleB
+    sh = shiftA + shiftB
+    mx.eval(sc, sh)
+
+    norm = MLXRMSNorm(None, eps=norm_eps)
+    chunks: List[mx.array] = []
+    for s in range(0, L, chunk_size):
+        e = min(s + chunk_size, L)
+        c = norm(x[s:e])
+        c = c * sc + sh
+        mx.eval(c)
+        chunks.append(c)
+    out = mx.concatenate(chunks, axis=0)
+    mx.eval(out)
+    return out
+
+
+def _chunked_out_mod_add(
+    x: mx.array,
+    x_delta: mx.array,
+    ada: 'MLXAdaSingle',
+    emb: mx.array,
+    layer: str,
+    L: int,
+    chunk_size: int = _BLOCK_CHUNK,
+) -> mx.array:
+    """out_modulate(x_delta) + residual add, chunked to avoid full-sized
+    intermediate from gate multiplication + addition coexisting."""
+    if L <= chunk_size:
+        gated = ada.out_modulate(x_delta, emb, layer, [L])
+        out = x + gated
+        mx.eval(out)
+        return out
+
+    _, _, gateA = ada._emb_for_layer(emb, layer)
+    gateB = ada.params[f"{layer}_gate"]
+    g = gateA + gateB
+    mx.eval(g)
+
+    chunks: List[mx.array] = []
+    for s in range(0, L, chunk_size):
+        e = min(s + chunk_size, L)
+        c = x[s:e] + x_delta[s:e] * g
+        mx.eval(c)
+        chunks.append(c)
+    out = mx.concatenate(chunks, axis=0)
+    mx.eval(out)
+    return out
+
+
+# ============================================================================
+# Branch (vid or txt) container - holds per-block weights for one block
 # ============================================================================
 
 @dataclass
@@ -639,6 +720,9 @@ def make_window_info(vid_shape: Tuple[int, int, int], window: Tuple[int, int, in
 # NaSwinAttention (windowed varlen with 3D MM-RoPE) - batch=1 specialization
 # ============================================================================
 
+_ATTN_WIN_GROUP = int(os.environ.get("MLX_DIT_WIN_GROUP", "10"))
+
+
 def windowed_swin_attention(
     vid: mx.array,                   # (L_vid, dim)
     txt: mx.array,                   # (L_txt, dim)  L_txt = txt_len
@@ -656,26 +740,17 @@ def windowed_swin_attention(
     Per-block windowed multi-modal attention.  Returns (vid_out, txt_out) with
     same shapes as inputs.
 
-    Steps mirror NaSwinAttention.forward:
-        1. proj_qkv -> split (Q, K, V)
-        2. window_partition vid tokens (reorder)
-        3. norm_q / norm_k on head_dim
-        4. RoPE on per-window vid + repeated text
-        5. SDPA per window (vid_window || txt) varlen
-        6. unconcat (txt averaged across windows)
-        7. window_reverse vid -> proj_out
+    QKV projection is fused into the per-window loop in groups of
+    _ATTN_WIN_GROUP windows to avoid allocating the full-sequence vid_qkv
+    (3.89 GB at 121 frames 1080p).  Each group projects only its tokens,
+    keeping peak activation at ~vid_h + group_qkv instead of
+    vid_h + vid_qkv + vid_qkv_win.
     """
     txt_b = txt_branch if txt_branch is not None else vid_branch
     vid_dtype = vid.dtype
     txt_dtype = txt.dtype
     scale = 1.0 / math.sqrt(head_dim)
     rope_dim = 126   # 3 axes * (head_dim // 3) * pair = 3 * 42 = 126
-
-    # 1. proj_qkv on full vid (1.13 GB at 1080p) - the only full-vid alloc.
-    vid_qkv = MLXLinear(vid_branch.proj_qkv_w)(vid)
-    # 2. window-permute (gather along L) and reshape so per-window slice is cheap
-    vid_qkv_win = vid_qkv[win_info.tgt_idx].reshape(-1, 3, heads, head_dim)
-    mx.eval(vid_qkv_win)   # materialize so original vid_qkv can be freed
 
     # txt branch — small; do RMSNorm+RoPE once outside loop
     txt_qkv = MLXLinear(txt_b.proj_qkv_w)(txt).reshape(-1, 3, heads, head_dim)
@@ -693,50 +768,62 @@ def windowed_swin_attention(
 
     norm_q_w = vid_branch.norm_q_w
     norm_k_w = vid_branch.norm_k_w
+    proj_qkv_w = vid_branch.proj_qkv_w
 
-    # 3. Per-window streaming attention.  Each iteration touches only this
-    # window's small (W, heads, head_dim) Q/K/V plus the constant txt branch.
-    # Q/K norm and 3D RoPE are done on the per-window slice (fp32 RoPE, then
-    # cast back) so we never materialize a full-vid Q/K/V or fp32 tensor.
     vid_out_parts = []
     txt_out_sum = None    # (txt_len, heads, head_dim) fp32 running sum
+    n_win = win_info.n_windows
+    grp = _ATTN_WIN_GROUP
 
-    for i in range(win_info.n_windows):
-        s = win_info.cum_vid_lens[i]
-        e = win_info.cum_vid_lens[i + 1]
-        T_w, H_w, W_w = win_info.window_shapes[i]
+    for g_start in range(0, n_win, grp):
+        g_end = min(g_start + grp, n_win)
+        gs = win_info.cum_vid_lens[g_start]
+        ge = win_info.cum_vid_lens[g_end]
 
-        win_qkv = vid_qkv_win[s:e]                    # (W, 3, heads, head_dim)
-        vid_q = MLXRMSNorm(norm_q_w, eps=1e-5)(win_qkv[:, 0])
-        vid_k = MLXRMSNorm(norm_k_w, eps=1e-5)(win_qkv[:, 1])
-        vid_v = win_qkv[:, 2]
-        # 3D RoPE on this window only (freqs depend on (T_w,H_w,W_w))
-        win_freqs = vid_freqs[txt_len:txt_len + T_w, :H_w, :W_w, :].reshape(-1, rope_dim)
-        vid_q_h = vid_q.transpose(1, 0, 2).astype(mx.float32)
-        vid_k_h = vid_k.transpose(1, 0, 2).astype(mx.float32)
-        vid_q_h = _apply_rotary_emb(win_freqs, vid_q_h)
-        vid_k_h = _apply_rotary_emb(win_freqs, vid_k_h)
-        vid_q = vid_q_h.transpose(1, 0, 2).astype(vid_dtype)
-        vid_k = vid_k_h.transpose(1, 0, 2).astype(vid_dtype)
+        # Gather this group's tokens from vid and project QKV in one matmul
+        group_idx = win_info.tgt_idx[gs:ge]
+        group_input = vid[group_idx]
+        group_qkv = MLXLinear(proj_qkv_w)(group_input).reshape(-1, 3, heads, head_dim)
+        mx.eval(group_qkv)
+        del group_input
 
-        # Concat with txt for varlen, run SDPA on (1, heads, seq, head_dim)
-        q = mx.concatenate([vid_q, txt_q], axis=0)
-        k = mx.concatenate([vid_k, txt_k], axis=0)
-        v = mx.concatenate([vid_v, txt_v], axis=0)
-        q4 = q.transpose(1, 0, 2)[None, :]
-        k4 = k.transpose(1, 0, 2)[None, :]
-        v4 = v.transpose(1, 0, 2)[None, :]
-        out4 = mx.fast.scaled_dot_product_attention(q4, k4, v4, scale=scale)
-        out = out4[0].transpose(1, 0, 2)
-        vid_part = out[:e - s]
-        txt_part = out[e - s:].astype(mx.float32)
-        # Materialize this window's outputs so per-window intermediates drop
-        mx.eval(vid_part, txt_part)
-        vid_out_parts.append(vid_part)
-        if txt_out_sum is None:
-            txt_out_sum = txt_part
-        else:
-            txt_out_sum = txt_out_sum + txt_part
+        # Per-window attention within this group
+        for i in range(g_start, g_end):
+            s = win_info.cum_vid_lens[i] - gs
+            e = win_info.cum_vid_lens[i + 1] - gs
+            T_w, H_w, W_w = win_info.window_shapes[i]
+
+            win_qkv = group_qkv[s:e]
+            vid_q = MLXRMSNorm(norm_q_w, eps=1e-5)(win_qkv[:, 0])
+            vid_k = MLXRMSNorm(norm_k_w, eps=1e-5)(win_qkv[:, 1])
+            vid_v = win_qkv[:, 2]
+
+            win_freqs = vid_freqs[txt_len:txt_len + T_w, :H_w, :W_w, :].reshape(-1, rope_dim)
+            vid_q_h = vid_q.transpose(1, 0, 2).astype(mx.float32)
+            vid_k_h = vid_k.transpose(1, 0, 2).astype(mx.float32)
+            vid_q_h = _apply_rotary_emb(win_freqs, vid_q_h)
+            vid_k_h = _apply_rotary_emb(win_freqs, vid_k_h)
+            vid_q = vid_q_h.transpose(1, 0, 2).astype(vid_dtype)
+            vid_k = vid_k_h.transpose(1, 0, 2).astype(vid_dtype)
+
+            q = mx.concatenate([vid_q, txt_q], axis=0)
+            k = mx.concatenate([vid_k, txt_k], axis=0)
+            v = mx.concatenate([vid_v, txt_v], axis=0)
+            q4 = q.transpose(1, 0, 2)[None, :]
+            k4 = k.transpose(1, 0, 2)[None, :]
+            v4 = v.transpose(1, 0, 2)[None, :]
+            out4 = mx.fast.scaled_dot_product_attention(q4, k4, v4, scale=scale)
+            out = out4[0].transpose(1, 0, 2)
+            vid_part = out[:e - s]
+            txt_part = out[e - s:].astype(mx.float32)
+            mx.eval(vid_part, txt_part)
+            vid_out_parts.append(vid_part)
+            if txt_out_sum is None:
+                txt_out_sum = txt_part
+            else:
+                txt_out_sum = txt_out_sum + txt_part
+
+        del group_qkv
 
     vid_out_win = mx.concatenate(vid_out_parts, axis=0)
     txt_out = (txt_out_sum / float(win_info.n_windows)).astype(txt_dtype)
@@ -745,10 +832,10 @@ def windowed_swin_attention(
     vid_out_win = vid_out_win.reshape(-1, heads * head_dim)
     txt_out = txt_out.reshape(-1, heads * head_dim)
 
-    # 4. window_reverse vid (inverse permutation)
+    # window_reverse vid (inverse permutation)
     vid_out = vid_out_win[win_info.src_idx]
 
-    # 5. proj_out
+    # proj_out
     vid_out = MLXLinear(vid_branch.proj_out_w, vid_branch.proj_out_b)(vid_out)
     txt_out = MLXLinear(txt_b.proj_out_w, txt_b.proj_out_b)(txt_out)
 
@@ -794,16 +881,12 @@ def transformer_block_forward(
     )
 
     # ---- attn block ----
-    vid_a = MLXRMSNorm(None, eps=norm_eps)(vid)  # attn_norm (no affine)
+    # Chunked norm+modulate for vid (caps fp32 transient); txt is small.
+    vid_a = _chunked_norm_mod(vid, vid_ada, emb, "attn", L_vid, norm_eps)
     txt_a = MLXRMSNorm(None, eps=norm_eps)(txt)
-
-    vid_a = vid_ada.in_modulate(vid_a, emb, "attn", [L_vid])
     if txt_ada is not None:
         txt_a = txt_ada.in_modulate(txt_a, emb, "attn", [L_txt])
-
-    # Flush norm+modulate so fp32 RMSNorm intermediates are freed before
-    # the large QKV projection allocates ~2 GB in the attention function.
-    mx.eval(vid_a, txt_a)
+    mx.eval(txt_a)
 
     vid_a, txt_a = windowed_swin_attention(
         vid_a, txt_a, vid_b, None if block.shared else block.txt,
@@ -811,31 +894,22 @@ def transformer_block_forward(
         heads, head_dim,
     )
 
-    vid_a = vid_ada.out_modulate(vid_a, emb, "attn", [L_vid])
+    # Chunked out_modulate + residual for vid; txt is small.
+    vid = _chunked_out_mod_add(vid, vid_a, vid_ada, emb, "attn", L_vid)
+    del vid_a
     if txt_ada is not None:
         txt_a = txt_ada.out_modulate(txt_a, emb, "attn", [L_txt])
-
-    vid = vid + vid_a
     txt = txt + txt_a
-    mx.eval(vid, txt)   # free attention intermediates before MLP allocates
+    mx.eval(txt)
 
     # ---- mlp block ----
-    # For is_last_layer: PyTorch MMModule(vid_only=True) returns txt UNCHANGED
-    # through mlp_norm, ada(in/out), mlp.  Then the residual `txt_attn + txt_mlp`
-    # becomes `txt_attn + txt_attn = 2*txt_attn`.  We replicate that quirk for
-    # math identity, even though the txt output of the last block is discarded
-    # downstream (only vid is used by vid_out_norm/ada/out).
-    vid_m = MLXRMSNorm(None, eps=norm_eps)(vid)
+    vid_m = _chunked_norm_mod(vid, vid_ada, emb, "mlp", L_vid, norm_eps)
     if is_last_layer:
-        txt_m = txt   # mlp_norm with vid_only=True returns txt unchanged
+        txt_m = txt
     else:
         txt_m = MLXRMSNorm(None, eps=norm_eps)(txt)
-
-    vid_m = vid_ada.in_modulate(vid_m, emb, "mlp", [L_vid])
-    if not is_last_layer:
         txt_m = txt_ada.in_modulate(txt_m, emb, "mlp", [L_txt])
-
-    mx.eval(vid_m, txt_m)  # flush norm+modulate before MLP allocates
+    mx.eval(txt_m)
 
     vid_mlp = MLXSwiGLUMLP(vid_b.mlp_gate_w, vid_b.mlp_up_w, vid_b.mlp_down_w)
     vid_m = vid_mlp(vid_m)
@@ -843,12 +917,15 @@ def transformer_block_forward(
         txt_mlp = MLXSwiGLUMLP(txt_b.mlp_gate_w, txt_b.mlp_up_w, txt_b.mlp_down_w)
         txt_m = txt_mlp(txt_m)
 
-    vid_m = vid_ada.out_modulate(vid_m, emb, "mlp", [L_vid])
-    if not is_last_layer:
+    # Chunked out_modulate + residual for vid
+    vid = _chunked_out_mod_add(vid, vid_m, vid_ada, emb, "mlp", L_vid)
+    del vid_m
+    if is_last_layer:
+        txt = txt + txt_m   # PyTorch quirk on last layer: 2*txt_attn
+    else:
         txt_m = txt_ada.out_modulate(txt_m, emb, "mlp", [L_txt])
-
-    vid = vid + vid_m
-    txt = txt + txt_m   # PyTorch quirk on last layer: 2*txt_attn
+        txt = txt + txt_m
+    mx.eval(txt)
 
     return vid, txt
 
@@ -1252,6 +1329,8 @@ class MLXNaDiT(torch_nn.Module):
         # the full heap available for its ~8 GB peak activation working set.
         if torch.backends.mps.is_available():
             torch.mps.empty_cache()
+        mx.clear_cache()
+        mx.set_cache_limit(4 * 1024**3)
 
         vid_mx = _t_to_mx(vid, dtype=self.dtype)
         txt_mx = _t_to_mx(txt, dtype=self.dtype)
@@ -1272,15 +1351,6 @@ class MLXNaDiT(torch_nn.Module):
         del vid_mx, txt_mx
         out_np = np.asarray(out_mx.astype(mx.float32))
         del out_mx
-
-        # NOTE: deliberately NOT calling mx.clear_cache() here.  The VAE
-        # encode/decode that runs before/after DiT relies on the MLX metal-
-        # buffer cache for fast tile re-allocation (~4 GB working set).
-        # Clearing the cache forces the VAE to round-trip every allocation
-        # through the OS on the very next call, which we measured doubles
-        # tile times (28 s → 11 s/tile decode at 1080p).  MLX's own LRU
-        # eviction (capped by the VAE's set_cache_limit) keeps memory
-        # bounded automatically.
 
         out_t = torch.from_numpy(out_np).to(device=target_device, dtype=target_dtype)
         return NaDiTOutput(vid_sample=out_t)
@@ -1306,6 +1376,8 @@ class MLXNaDiT(torch_nn.Module):
 
         if torch.backends.mps.is_available():
             torch.mps.empty_cache()
+        mx.clear_cache()
+        mx.set_cache_limit(4 * 1024**3)
 
         # Convert inputs to MLX
         tile_vids_mx = [_t_to_mx(v, dtype=self.dtype) for v in tile_vids]

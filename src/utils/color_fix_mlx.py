@@ -22,6 +22,10 @@ from typing import Optional
 import mlx.core as mx
 import numpy as np
 
+# Grab the original torch implementation BEFORE inference_mac_streaming
+# monkey-patches color_fix.wavelet_reconstruction with the MLX version.
+from .color_fix import wavelet_reconstruction as _torch_wavelet_reconstruction
+
 
 # 3x3 Gaussian-approx kernel used by the torch wavelet_blur.
 # Values must match exactly (color_fix.py:148-152).
@@ -117,8 +121,7 @@ def wavelet_reconstruction_mlx(content_feat, style_feat, debug=None):
     # delegate to torch for that rare path — keeps this module focused on
     # the common case where shapes already match.
     if content_feat.shape != style_feat.shape:
-        from .color_fix import wavelet_reconstruction as _torch_fallback
-        return _torch_fallback(content_feat, style_feat, debug)
+        return _torch_wavelet_reconstruction(content_feat, style_feat, debug)
 
     # NCHW torch -> NHWC mlx. Run the whole decomposition in MLX, then
     # convert the final clamped result back to torch.
