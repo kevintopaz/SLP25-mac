@@ -71,6 +71,7 @@ class DivisiblePad:
             if image.dtype == torch.float16:
                 image = image.float()
             image = torch.nn.functional.pad(image, padding, mode='reflect')
+            #image = torch.nn.functional.pad(image, padding, mode='constant', value=0.0)
             image = image.to(orig_dtype)
         elif isinstance(image, Image.Image):
             import numpy as np
@@ -78,6 +79,9 @@ class DivisiblePad:
             arr = np.pad(arr,
                          ((0, pad_height), (0, pad_width), (0, 0)),
                          mode='reflect')
+            #arr = np.pad(arr,
+            #             ((0, pad_height), (0, pad_width), (0, 0)),
+            #             mode='constant', value=0.0)
             image = Image.fromarray(arr)
 
         return image
