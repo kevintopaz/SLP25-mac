@@ -62,9 +62,7 @@ def _blend_overlapping_frames(
     overlap: int,
 ) -> torch.Tensor:
     """
-    Blend two overlapping frame sequences using a Hann-window crossfade.
-
-    Matches ``blend_overlapping_frames`` from the ComfyUI-SeedVR2 reference.
+    Blend two overlapping frame sequences using linear crossfade.
 
     Args:
         prev_tail: Last *overlap* frames from previous batch ``[overlap, H, W, C]``.
@@ -77,15 +75,7 @@ def _blend_overlapping_frames(
     device = prev_tail.device
     dtype = prev_tail.dtype
 
-    if overlap >= 3:
-        t = torch.linspace(0.0, 1.0, steps=overlap, device=device, dtype=dtype)
-        blend_start = 1.0 / 3.0
-        blend_end = 2.0 / 3.0
-        u = ((t - blend_start) / (blend_end - blend_start)).clamp(0.0, 1.0)
-        w_prev_1d = 0.5 + 0.5 * torch.cos(math.pi * u)
-    else:
-        w_prev_1d = torch.linspace(1.0, 0.0, steps=overlap, device=device, dtype=dtype)
-
+    w_prev_1d = torch.linspace(1.0, 0.0, steps=overlap, device=device, dtype=dtype)
     w_prev = w_prev_1d.view(overlap, 1, 1, 1)
     w_cur = 1.0 - w_prev
 
@@ -100,21 +90,13 @@ def _blend_overlapping_transformed(
     """
     Blend overlapping transformed frames ``[C, T, H, W]`` layout.
 
-    Same Hann crossfade as ``_blend_overlapping_frames`` but for CTHW tensors.
+    Same linear crossfade as ``_blend_overlapping_frames`` but for CTHW tensors.
     """
     device = prev_tail.device
     dtype = prev_tail.dtype
 
-    if overlap >= 3:
-        t = torch.linspace(0.0, 1.0, steps=overlap, device=device, dtype=dtype)
-        blend_start = 1.0 / 3.0
-        blend_end = 2.0 / 3.0
-        u = ((t - blend_start) / (blend_end - blend_start)).clamp(0.0, 1.0)
-        w_prev_1d = 0.5 + 0.5 * torch.cos(math.pi * u)
-    else:
-        w_prev_1d = torch.linspace(1.0, 0.0, steps=overlap, device=device, dtype=dtype)
-
-    w_prev = w_prev_1d.view(1, overlap, 1, 1)   # [1, overlap, 1, 1] for CTHW
+    w_prev_1d = torch.linspace(1.0, 0.0, steps=overlap, device=device, dtype=dtype)
+    w_prev = w_prev_1d.view(1, overlap, 1, 1)
     w_cur = 1.0 - w_prev
 
     return prev_tail * w_prev + cur_head * w_cur
@@ -368,7 +350,14 @@ def _postprocess_frames_inline(
         # video: [T, H, W, C] → [T, C, H, W]
         video = decoded.permute(0, 3, 1, 2).to(device)
 
-        chunk_sz = max(1, min(32, T))
+        H, W = video.shape[-2], video.shape[-1]
+        pix = H * W
+        if pix > 4_000_000:
+            chunk_sz = max(1, min(4, T))
+        elif pix > 2_000_000:
+            chunk_sz = max(1, min(8, T))
+        else:
+            chunk_sz = max(1, min(32, T))
         result_chunks = []
         for s in range(0, T, chunk_sz):
             e = min(s + chunk_sz, T)

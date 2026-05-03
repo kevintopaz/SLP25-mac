@@ -71,20 +71,15 @@ def _mx_nhwc_to_torch(mx_arr, ref_torch):
 
 
 def _wavelet_blur_mlx(image: mx.array, radius: int) -> mx.array:
-    """Dilated Gaussian blur. image is NHWC mx.array."""
+    """Dilated Gaussian blur. image is NHWC mx.array (fp32)."""
     B, H, W, C = image.shape
-    # Same safety clamp as the torch version (color_fix.py:139-143).
     max_safe_radius = max(1, min(H, W) // 8)
     if radius > max_safe_radius:
         radius = max_safe_radius
 
-    # Depthwise kernel: (out_channels=C, kH=3, kW=3, in_channels_per_group=1)
-    # MLX conv2d weight layout is OHWI, and depthwise has groups=C with
-    # in_channels_per_group=1.
     kernel_np = np.broadcast_to(_GAUSSIAN_3X3[None, :, :, None], (C, 3, 3, 1))
-    kernel = mx.array(kernel_np.copy()).astype(image.dtype)
+    kernel = mx.array(kernel_np.copy())  # fp32
 
-    # Replicate pad by `radius` on H and W (matches torch ``mode='replicate'``).
     image_padded = mx.pad(
         image, [(0, 0), (radius, radius), (radius, radius), (0, 0)], mode="edge"
     )
@@ -94,7 +89,7 @@ def _wavelet_blur_mlx(image: mx.array, radius: int) -> mx.array:
 
 
 def _wavelet_decomposition_mlx(image: mx.array, levels: int = 5):
-    """Returns (high_freq, low_freq) — same algorithm as torch wavelet_decomposition."""
+    """Returns (high_freq, low_freq) — runs in fp32 for precision."""
     high_freq = mx.zeros_like(image)
     for i in range(levels):
         radius = 2 ** i
@@ -117,23 +112,19 @@ def wavelet_reconstruction_mlx(content_feat, style_feat, debug=None):
         style's low-frequency colors, clamped to [-1, 1]. Dtype and device
         match ``content_feat``.
     """
-    # Spatial mismatch handling: torch path uses bilinear interpolate. We
-    # delegate to torch for that rare path — keeps this module focused on
-    # the common case where shapes already match.
     if content_feat.shape != style_feat.shape:
         return _torch_wavelet_reconstruction(content_feat, style_feat, debug)
 
-    # NCHW torch -> NHWC mlx. Run the whole decomposition in MLX, then
-    # convert the final clamped result back to torch.
-    content_mx = _torch_to_mx_nhwc(content_feat)
-    style_mx = _torch_to_mx_nhwc(style_feat)
+    # Cast to fp32 for the decomposition to avoid precision loss in the
+    # high-frequency residual (image - low_freq) across 5 iterative levels.
+    content_mx = _torch_to_mx_nhwc(content_feat).astype(mx.float32)
+    style_mx = _torch_to_mx_nhwc(style_feat).astype(mx.float32)
 
     content_high, _ = _wavelet_decomposition_mlx(content_mx)
     _, style_low = _wavelet_decomposition_mlx(style_mx)
 
     out_mx = mx.clip(content_high + style_low, -1.0, 1.0)
     mx.eval(out_mx)
-    # Drop intermediates so MLX can reclaim before we return.
     del content_mx, style_mx, content_high, style_low
 
     return _mx_nhwc_to_torch(out_mx, content_feat)

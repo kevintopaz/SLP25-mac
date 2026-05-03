@@ -43,7 +43,7 @@ class DivisibleCrop:
 class DivisiblePad:
     """
     Pad image to make dimensions divisible by a factor.
-    Pads with black (0) to avoid data loss.
+    Uses reflect padding to avoid boundary artifacts.
     """
     def __init__(self, factor):
         if not isinstance(factor, tuple):
@@ -58,23 +58,26 @@ class DivisiblePad:
         else:
             raise NotImplementedError
 
-        # Calculate padding needed
         pad_height = (self.height_factor - (height % self.height_factor)) % self.height_factor
         pad_width = (self.width_factor - (width % self.width_factor)) % self.width_factor
 
         if pad_height == 0 and pad_width == 0:
             return image
 
-        # Pad symmetrically (or bottom/right)
         if isinstance(image, torch.Tensor):
             # Pad format: (left, right, top, bottom)
             padding = (0, pad_width, 0, pad_height)
-            image = torch.nn.functional.pad(image, padding, mode='constant', value=0.0)
+            orig_dtype = image.dtype
+            if image.dtype == torch.float16:
+                image = image.float()
+            image = torch.nn.functional.pad(image, padding, mode='reflect')
+            image = image.to(orig_dtype)
         elif isinstance(image, Image.Image):
-            new_width = width + pad_width
-            new_height = height + pad_height
-            result = Image.new(image.mode, (new_width, new_height), (0, 0, 0))
-            result.paste(image, (0, 0))
-            image = result
+            import numpy as np
+            arr = np.array(image)
+            arr = np.pad(arr,
+                         ((0, pad_height), (0, pad_width), (0, 0)),
+                         mode='reflect')
+            image = Image.fromarray(arr)
 
         return image

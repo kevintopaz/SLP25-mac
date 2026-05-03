@@ -986,8 +986,14 @@ def postprocess_latent_output(
         
         debug.log(f"Applying {color_correction} color correction ({T} frames, ref={T_ref})", category="color")
         
-        # Process in chunks to avoid GPU OOM on high-res videos
-        chunk_size = max(1, min(32, T))  # 8 frames at a time
+        H, W = video.shape[-2], video.shape[-1]
+        pix = H * W
+        if pix > 4_000_000:
+            chunk_size = max(1, min(4, T))
+        elif pix > 2_000_000:
+            chunk_size = max(1, min(8, T))
+        else:
+            chunk_size = max(1, min(32, T))
         result_chunks = []
         
         for start in range(0, T, chunk_size):

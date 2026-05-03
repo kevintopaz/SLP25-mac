@@ -1481,19 +1481,23 @@ def parse_arguments():
     )
     parser.add_argument("--full_pool", action="store_true",
                         help="Keep all DiT blocks in memory (no streaming)")
-    parser.add_argument("--mlx_dit", action="store_true",
+    parser.add_argument("--mlx_dit", action="store_true", default=True,
                         help="Use MLX-native DiT backend (math-identical to PyTorch within "
-                             "bf16/fp16 ULP, runs on Apple Silicon GPU via Metal).")
+                             "bf16/fp16 ULP, runs on Apple Silicon GPU via Metal). Default: True.")
+    parser.add_argument("--no_mlx_dit", action="store_false", dest="mlx_dit",
+                        help="Disable MLX DiT and fall back to PyTorch/MPS.")
     parser.add_argument("--mlx_dtype", choices=["bf16", "fp16", "fp32"], default="bf16",
                         help="MLX DiT compute precision. fp16 matches training; bf16 is the "
                              "default; fp32 is bit-accurate but uses 2x memory. (Only with --mlx_dit)")
-    parser.add_argument("--mlx_stream", action="store_true",
+    parser.add_argument("--mlx_stream", action="store_true", default=True,
                         help="Stream DiT blocks from disk instead of holding all 32 in memory. "
                              "Drops weight residency from ~6 GB to ~0.4 GB at <1%% time cost. "
-                             "(Only with --mlx_dit)")
+                             "Default: True. (Only with --mlx_dit)")
+    parser.add_argument("--no_mlx_stream", action="store_false", dest="mlx_stream",
+                        help="Load all 32 DiT blocks into memory instead of streaming.")
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--chunking_mode", default="pixel", choices=["pixel", "latent"],
-                        help="Chunking strategy: 'pixel' (default) or 'latent' (hybrid streaming)")
+    parser.add_argument("--chunking_mode", default="latent", choices=["pixel", "latent"],
+                        help="Chunking strategy: 'latent' (default, hybrid streaming) or 'pixel'")
     return parser.parse_args()
 
 

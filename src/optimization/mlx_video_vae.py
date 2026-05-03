@@ -1100,13 +1100,13 @@ def assemble_tiles_from_disk(tile_infos, pixel_H, pixel_W, num_frames=None):
         clip_h = min(tile_H, pixel_H - ph)
         clip_w = min(tile_W, pixel_W - pw)
         total_wt[ph:ph+clip_h, pw:pw+clip_w] += bw[:clip_h, :clip_w]
-    total_wt = np.maximum(total_wt, 1e-4).astype(np.float16)
+    total_wt = np.maximum(total_wt, 1e-4)
 
-    output = np.zeros((T_pix, pixel_H, pixel_W, 3), dtype=np.float16)
+    output = np.zeros((T_pix, pixel_H, pixel_W, 3), dtype=np.float32)
 
     t0 = time.perf_counter()
     for info in tile_infos:
-        tile_data = _read_tile_as_fp16(info, 0, T_pix)
+        tile_data = _read_tile_as_fp16(info, 0, T_pix).astype(np.float32)
 
         ph, pw = info["pixel_h"], info["pixel_w"]
         clip_h = min(tile_H, pixel_H - ph)
@@ -1114,16 +1114,16 @@ def assemble_tiles_from_disk(tile_infos, pixel_H, pixel_W, num_frames=None):
         bw = _make_blend_weight(tile_H, tile_W, (ov_H, ov_W),
                                 n_h, n_w, info["ti"], info["tj"])
         bw = bw[:clip_h, :clip_w]
-        norm_bw = (bw / total_wt[ph:ph+clip_h, pw:pw+clip_w]).astype(np.float16)
-        bw4d = norm_bw[None, :, :, None]  # [1, H, W, 1]
+        norm_bw = bw / total_wt[ph:ph+clip_h, pw:pw+clip_w]
+        bw4d = norm_bw[None, :, :, None]
         output[:, ph:ph+clip_h, pw:pw+clip_w, :] += (
-            (tile_data[:, :clip_h, :clip_w, :] * bw4d).astype(np.float16)
+            tile_data[:, :clip_h, :clip_w, :] * bw4d
         )
         del tile_data
 
     elapsed = time.perf_counter() - t0
     logger.info(f"Assembled tiles from disk in {elapsed:.1f}s -> {output.shape}")
-    return output
+    return output.astype(np.float16)
 
 
 def assemble_tiles_from_disk_range(tile_infos, pixel_H, pixel_W,
@@ -1163,13 +1163,13 @@ def assemble_tiles_from_disk_range(tile_infos, pixel_H, pixel_W,
         clip_h = min(tile_H, pixel_H - ph)
         clip_w = min(tile_W, pixel_W - pw)
         total_wt[ph:ph+clip_h, pw:pw+clip_w] += bw[:clip_h, :clip_w]
-    total_wt = np.maximum(total_wt, 1e-4).astype(np.float16)
+    total_wt = np.maximum(total_wt, 1e-4)
 
-    output = np.zeros((frame_count, pixel_H, pixel_W, 3), dtype=np.float16)
+    output = np.zeros((frame_count, pixel_H, pixel_W, 3), dtype=np.float32)
 
     fs, fe = frame_start, frame_start + frame_count
     for info in tile_infos:
-        tile_data = _read_tile_as_fp16(info, fs, fe - fs)
+        tile_data = _read_tile_as_fp16(info, fs, fe - fs).astype(np.float32)
 
         ph, pw = info["pixel_h"], info["pixel_w"]
         clip_h = min(tile_H, pixel_H - ph)
@@ -1177,14 +1177,14 @@ def assemble_tiles_from_disk_range(tile_infos, pixel_H, pixel_W,
         bw = _make_blend_weight(tile_H, tile_W, (ov_H, ov_W),
                                 n_h, n_w, info["ti"], info["tj"])
         bw = bw[:clip_h, :clip_w]
-        norm_bw = (bw / total_wt[ph:ph+clip_h, pw:pw+clip_w]).astype(np.float16)
+        norm_bw = bw / total_wt[ph:ph+clip_h, pw:pw+clip_w]
         bw4d = norm_bw[None, :, :, None]
         output[:, ph:ph+clip_h, pw:pw+clip_w, :] += (
-            (tile_data[:, :clip_h, :clip_w, :] * bw4d).astype(np.float16)
+            tile_data[:, :clip_h, :clip_w, :] * bw4d
         )
         del tile_data
 
-    return output
+    return output.astype(np.float16)
 
 
 def cleanup_tile_files(tile_infos):
@@ -1417,9 +1417,9 @@ class MLXVideoVAE:
                 clip_h = min(tile_H, pixel_H - ph)
                 clip_w = min(tile_W, pixel_W - pw)
                 total_wt[ph:ph+clip_h, pw:pw+clip_w] += bw[:clip_h, :clip_w]
-        total_wt = np.maximum(total_wt, 1e-4).astype(np.float16)
+        total_wt = np.maximum(total_wt, 1e-4)
 
-        output = np.zeros((1, T_out, pixel_H, pixel_W, 3), dtype=np.float16)
+        output = np.zeros((1, T_out, pixel_H, pixel_W, 3), dtype=np.float32)
 
         t0 = time.perf_counter()
         tc = 0
@@ -1440,16 +1440,16 @@ class MLXVideoVAE:
                                         (ov_H, ov_W), n_h, n_w, ti, tj)
                 tile_np = np.asarray(tile_out)
                 del tile_out
-                norm_bw = (bw[:clip_h, :clip_w] / total_wt[ph:ph+clip_h, pw:pw+clip_w]).astype(np.float16)
+                norm_bw = bw[:clip_h, :clip_w] / total_wt[ph:ph+clip_h, pw:pw+clip_w]
                 bw5d = norm_bw[None, None, :, :, None]
                 output[:, :, ph:ph+clip_h, pw:pw+clip_w, :] += (
-                    (tile_np[:, :, :clip_h, :clip_w, :] * bw5d).astype(np.float16)
+                    tile_np[:, :, :clip_h, :clip_w, :] * bw5d
                 )
                 del tile_np
                 tc += 1
                 logger.info(f"  Dec tile {tc}/{n_h*n_w}: {time.perf_counter()-t0:.1f}s")
 
-        output_np = output
+        output_np = output.astype(np.float16)
         del output, total_wt
         mx.clear_cache()
         elapsed = time.perf_counter() - t0
