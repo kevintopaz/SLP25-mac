@@ -263,12 +263,37 @@ def process_pix_chunk(
     t_dec_end = time.time()
     vram_decode = getattr(runner, '_trt_vram_decode', None) or _peak_vram_gb()
 
-    # Move results to CPU
+    chunk_timings = {
+        "encode": t_enc_end - t_enc_start,
+        "dit": t_dit_end - t_dit_start,
+        "decode": t_dec_end - t_dec_start,
+        "vram_encode": vram_encode,
+        "vram_dit": vram_dit,
+        "vram_decode": vram_decode,
+    }
+
+    # ── Streaming decode path ──
+    # When _decode_tile_infos is in ctx, the decoded video is still on disk
+    # as tile memmaps.  Return metadata instead of full tensors so the caller
+    # can do streaming assembly + post-process in temporal batches.
+    _tile_infos = ctx.pop('_decode_tile_infos', None)
+    if _tile_infos is not None:
+        _mm_meta = ctx.get('_transformed_video_memmap')
+        _trim = ctx.get('_transformed_video_trim')
+        return {
+            'tile_infos': _tile_infos,
+            'pixel_H': ctx.pop('_decode_pixel_H'),
+            'pixel_W': ctx.pop('_decode_pixel_W'),
+            'T_pix': ctx.pop('_decode_T_pix'),
+            'transform_memmap': _mm_meta,
+            'transform_trim': _trim,
+        }, None, chunk_timings
+
+    # ── Legacy path: materialise full tensors ──
     decoded = ctx['decoded_video']
     if decoded.is_cuda or (hasattr(decoded, 'is_mps') and decoded.is_mps):
         decoded = decoded.cpu()
 
-    # Reload transformed_video from memmap if it was offloaded during encode
     _mm_meta = ctx.pop('_transformed_video_memmap', None)
     if _mm_meta is not None and 'transformed_video' not in ctx:
         import numpy as np, os
@@ -287,15 +312,6 @@ def process_pix_chunk(
     transformed = ctx.get('transformed_video')
     if transformed is not None:
         transformed = transformed.cpu()
-
-    chunk_timings = {
-        "encode": t_enc_end - t_enc_start,
-        "dit": t_dit_end - t_dit_start,
-        "decode": t_dec_end - t_dec_start,
-        "vram_encode": vram_encode,
-        "vram_dit": vram_dit,
-        "vram_decode": vram_decode,
-    }
 
     return decoded, transformed, chunk_timings
 
@@ -431,6 +447,179 @@ def _postprocess_frames_inline(
         del kernel_h, kernel_v, gauss_1d
 
     return video_out
+
+
+_STREAM_PP_BATCH = 4  # frames per streaming post-process batch
+
+
+def _streaming_postprocess_chunk(
+    decode_meta: dict,
+    ci: int,
+    num_chunks: int,
+    is_last: bool,
+    overlap: int,
+    extra_skip_val: int,
+    overlap_dec: Optional[torch.Tensor],
+    overlap_trans: Optional[torch.Tensor],
+    color_correction: str,
+    usm_weight: float,
+    usm_radius: int,
+    usm_threshold: int,
+    device: str,
+    pp_func,
+    debug,
+):
+    """Streaming assembly + post-process for a single decode chunk.
+
+    Instead of materialising the full decoded [T,H,W,C] + transformed
+    [C,T,H,W] tensors (~12 GB for 4K 121 frames), this reads from tile
+    memmaps and the transform memmap in temporal batches of
+    ``_STREAM_PP_BATCH`` frames.
+
+    Returns:
+        (overlap_dec, overlap_trans) — the overlap tail to hold for the
+        next chunk, or (None, None) if this is the last chunk.
+    """
+    import numpy as np
+    from ..optimization.mlx_video_vae import (
+        assemble_tiles_from_disk_range, cleanup_tile_files,
+    )
+
+    tile_infos = decode_meta['tile_infos']
+    pixel_H = decode_meta['pixel_H']
+    pixel_W = decode_meta['pixel_W']
+    T_pix = decode_meta['T_pix']
+    transform_mm_meta = decode_meta.get('transform_memmap')
+    transform_trim = decode_meta.get('transform_trim')
+
+    # Open transform memmap for reading colour-correction reference.
+    trans_mm = None
+    if transform_mm_meta is not None:
+        trans_mm = np.memmap(
+            transform_mm_meta['path'],
+            dtype=transform_mm_meta['dtype'],
+            mode='r',
+            shape=transform_mm_meta['shape'],
+        )
+
+    def _read_decoded_range(start, count):
+        """Assemble spatial tiles for frames [start : start+count]."""
+        count = min(count, T_pix - start)
+        dec_np = assemble_tiles_from_disk_range(
+            tile_infos, pixel_H, pixel_W, start, count,
+        )
+        return torch.from_numpy(dec_np)  # [count, H, W, 3] fp16
+
+    def _read_transform_range(start, count):
+        """Read colour-correction reference for frames [start : start+count]."""
+        if trans_mm is None:
+            return None
+        count = min(count, trans_mm.shape[1] - start)
+        chunk = np.array(trans_mm[:, start:start + count, :, :])
+        t = torch.from_numpy(chunk)
+        if transform_trim is not None:
+            t = t[:, :, :transform_trim[0], :transform_trim[1]]
+        return t  # [C, count, H, W] fp16
+
+    def _cleanup_all():
+        """Clean up tile files and transform memmap."""
+        cleanup_tile_files(tile_infos)
+        if transform_mm_meta is not None:
+            import os as _os
+            try:
+                _os.unlink(transform_mm_meta['path'])
+            except OSError:
+                pass
+
+    # Materialise the full decoded + transformed only for the overlap
+    # region (small: ≤21 frames for 4K).  Process the rest in streaming
+    # batches via pp_func.
+
+    skip = extra_skip_val
+    T_effective = T_pix - skip
+
+    if ci == 0:
+        if num_chunks == 1:
+            # Single chunk — stream everything through pp_func.
+            for fs in range(0, T_pix, _STREAM_PP_BATCH):
+                cnt = min(_STREAM_PP_BATCH, T_pix - fs)
+                dec_b = _read_decoded_range(fs, cnt)
+                trans_b = _read_transform_range(fs, cnt)
+                pp_func(dec_b, trans_b)
+                del dec_b, trans_b
+            _cleanup_all()
+            del trans_mm
+            return None, None
+        else:
+            # First of multiple chunks — stream non-overlap, hold overlap.
+            safe_end = T_pix - overlap
+            for fs in range(0, safe_end, _STREAM_PP_BATCH):
+                cnt = min(_STREAM_PP_BATCH, safe_end - fs)
+                dec_b = _read_decoded_range(fs, cnt)
+                trans_b = _read_transform_range(fs, cnt)
+                pp_func(dec_b, trans_b)
+                del dec_b, trans_b
+            # Read overlap tail into memory (small: ~21 frames).
+            new_ov_dec = _read_decoded_range(safe_end, overlap)
+            new_ov_trans = _read_transform_range(safe_end, overlap)
+            _cleanup_all()
+            del trans_mm
+            return new_ov_dec, new_ov_trans
+    else:
+        # Subsequent chunk — handle skip + overlap blending.
+        actual_overlap = min(overlap, T_effective)
+        if overlap_dec is not None:
+            actual_overlap = min(actual_overlap, overlap_dec.shape[0])
+
+        if actual_overlap > 0 and overlap_dec is not None:
+            cur_head_dec = _read_decoded_range(skip, actual_overlap)
+            cur_head_trans = _read_transform_range(skip, actual_overlap)
+            blended_dec = _blend_overlapping_frames(
+                overlap_dec, cur_head_dec, actual_overlap,
+            )
+            blended_trans = None
+            if overlap_trans is not None and cur_head_trans is not None:
+                blended_trans = _blend_overlapping_transformed(
+                    overlap_trans, cur_head_trans, actual_overlap,
+                )
+            debug.log(
+                f"Blended {actual_overlap} overlapping frames",
+                category="video", indent_level=1,
+            )
+            pp_func(blended_dec, blended_trans)
+            del blended_dec, blended_trans, cur_head_dec, cur_head_trans
+
+        # Stream the non-overlap remainder.
+        rest_start = skip + actual_overlap
+        rest_end = T_pix
+        if not is_last and overlap > 0:
+            rest_end = T_pix - overlap
+
+        for fs in range(rest_start, rest_end, _STREAM_PP_BATCH):
+            cnt = min(_STREAM_PP_BATCH, rest_end - fs)
+            dec_b = _read_decoded_range(fs, cnt)
+            trans_b = _read_transform_range(fs, cnt)
+            pp_func(dec_b, trans_b)
+            del dec_b, trans_b
+
+        if is_last or overlap == 0:
+            # Stream any remaining tail.
+            if rest_end < T_pix:
+                for fs in range(rest_end, T_pix, _STREAM_PP_BATCH):
+                    cnt = min(_STREAM_PP_BATCH, T_pix - fs)
+                    dec_b = _read_decoded_range(fs, cnt)
+                    trans_b = _read_transform_range(fs, cnt)
+                    pp_func(dec_b, trans_b)
+                    del dec_b, trans_b
+            _cleanup_all()
+            del trans_mm
+            return None, None
+        else:
+            new_ov_dec = _read_decoded_range(T_pix - overlap, overlap)
+            new_ov_trans = _read_transform_range(T_pix - overlap, overlap)
+            _cleanup_all()
+            del trans_mm
+            return new_ov_dec, new_ov_trans
 
 
 # =============================================================================
@@ -688,87 +877,96 @@ def process_video_pix_chunked(
             is_last = (ci == num_chunks - 1) or video_ended_early
             t_pp0 = time.time()
 
-            if ci == 0:
-                # ── First chunk ──
-                if num_chunks == 1:
-                    # Only one chunk — everything is final
-                    _pp(decoded, transformed)
+            # ── Streaming decode path ──
+            # When decoded is a dict, the pixel data is still on disk as
+            # tile memmaps.  Assemble + post-process in temporal batches
+            # of _STREAM_PP_BATCH frames to avoid the 12 GB peak.
+            if isinstance(decoded, dict):
+                decoded, transformed = _streaming_postprocess_chunk(
+                    decoded, ci, num_chunks, is_last, overlap,
+                    extra_skip[ci], overlap_dec, overlap_trans,
+                    color_correction, usm_weight, usm_radius,
+                    usm_threshold, device, _pp, debug,
+                )
+                # _streaming_postprocess_chunk handles blending, _pp calls,
+                # and returns new overlap buffers.
+                if decoded is not None:
+                    overlap_dec = decoded
+                    overlap_trans = transformed
                 else:
-                    # Save everything except the last *overlap* frames
-                    if overlap > 0 and decoded.shape[0] > overlap:
-                        safe_dec = decoded[:-overlap]
-                        safe_trans = transformed[:, :-overlap] if transformed is not None else None
-                        _pp(safe_dec, safe_trans)
-                        overlap_dec = decoded[-overlap:].clone()
-                        overlap_trans = transformed[:, -overlap:].clone() if transformed is not None else None
-                    elif overlap > 0:
-                        # Entire chunk is overlap-sized; hold it all
-                        overlap_dec = decoded.clone()
-                        overlap_trans = transformed.clone() if transformed is not None else None
-                    else:
-                        _pp(decoded, transformed)
-            else:
-                # ── Subsequent chunks ──
-                # For shift-back chunks, discard leading decoded frames that
-                # overlap with already-streamed content from the previous chunk.
-                skip = extra_skip[ci]
-                if skip > 0:
-                    logger.info(
-                        "Shift-back: discarding %d leading decoded frames from chunk %d",
-                        skip, ci + 1,
-                    )
-                    decoded = decoded[skip:]
-                    if transformed is not None:
-                        transformed = transformed[:, skip:]
-
-                actual_overlap = min(overlap, decoded.shape[0])
-                if overlap_dec is not None:
-                    actual_overlap = min(actual_overlap, overlap_dec.shape[0])
-
-                if actual_overlap > 0 and overlap_dec is not None:
-                    blended_dec = _blend_overlapping_frames(
-                        overlap_dec, decoded[:actual_overlap], actual_overlap,
-                    )
-                    blended_trans = None
-                    if overlap_trans is not None and transformed is not None:
-                        blended_trans_raw = _blend_overlapping_transformed(
-                            overlap_trans, transformed[:, :actual_overlap], actual_overlap,
-                        )
-                        blended_trans = blended_trans_raw
-
-                    debug.log(
-                        f"Blended {actual_overlap} overlapping frames",
-                        category="video", indent_level=1,
-                    )
-
-                    _pp(blended_dec, blended_trans)
-                    del blended_dec
-                    if blended_trans is not None:
-                        del blended_trans
-
-                # Non-overlapping remainder of this chunk
-                rest_dec = decoded[actual_overlap:]
-                rest_trans = transformed[:, actual_overlap:] if transformed is not None else None
-
-                if is_last or overlap == 0:
-                    # All remaining frames are final
-                    _pp(rest_dec, rest_trans)
                     overlap_dec = None
                     overlap_trans = None
-                else:
-                    # Hold back the tail for blending with the next chunk
-                    if rest_dec.shape[0] > overlap:
-                        safe_dec = rest_dec[:-overlap]
-                        safe_trans = rest_trans[:, :-overlap] if rest_trans is not None else None
-                        _pp(safe_dec, safe_trans)
-                        overlap_dec = rest_dec[-overlap:].clone()
-                        overlap_trans = rest_trans[:, -overlap:].clone() if rest_trans is not None else None
-                    elif rest_dec.shape[0] > 0:
-                        overlap_dec = rest_dec.clone()
-                        overlap_trans = rest_trans.clone() if rest_trans is not None else None
+            else:
+                # ── Legacy tensor path (non-hybrid) ──
+                if ci == 0:
+                    if num_chunks == 1:
+                        _pp(decoded, transformed)
                     else:
+                        if overlap > 0 and decoded.shape[0] > overlap:
+                            safe_dec = decoded[:-overlap]
+                            safe_trans = transformed[:, :-overlap] if transformed is not None else None
+                            _pp(safe_dec, safe_trans)
+                            overlap_dec = decoded[-overlap:].clone()
+                            overlap_trans = transformed[:, -overlap:].clone() if transformed is not None else None
+                        elif overlap > 0:
+                            overlap_dec = decoded.clone()
+                            overlap_trans = transformed.clone() if transformed is not None else None
+                        else:
+                            _pp(decoded, transformed)
+                else:
+                    skip = extra_skip[ci]
+                    if skip > 0:
+                        logger.info(
+                            "Shift-back: discarding %d leading decoded frames from chunk %d",
+                            skip, ci + 1,
+                        )
+                        decoded = decoded[skip:]
+                        if transformed is not None:
+                            transformed = transformed[:, skip:]
+
+                    actual_overlap = min(overlap, decoded.shape[0])
+                    if overlap_dec is not None:
+                        actual_overlap = min(actual_overlap, overlap_dec.shape[0])
+
+                    if actual_overlap > 0 and overlap_dec is not None:
+                        blended_dec = _blend_overlapping_frames(
+                            overlap_dec, decoded[:actual_overlap], actual_overlap,
+                        )
+                        blended_trans = None
+                        if overlap_trans is not None and transformed is not None:
+                            blended_trans_raw = _blend_overlapping_transformed(
+                                overlap_trans, transformed[:, :actual_overlap], actual_overlap,
+                            )
+                            blended_trans = blended_trans_raw
+                        debug.log(
+                            f"Blended {actual_overlap} overlapping frames",
+                            category="video", indent_level=1,
+                        )
+                        _pp(blended_dec, blended_trans)
+                        del blended_dec
+                        if blended_trans is not None:
+                            del blended_trans
+
+                    rest_dec = decoded[actual_overlap:]
+                    rest_trans = transformed[:, actual_overlap:] if transformed is not None else None
+
+                    if is_last or overlap == 0:
+                        _pp(rest_dec, rest_trans)
                         overlap_dec = None
                         overlap_trans = None
+                    else:
+                        if rest_dec.shape[0] > overlap:
+                            safe_dec = rest_dec[:-overlap]
+                            safe_trans = rest_trans[:, :-overlap] if rest_trans is not None else None
+                            _pp(safe_dec, safe_trans)
+                            overlap_dec = rest_dec[-overlap:].clone()
+                            overlap_trans = rest_trans[:, -overlap:].clone() if rest_trans is not None else None
+                        elif rest_dec.shape[0] > 0:
+                            overlap_dec = rest_dec.clone()
+                            overlap_trans = rest_trans.clone() if rest_trans is not None else None
+                        else:
+                            overlap_dec = None
+                            overlap_trans = None
 
             t_pp1 = time.time()
             total_post_time += t_pp1 - t_pp0

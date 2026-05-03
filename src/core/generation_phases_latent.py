@@ -219,72 +219,85 @@ def encode_whole_video(
     manage_model_device(model=runner.vae, target_device=ctx['vae_device'],
                        model_name="VAE", debug=debug, runner=runner)
     
-    video = images.permute(0, 3, 1, 2)
     transform = ctx['video_transform']
-    video_transformed = transform(video)
-    
-    # Free original pixel-value frames immediately — only the transformed
-    # [-1, 1] version is needed from here on.
-    del images, video
+    T_input = images.shape[0]
+
+    # Determine output spatial dims by transforming a single frame.
+    with torch.no_grad():
+        _probe = transform(images[0:1].permute(0, 3, 1, 2))  # [C,1,H_out,W_out]
+        C_out, _, H_out, W_out = _probe.shape
+        del _probe
+
+    # Temporal padding for 4n+1 constraint
+    T_padded = T_input
+    pad_count = 0
+    if T_input % 4 != 1:
+        T_padded = T_input + (4 - (T_input - 1) % 4)
+        pad_count = T_padded - T_input
+
+    ctx['original_temporal_frames'] = T_input
+
+    # Batch-transform frames (4 at a time) and write directly to a CTHW
+    # memmap.  This avoids the 2x peak from having both the input tensor
+    # and the full transformed tensor in RAM simultaneously.
+    import tempfile as _tmpmod, numpy as np
+    _mm_file = _tmpmod.NamedTemporaryFile(suffix='.dat', delete=False)
+    mm_path = _mm_file.name
+    _mm_file.close()
+    mm_shape = (C_out, T_padded, H_out, W_out)
+    transform_mm = np.memmap(mm_path, dtype=np.float16, mode='w+', shape=mm_shape)
+
+    _TRANSFORM_BATCH = 4
+    for i in range(0, T_input, _TRANSFORM_BATCH):
+        end = min(i + _TRANSFORM_BATCH, T_input)
+        batch = images[i:end].permute(0, 3, 1, 2)  # [B, C, H, W]
+        batch_out = transform(batch).cpu().to(torch.float16)  # [C, B, H_out, W_out]
+        transform_mm[:, i:end, :, :] = batch_out.numpy()
+        del batch, batch_out
+
+    # Mirror-pad trailing frames
+    if pad_count > 0:
+        pad_indices = []
+        for p in range(pad_count):
+            pad_indices.append(T_input - 1 - (p % T_input) if T_input > 1 else 0)
+        for pi, src_idx in enumerate(pad_indices):
+            transform_mm[:, T_input + pi, :, :] = transform_mm[:, src_idx, :, :]
+
+    transform_mm.flush()
+
+    debug.log(f"Transformed shape: {mm_shape} (CTHW fp16)", category="vae")
+    debug.log(f"Batch-transformed to memmap: {mm_path} ({os.path.getsize(mm_path) / 1e9:.2f} GB)",
+              category="memory", force=True)
+
+    # Free input frames — everything is now in the memmap.
+    del images
     if 'input_images' in ctx:
         del ctx['input_images']
     import gc; gc.collect()
 
-    debug.log(f"Transformed shape: {video_transformed.shape}", category="vae")
+    ctx['_transformed_video_memmap'] = {
+        'path': mm_path,
+        'dtype': np.float16,
+        'shape': mm_shape,
+    }
 
-    # Keep exactly ONE fp16 copy: used for VAE encode now and color
-    # correction later. No separate bf16 full-frame cast — tiled_encode
-    # converts each spatial crop to the model dtype per-tile.
-    video_transformed = video_transformed.cpu().to(torch.float16)
-    ctx['transformed_video'] = video_transformed
-
-    # VAE requires temporal dimension to satisfy 4n+1 constraint
-    # video_transformed is CTHW format, temporal_dim=1
-    T_original = video_transformed.shape[1]
-    ctx['original_temporal_frames'] = T_original
-    
-    if T_original % 4 != 1:
-        video_transformed = pad_video_temporal(video_transformed, count=0, temporal_dim=1, prepend=False, debug=debug)
-        T_padded = video_transformed.shape[1]
-        debug.log(f"Padded temporal: {T_original} → {T_padded} frames (4n+1 constraint)", category="vae")
-
-    # Move to VAE device (stays fp16; per-tile dtype cast happens inside
-    # tiled_encode, avoiding a full-frame bf16 copy).
-    video_transformed = manage_tensor(
-        tensor=video_transformed,
-        target_device=ctx['vae_device'],
-        tensor_name="video_for_encode",
-        dtype=None,
-        debug=debug,
-        reason="VAE encoding"
-    )
-
-    # Offload ctx['transformed_video'] to disk BEFORE encoding so that
-    # the streaming encoder doesn't have to compete with the ~1.5 GB
-    # original-frames tensor for physical RAM.
-    if 'transformed_video' in ctx:
-        import tempfile as _enc_tmpmod
-        import numpy as np
-        tv = ctx['transformed_video']
-        tv_shape = tuple(tv.shape)
-        tv_np = tv.numpy()
-        _enc_tmp = _enc_tmpmod.NamedTemporaryFile(suffix='.dat', delete=False)
-        _enc_mm = np.memmap(_enc_tmp.name, dtype=tv_np.dtype, mode='w+',
-                            shape=tv_np.shape)
-        _enc_mm[:] = tv_np
-        _enc_mm.flush()
-        del _enc_mm, tv_np, tv
-        ctx['_transformed_video_memmap'] = {
-            'path': _enc_tmp.name,
-            'dtype': np.float16,
-            'shape': tv_shape,
-        }
-        del ctx['transformed_video']
-        _enc_tmp.close()
-        import gc as _gc; _gc.collect()
-        debug.log(f"Offloaded transformed_video to memmap before encode: "
-                  f"{_enc_tmp.name} (shape={tv_shape})",
-                  category="memory", force=True)
+    _hybrid = getattr(runner, '_hybrid_encode_active', False)
+    if _hybrid:
+        del transform_mm
+        video_transformed = torch.empty(1)
+    else:
+        video_transformed = torch.from_numpy(
+            np.array(transform_mm)
+        ).to(torch.float16)
+        del transform_mm
+        video_transformed = manage_tensor(
+            tensor=video_transformed,
+            target_device=ctx['vae_device'],
+            tensor_name="video_for_encode",
+            dtype=None,
+            debug=debug,
+            reason="VAE encoding"
+        )
 
     if progress_callback:
         progress_callback(0, 1, ctx['total_frames'], "Phase 1: Encoding")

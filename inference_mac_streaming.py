@@ -118,10 +118,10 @@ PIX_OVERLAP = 8
 DIT_TILE_OVERLAP = 0.1
 
 # Hybrid latent-chunk mode: pixel-space outer loop with streaming VAE
-HYBRID_CHUNK_SIZE = 121       # 4*30+1 pixel frames per outer chunk
-HYBRID_OVERLAP = 21           # pixel-space overlap between outer chunks
+HYBRID_CHUNK_SIZE = 33        # 4*8+1 pixel frames per outer chunk
+HYBRID_OVERLAP = 8            # pixel-space overlap between outer chunks
 HYBRID_FIXED_WT = 3           # temporal attention window size for full-latent DiT
-HYBRID_TEMPORAL_ENCODE_SLICE = 17   # pixel frames per streaming encode slice
+HYBRID_TEMPORAL_ENCODE_SLICE = 11   # pixel frames per streaming encode slice
 HYBRID_TEMPORAL_DECODE_SLICE = 5    # latent frames per streaming decode slice
 COLOR_CORRECTION = "wavelet"
 USM_WEIGHT = 0.0
@@ -1258,6 +1258,7 @@ class VideoUpscaler:
             # Re-patch VAE encode to use streaming
             _orig_vae_encode = self.runner.vae_encode
             _orig_vae_decode = self.runner.vae_decode
+            self.runner._hybrid_encode_active = True
             mlx_vae = self.mlx_vae
             scale = self.runner.config.vae.scaling_factor
             shift = self.runner.config.vae.get("shifting_factor", 0.0)
@@ -1267,8 +1268,6 @@ class VideoUpscaler:
                 import mlx.core as _mx
                 runner = self.runner
 
-                # Free DiT IO weights during encode (~0.58 GB MLX Metal) —
-                # mirrors the default mlx_vae_encode path.
                 _dit = getattr(runner, 'dit', None)
                 _dit_io_freed = False
                 if _dit is not None and hasattr(_dit, 'io') and _dit.io is not None:
@@ -1280,10 +1279,25 @@ class VideoUpscaler:
 
                 torch.mps.empty_cache()
 
-                latents = []
-                for idx in range(len(samples)):
-                    sample = samples[idx]
-                    samples[idx] = None  # release original CTHW tensor early
+                # Read directly from the transform memmap (CTHW fp16) written
+                # by encode_whole_video, avoiding a 6 GB contiguous copy.
+                mm_meta = self.ctx.get('_transformed_video_memmap')
+                if mm_meta is not None:
+                    transform_mm = np.memmap(
+                        mm_meta['path'], dtype=mm_meta['dtype'],
+                        mode='r', shape=mm_meta['shape'],
+                    )
+                    latent_np = mlx_vae.tiled_encode_streaming(
+                        transform_mm,
+                        tile_size=HYBRID_VAE_TILE_SIZE,
+                        tile_overlap=HYBRID_VAE_TILE_OVERLAP,
+                        temporal_slice=HYBRID_TEMPORAL_ENCODE_SLICE,
+                        input_layout='CTHW',
+                    )
+                    del transform_mm
+                else:
+                    sample = samples[0]
+                    samples[0] = None
                     frames_torch = sample.permute(1, 2, 3, 0).contiguous().cpu()
                     del sample
                     if frames_torch.dtype != torch.float16:
@@ -1295,24 +1309,23 @@ class VideoUpscaler:
                         temporal_slice=HYBRID_TEMPORAL_ENCODE_SLICE,
                     )
                     del frames_torch
-                    latent_t = torch.from_numpy(latent_np.astype(np.float32)).squeeze(0)
-                    latent_t = (latent_t - shift) * scale
-                    latent_t = latent_t.to(dtype=torch.bfloat16)
-                    latents.append(latent_t)
-                    del latent_np
+
+                latent_t = torch.from_numpy(latent_np.astype(np.float32)).squeeze(0)
+                latent_t = (latent_t - shift) * scale
+                latent_t = latent_t.to(dtype=torch.bfloat16)
+                del latent_np
 
                 mlx_vae.encoder = None
                 gc.collect()
                 _mx.clear_cache()
                 torch.mps.empty_cache()
 
-                # Restore DiT IO weights
                 if _dit_io_freed and _dit is not None:
                     _dit.io = _dit._saved_io
                     del _dit._saved_io
                     _mx.eval(*[v for v in _dit.io.__dict__.values()
                                if isinstance(v, _mx.array)])
-                return latents
+                return [latent_t]
 
             @torch.no_grad()
             def _hybrid_vae_decode(latents):
@@ -1321,7 +1334,6 @@ class VideoUpscaler:
                 for latent in latents:
                     if latent.dim() == 5:
                         latent = latent.squeeze(0)  # [T, H, W, C]
-                    # latent shape: [T_lat, H_lat, W_lat, C]
                     T_lat, lat_H, lat_W = latent.shape[0], latent.shape[1], latent.shape[2]
                     pixel_H, pixel_W = lat_H * 8, lat_W * 8
 
@@ -1337,11 +1349,23 @@ class VideoUpscaler:
                     )
                     del lat_np
 
-                    frames_np = assemble_tiles_from_disk(tile_infos, pixel_H, pixel_W)
-                    cleanup_tile_files(tile_infos)
-                    sample_t = torch.from_numpy(frames_np).permute(3, 0, 1, 2)  # [C, T, H, W]
+                    # Store tile_infos in ctx for streaming post-process
+                    T_pix_full = 1 if T_lat == 1 else (T_lat - 1) * 4 + 1
+                    T_pix = min(T_pix_full,
+                                self.ctx.get('original_temporal_frames', T_pix_full))
+                    true_dims = self.ctx.get('true_target_dims')
+                    if true_dims is not None:
+                        pixel_H = min(pixel_H, true_dims[0])
+                        pixel_W = min(pixel_W, true_dims[1])
+                    self.ctx['_decode_tile_infos'] = tile_infos
+                    self.ctx['_decode_pixel_H'] = pixel_H
+                    self.ctx['_decode_pixel_W'] = pixel_W
+                    self.ctx['_decode_T_pix'] = T_pix
+
+                    sample_t = torch.empty(3, T_pix, pixel_H, pixel_W,
+                                          dtype=torch.float16)
                     samples.append(sample_t)
-                    del frames_np
+
                 mlx_vae.decoder = None
                 gc.collect()
                 _mx.clear_cache()

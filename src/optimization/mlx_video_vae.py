@@ -75,6 +75,16 @@ _BATCHED_MAX_BYTES = int(float(os.environ.get("MLX_VAE_BATCHED_MAX_GB", "0")) * 
 # Default 1 GB: batched at stages 2/3/mid, per-frame at stages 0/1.
 _STREAMING_BATCHED_MAX = int(float(os.environ.get("MLX_VAE_STREAMING_BATCHED_MAX_GB", "1.0")) * 1024**3)
 
+# Threshold for intermediate mx.eval calls in ResNet/DownEncoder/MidBlock.
+# Skip eval when the activation is below this size — lets MLX fuse
+# norm+silu+conv at later stages where tensors are small.
+_EVAL_MIN_BYTES = int(float(os.environ.get("MLX_VAE_EVAL_MIN_MB", "100")) * 1024 * 1024)
+
+
+def _should_eval(x):
+    """Return True if x is large enough to warrant an mx.eval checkpoint."""
+    return x.nbytes >= _EVAL_MIN_BYTES
+
 # Like TRT path empty_cache between tiles: drop MLX buffer pool between spatial
 # tiles (slower). Set MLX_VAE_CLEAR_CACHE_PER_TILE=1 when chasing peak footprint.
 _CLEAR_CACHE_PER_TILE = os.environ.get("MLX_VAE_CLEAR_CACHE_PER_TILE", "0") == "1"
@@ -600,15 +610,15 @@ class ResnetBlock(nn.Module):
 
     def __call__(self, x, low_mem=False, streaming=False):
         h = _silu_gn5d(self.norm1, x)
-        if low_mem: mx.eval(h)
+        if low_mem and _should_eval(h): mx.eval(h)
         h = self.conv1(h, low_mem=low_mem, streaming=streaming)
         h = _silu_gn5d(self.norm2, h)
-        if low_mem: mx.eval(h)
+        if low_mem and _should_eval(h): mx.eval(h)
         h = self.conv2(h, low_mem=low_mem, streaming=streaming)
         if self.has_shortcut:
             x = self.conv_shortcut(x, low_mem=low_mem, streaming=streaming)
         out = x + h
-        if low_mem:
+        if low_mem and _should_eval(out):
             mx.eval(out)
         return out
 
@@ -662,7 +672,7 @@ class MidBlock(nn.Module):
         if _mem_prof_active():
             _mem_seg_reset()
         x = self.resnets[0](x, low_mem=low_mem, streaming=streaming)
-        if low_mem: mx.eval(x)
+        if low_mem and _should_eval(x): mx.eval(x)
         if _mem_prof_active():
             _mem_seg_dump("enc.mid.resnet[0]", x)
 
@@ -674,14 +684,14 @@ class MidBlock(nn.Module):
             _mem_seg_dump("enc.mid.attention", flat)
 
         x = flat.reshape(B, T, H, W, C)
-        if low_mem: mx.eval(x)
+        if low_mem and _should_eval(x): mx.eval(x)
         if _mem_prof_active():
             _mem_seg_dump("enc.mid.after_reshape", x)
 
         if _mem_prof_active():
             _mem_seg_reset()
         x = self.resnets[1](x, low_mem=low_mem, streaming=streaming)
-        if low_mem: mx.eval(x)
+        if low_mem and _should_eval(x): mx.eval(x)
         if _mem_prof_active():
             _mem_seg_dump("enc.mid.resnet[1]", x)
         return x
@@ -754,12 +764,12 @@ class UpDecoderBlock(nn.Module):
     def __call__(self, x, low_mem=False, streaming=False):
         for j, r in enumerate(self.resnets):
             x = r(x, low_mem=low_mem, streaming=streaming)
-            if low_mem: mx.eval(x)
+            if low_mem and _should_eval(x): mx.eval(x)
             if low_mem and _CLEAR_CACHE_BETWEEN_RESNETS and j + 1 < len(self.resnets):
                 mx.clear_cache()
         for u in self.upsamplers:
             x = u(x, low_mem=low_mem, streaming=streaming)
-            if low_mem: mx.eval(x)
+            if low_mem and _should_eval(x): mx.eval(x)
         return x
 
 
@@ -818,12 +828,12 @@ class Decoder(nn.Module):
 
     def __call__(self, z, low_mem=False, streaming=False):
         x = self.conv_in(z, low_mem=low_mem, streaming=streaming)
-        if low_mem: mx.eval(x)
+        if low_mem and _should_eval(x): mx.eval(x)
         x = self.mid_block(x, low_mem=low_mem, streaming=streaming)
         for blk in self.up_blocks:
             x = blk(x, low_mem=low_mem, streaming=streaming)
         x = _silu_gn5d(self.conv_norm_out, x)
-        if low_mem: mx.eval(x)
+        if low_mem and _should_eval(x): mx.eval(x)
         x = self.conv_out(x, low_mem=low_mem, streaming=streaming)
         return x
 
@@ -865,7 +875,7 @@ class DownEncoderBlock(nn.Module):
             if _mem_prof_active() and mem_tag:
                 _mem_seg_reset()
             x = r(x, low_mem=low_mem, streaming=streaming)
-            if low_mem: mx.eval(x)
+            if low_mem and _should_eval(x): mx.eval(x)
             if _mem_prof_active() and mem_tag:
                 _mem_seg_dump(f"{mem_tag}.resnet[{j}]", x)
             if low_mem and _CLEAR_CACHE_BETWEEN_RESNETS and j + 1 < len(self.resnets):
@@ -874,7 +884,7 @@ class DownEncoderBlock(nn.Module):
             if _mem_prof_active() and mem_tag:
                 _mem_seg_reset()
             x = d(x, low_mem=low_mem, streaming=streaming)
-            if low_mem: mx.eval(x)
+            if low_mem and _should_eval(x): mx.eval(x)
             if _mem_prof_active() and mem_tag:
                 _mem_seg_dump(f"{mem_tag}.downsample[{k}]", x)
         return x
@@ -936,7 +946,7 @@ class Encoder(nn.Module):
         if _mem_prof_active():
             _mem_seg_reset()
         x = self.conv_in(x, low_mem=low_mem, streaming=streaming)
-        if low_mem: mx.eval(x)
+        if low_mem and _should_eval(x): mx.eval(x)
         if _mem_prof_active():
             _mem_seg_dump("enc.01_conv_in", x)
 
@@ -956,7 +966,7 @@ class Encoder(nn.Module):
         if _mem_prof_active():
             _mem_seg_reset()
         x = _silu_gn5d(self.conv_norm_out, x)
-        if low_mem: mx.eval(x)
+        if low_mem and _should_eval(x): mx.eval(x)
         if _mem_prof_active():
             _mem_seg_dump("enc.04_conv_norm_silu", x)
 
@@ -1042,6 +1052,20 @@ def _gpu_blend_paste(canvas, weight_canvas, tile, bw_5d, t_slice, h_slice, w_sli
     return canvas, weight_canvas
 
 
+def _read_tile_as_fp16(info, frame_start, frame_count):
+    """Read a temporal sub-range from a tile memmap, returning fp16 [-1,1]."""
+    _tile_dtype = np.dtype(info.get("dtype", "uint8"))
+    mm = np.memmap(info["path"], dtype=_tile_dtype, mode='r',
+                   shape=tuple(info["shape"]))
+    tile_raw = np.array(mm[frame_start:frame_start + frame_count])
+    del mm
+    if _tile_dtype == np.uint8:
+        return tile_raw.astype(np.float16) / np.float16(127.5) - np.float16(1.0)
+    if _tile_dtype == np.uint16:
+        return tile_raw.astype(np.float16) / np.float16(32767.5) - np.float16(1.0)
+    return tile_raw.astype(np.float16)
+
+
 def assemble_tiles_from_disk(tile_infos, pixel_H, pixel_W, num_frames=None):
     """Blend decoded pixel tiles from memmap files into a single output.
 
@@ -1080,10 +1104,7 @@ def assemble_tiles_from_disk(tile_infos, pixel_H, pixel_W, num_frames=None):
 
     t0 = time.perf_counter()
     for info in tile_infos:
-        mm = np.memmap(info["path"], dtype=np.float32, mode='r',
-                       shape=tuple(info["shape"]))
-        tile_data = np.array(mm[:T_pix])
-        del mm
+        tile_data = _read_tile_as_fp16(info, 0, T_pix)
 
         ph, pw = info["pixel_h"], info["pixel_w"]
         bw = _make_blend_weight(tile_H, tile_W, (ov_H, ov_W),
@@ -1097,6 +1118,62 @@ def assemble_tiles_from_disk(tile_infos, pixel_H, pixel_W, num_frames=None):
 
     elapsed = time.perf_counter() - t0
     logger.info(f"Assembled tiles from disk in {elapsed:.1f}s -> {output.shape}")
+    return output
+
+
+def assemble_tiles_from_disk_range(tile_infos, pixel_H, pixel_W,
+                                   frame_start, frame_count):
+    """Blend a temporal sub-range of decoded pixel tiles from memmap files.
+
+    Same spatial blending as ``assemble_tiles_from_disk`` but only reads
+    frames ``[frame_start : frame_start + frame_count]`` from each tile,
+    allowing the caller to process the output in small temporal batches
+    without materialising the full ``[T, H, W, 3]`` tensor.
+
+    Args:
+        tile_infos: list of dicts from ``tiled_decode_streaming``.
+        pixel_H, pixel_W: full output spatial resolution.
+        frame_start: first pixel frame index to read.
+        frame_count: number of pixel frames to read.
+
+    Returns:
+        output: numpy ``[frame_count, H, W, 3]`` float16.
+    """
+    if not tile_infos:
+        raise ValueError("No tile_infos provided")
+
+    info0 = tile_infos[0]
+    tile_H = info0["tile_H"]
+    tile_W = info0["tile_W"]
+    ov_H = info0["ov_H"]
+    ov_W = info0["ov_W"]
+    n_h = info0["n_h"]
+    n_w = info0["n_w"]
+
+    total_wt = np.zeros((pixel_H, pixel_W), dtype=np.float32)
+    for info in tile_infos:
+        bw = _make_blend_weight(tile_H, tile_W, (ov_H, ov_W),
+                                n_h, n_w, info["ti"], info["tj"])
+        total_wt[info["pixel_h"]:info["pixel_h"]+tile_H,
+                 info["pixel_w"]:info["pixel_w"]+tile_W] += bw
+    total_wt = np.maximum(total_wt, 1e-4).astype(np.float16)
+
+    output = np.zeros((frame_count, pixel_H, pixel_W, 3), dtype=np.float16)
+
+    fs, fe = frame_start, frame_start + frame_count
+    for info in tile_infos:
+        tile_data = _read_tile_as_fp16(info, fs, fe - fs)
+
+        ph, pw = info["pixel_h"], info["pixel_w"]
+        bw = _make_blend_weight(tile_H, tile_W, (ov_H, ov_W),
+                                n_h, n_w, info["ti"], info["tj"])
+        norm_bw = (bw / total_wt[ph:ph+tile_H, pw:pw+tile_W]).astype(np.float16)
+        bw4d = norm_bw[None, :, :, None]
+        output[:, ph:ph+tile_H, pw:pw+tile_W, :] += (
+            (tile_data * bw4d).astype(np.float16)
+        )
+        del tile_data
+
     return output
 
 
@@ -1380,26 +1457,27 @@ class MLXVideoVAE:
         frames: Union[np.ndarray, "torch.Tensor"],
         tile_size=480,
         tile_overlap=48,
-        temporal_slice=17,
+        temporal_slice=11,
+        input_layout='THWC',
     ):
         """Encode frames using streaming temporal slices per spatial tile.
 
         Each spatial tile is processed through the encoder in small temporal
-        chunks (default 17 pixel frames), maintaining causal conv caches for
-        continuity.  The per-tile latent slices are concatenated and then
-        blended spatially, producing the same result as ``tiled_encode`` but
-        with bounded peak memory proportional to ``temporal_slice`` instead
-        of the full video length.
-
-        The input frames are written to a temporary memmap file so that
-        only the current tile's temporal slice resides in physical RAM at
-        any time (~17 × tile_H × tile_W × 3 × 2 bytes).
+        chunks, maintaining causal conv caches for continuity.  The per-tile
+        latent slices are concatenated and then blended spatially, producing
+        the same result as ``tiled_encode`` but with bounded peak memory
+        proportional to ``temporal_slice`` instead of the full video length.
 
         Args:
-            frames: ``[T, H, W, 3]`` numpy or PyTorch CPU tensor in [-1, 1].
+            frames: numpy/memmap array or PyTorch CPU tensor in [-1, 1].
+                    Shape ``[T, H, W, 3]`` when ``input_layout='THWC'`` (default),
+                    or ``[C, T, H, W]`` when ``input_layout='CTHW'``.
             tile_size: int or (H, W) pixel tile size.
             tile_overlap: int or (H, W) pixel overlap between tiles.
             temporal_slice: number of pixel frames per streaming chunk.
+            input_layout: ``'THWC'`` or ``'CTHW'``.  When ``'CTHW'`` the input
+                          (typically a memmap) is read directly without copying
+                          to an internal memmap.
 
         Returns:
             latent: numpy ``[1, T_lat, H_lat, W_lat, 16]`` float32 (mean).
@@ -1421,36 +1499,42 @@ class MLXVideoVAE:
         tile_H, tile_W = _as_hw(tile_size)
         ov_H, ov_W = _as_hw(tile_overlap)
 
-        # ── Write input frames to disk-backed memmap ──────────────────────
-        # This avoids pinning the full [T, H, W, 3] video in RAM.  The OS
-        # pages in only the slice currently being encoded (~17 × tile pixels).
-        try:
-            import torch as _torch
-            _is_torch = isinstance(frames, _torch.Tensor)
-        except ImportError:
-            _is_torch = False
+        _cthw_input = (input_layout == 'CTHW')
+        _owned_mm_path = None  # track internal memmap for cleanup
 
-        if _is_torch:
-            frames_cpu = frames.contiguous().cpu()
-            if frames_cpu.dtype == _torch.bfloat16:
-                frames_cpu = frames_cpu.to(_torch.float16)
-            elif frames_cpu.dtype not in (_torch.float16, _torch.float32):
-                frames_cpu = frames_cpu.float()
-            frames_arr = frames_cpu.numpy()
-            del frames_cpu
-        else:
+        if _cthw_input:
             frames_arr = np.asarray(frames)
+            C_in, T, H, W = frames_arr.shape
+            frames_mm = frames_arr  # keep reference; no internal memmap
+            del frames
+        else:
+            try:
+                import torch as _torch
+                _is_torch = isinstance(frames, _torch.Tensor)
+            except ImportError:
+                _is_torch = False
 
-        T, H, W, C_in = frames_arr.shape
-        mm_dtype = frames_arr.dtype  # fp16 or fp32
-        mm_path = _tmpmod.mktemp(prefix="vae_enc_input_", suffix=".dat")
-        frames_mm = np.memmap(mm_path, dtype=mm_dtype, mode='w+',
-                              shape=(T, H, W, C_in))
-        frames_mm[:] = frames_arr
-        frames_mm.flush()
-        del frames_arr, frames  # release the in-RAM copy
-        logger.info("Wrote encoder input to memmap (%s, %.1f MB)",
-                    mm_path, os.path.getsize(mm_path) / 1e6)
+            if _is_torch:
+                frames_cpu = frames.contiguous().cpu()
+                if frames_cpu.dtype == _torch.bfloat16:
+                    frames_cpu = frames_cpu.to(_torch.float16)
+                elif frames_cpu.dtype not in (_torch.float16, _torch.float32):
+                    frames_cpu = frames_cpu.float()
+                frames_arr = frames_cpu.numpy()
+                del frames_cpu
+            else:
+                frames_arr = np.asarray(frames)
+
+            T, H, W, C_in = frames_arr.shape
+            mm_dtype = frames_arr.dtype
+            _owned_mm_path = _tmpmod.mktemp(prefix="vae_enc_input_", suffix=".dat")
+            frames_mm = np.memmap(_owned_mm_path, dtype=mm_dtype, mode='w+',
+                                  shape=(T, H, W, C_in))
+            frames_mm[:] = frames_arr
+            frames_mm.flush()
+            del frames_arr, frames
+            logger.info("Wrote encoder input to memmap (%s, %.1f MB)",
+                        _owned_mm_path, os.path.getsize(_owned_mm_path) / 1e6)
 
         lat_tile_H = tile_H // 8
         lat_tile_W = tile_W // 8
@@ -1504,9 +1588,14 @@ class MLXVideoVAE:
                 tile_latents = []
 
                 for si, (ts, te) in enumerate(t_slices):
-                    slice_np = np.array(
-                        frames_mm[ts:te, hs:hs+tile_H, ws:ws+tile_W, :]
-                    )
+                    if _cthw_input:
+                        cthw_crop = np.array(frames_mm[:, ts:te, hs:hs+tile_H, ws:ws+tile_W])
+                        slice_np = np.transpose(cthw_crop, (1, 2, 3, 0))  # [T_s, H, W, C]
+                        del cthw_crop
+                    else:
+                        slice_np = np.array(
+                            frames_mm[ts:te, hs:hs+tile_H, ws:ws+tile_W, :]
+                        )
                     slice_mx = mx.array(slice_np[np.newaxis]).astype(self.dtype)
                     del slice_np
                     enc_out = self.encoder(slice_mx, low_mem=self.low_mem, streaming=True).astype(mx.float32)
@@ -1536,12 +1625,13 @@ class MLXVideoVAE:
                 tc += 1
                 logger.info(f"  Enc tile {tc}/{n_h*n_w}: {time.perf_counter()-t0:.1f}s")
 
-        # Cleanup memmap
+        # Cleanup internal memmap (only if we created one)
         del frames_mm
-        try:
-            os.remove(mm_path)
-        except OSError:
-            pass
+        if _owned_mm_path is not None:
+            try:
+                os.remove(_owned_mm_path)
+            except OSError:
+                pass
 
         latent = latent / mx.maximum(lat_wt, 1e-8)
         mean = latent[:, :, :, :, :16]
@@ -1561,8 +1651,15 @@ class MLXVideoVAE:
         temporal_slice=5,
         num_frames=None,
         tmp_dir=None,
+        tile_dtype="uint8",
     ):
         """Decode latent using streaming temporal slices, saving tiles to disk.
+
+        Args:
+            tile_dtype: Storage format for decoded pixel tiles on disk.
+                ``"uint8"`` (default) — smallest, fine for 8-bit sources.
+                ``"uint16"`` — preserves 10/12/16-bit source precision.
+                ``"float16"`` — raw VAE output.
 
         Each spatial tile is decoded in small temporal chunks (default 5 latent
         frames) and the full pixel output for that tile is written to a memmap
@@ -1644,7 +1741,7 @@ class MLXVideoVAE:
                     tile_z = mx.array(
                         latent_f32_np[:, ls:le, lh:lh+lat_tile_H, lw:lw+lat_tile_W, :]
                     ).astype(self.dtype)
-                    tile_out = self.decoder(tile_z, low_mem=self.low_mem, streaming=True).astype(mx.float32)
+                    tile_out = self.decoder(tile_z, low_mem=self.low_mem, streaming=True).astype(mx.float16)
                     mx.eval(tile_out)
                     del tile_z
                     tile_np = np.asarray(tile_out)
@@ -1660,15 +1757,21 @@ class MLXVideoVAE:
 
                 mm_path = os.path.join(tmp_dir, f"tile_{ti}_{tj}.dat")
                 actual_shape = full_tile.shape
-                mm = np.memmap(mm_path, dtype=np.float32, mode='w+', shape=actual_shape)
-                mm[:] = full_tile
+                np_dtype = np.dtype(tile_dtype)
+                mm = np.memmap(mm_path, dtype=np_dtype, mode='w+', shape=actual_shape)
+                if tile_dtype == "uint8":
+                    mm[:] = ((full_tile.astype(np.float32) + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
+                elif tile_dtype == "uint16":
+                    mm[:] = ((full_tile.astype(np.float32) + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+                else:
+                    mm[:] = full_tile.astype(np_dtype)
                 mm.flush()
                 del mm, full_tile
 
                 tile_infos.append({
                     "path": mm_path,
                     "shape": actual_shape,
-                    "dtype": "float32",
+                    "dtype": tile_dtype,
                     "pixel_h": ph,
                     "pixel_w": pw,
                     "tile_H": tile_H,
