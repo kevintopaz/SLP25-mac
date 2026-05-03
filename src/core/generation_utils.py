@@ -808,34 +808,40 @@ def ensure_precision_initialized(
         return
     
     try:
-        # Get model dtypes for informational logging
         dit_dtype = None
         vae_dtype = None
-        
-        if runner.dit is not None:
+
+        # Check for MLX models first (actual compute precision)
+        mlx_dit_dtype = getattr(runner, '_mlx_dit_dtype', None)
+        mlx_vae_dtype = getattr(runner, '_mlx_vae_dtype', None)
+
+        if mlx_dit_dtype is not None:
+            dit_dtype = f"mlx.{mlx_dit_dtype}"
+        elif runner.dit is not None:
             try:
-                param_device = next(runner.dit.parameters()).device
-                if param_device.type != 'meta':
-                    dit_dtype = next(runner.dit.parameters()).dtype
+                p = next(runner.dit.parameters())
+                if p.device.type != 'meta':
+                    dit_dtype = str(p.dtype)
             except StopIteration:
                 pass
-        
-        if runner.vae is not None:
+
+        if mlx_vae_dtype is not None:
+            vae_dtype = f"mlx.{mlx_vae_dtype}"
+        elif runner.vae is not None:
             try:
-                param_device = next(runner.vae.parameters()).device
-                if param_device.type != 'meta':
-                    vae_dtype = next(runner.vae.parameters()).dtype
+                p = next(runner.vae.parameters())
+                if p.device.type != 'meta':
+                    vae_dtype = str(p.dtype)
             except StopIteration:
                 pass
-        
-        # Build precision info string
+
         parts = []
         if dit_dtype is not None:
             parts.append(f"DiT={dit_dtype}")
         if vae_dtype is not None:
             parts.append(f"VAE={vae_dtype}")
         parts.append(f"compute={ctx['compute_dtype']}")
-        
+
         if parts:
             debug.log(f"Model precision: {', '.join(parts)}", category="precision")
             

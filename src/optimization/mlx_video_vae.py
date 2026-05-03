@@ -1096,8 +1096,10 @@ def assemble_tiles_from_disk(tile_infos, pixel_H, pixel_W, num_frames=None):
     for info in tile_infos:
         bw = _make_blend_weight(tile_H, tile_W, (ov_H, ov_W),
                                 n_h, n_w, info["ti"], info["tj"])
-        total_wt[info["pixel_h"]:info["pixel_h"]+tile_H,
-                 info["pixel_w"]:info["pixel_w"]+tile_W] += bw
+        ph, pw = info["pixel_h"], info["pixel_w"]
+        clip_h = min(tile_H, pixel_H - ph)
+        clip_w = min(tile_W, pixel_W - pw)
+        total_wt[ph:ph+clip_h, pw:pw+clip_w] += bw[:clip_h, :clip_w]
     total_wt = np.maximum(total_wt, 1e-4).astype(np.float16)
 
     output = np.zeros((T_pix, pixel_H, pixel_W, 3), dtype=np.float16)
@@ -1107,12 +1109,15 @@ def assemble_tiles_from_disk(tile_infos, pixel_H, pixel_W, num_frames=None):
         tile_data = _read_tile_as_fp16(info, 0, T_pix)
 
         ph, pw = info["pixel_h"], info["pixel_w"]
+        clip_h = min(tile_H, pixel_H - ph)
+        clip_w = min(tile_W, pixel_W - pw)
         bw = _make_blend_weight(tile_H, tile_W, (ov_H, ov_W),
                                 n_h, n_w, info["ti"], info["tj"])
-        norm_bw = (bw / total_wt[ph:ph+tile_H, pw:pw+tile_W]).astype(np.float16)
+        bw = bw[:clip_h, :clip_w]
+        norm_bw = (bw / total_wt[ph:ph+clip_h, pw:pw+clip_w]).astype(np.float16)
         bw4d = norm_bw[None, :, :, None]  # [1, H, W, 1]
-        output[:, ph:ph+tile_H, pw:pw+tile_W, :] += (
-            (tile_data * bw4d).astype(np.float16)
+        output[:, ph:ph+clip_h, pw:pw+clip_w, :] += (
+            (tile_data[:, :clip_h, :clip_w, :] * bw4d).astype(np.float16)
         )
         del tile_data
 
@@ -1154,8 +1159,10 @@ def assemble_tiles_from_disk_range(tile_infos, pixel_H, pixel_W,
     for info in tile_infos:
         bw = _make_blend_weight(tile_H, tile_W, (ov_H, ov_W),
                                 n_h, n_w, info["ti"], info["tj"])
-        total_wt[info["pixel_h"]:info["pixel_h"]+tile_H,
-                 info["pixel_w"]:info["pixel_w"]+tile_W] += bw
+        ph, pw = info["pixel_h"], info["pixel_w"]
+        clip_h = min(tile_H, pixel_H - ph)
+        clip_w = min(tile_W, pixel_W - pw)
+        total_wt[ph:ph+clip_h, pw:pw+clip_w] += bw[:clip_h, :clip_w]
     total_wt = np.maximum(total_wt, 1e-4).astype(np.float16)
 
     output = np.zeros((frame_count, pixel_H, pixel_W, 3), dtype=np.float16)
@@ -1165,12 +1172,15 @@ def assemble_tiles_from_disk_range(tile_infos, pixel_H, pixel_W,
         tile_data = _read_tile_as_fp16(info, fs, fe - fs)
 
         ph, pw = info["pixel_h"], info["pixel_w"]
+        clip_h = min(tile_H, pixel_H - ph)
+        clip_w = min(tile_W, pixel_W - pw)
         bw = _make_blend_weight(tile_H, tile_W, (ov_H, ov_W),
                                 n_h, n_w, info["ti"], info["tj"])
-        norm_bw = (bw / total_wt[ph:ph+tile_H, pw:pw+tile_W]).astype(np.float16)
+        bw = bw[:clip_h, :clip_w]
+        norm_bw = (bw / total_wt[ph:ph+clip_h, pw:pw+clip_w]).astype(np.float16)
         bw4d = norm_bw[None, :, :, None]
-        output[:, ph:ph+tile_H, pw:pw+tile_W, :] += (
-            (tile_data * bw4d).astype(np.float16)
+        output[:, ph:ph+clip_h, pw:pw+clip_w, :] += (
+            (tile_data[:, :clip_h, :clip_w, :] * bw4d).astype(np.float16)
         )
         del tile_data
 
@@ -1404,13 +1414,11 @@ class MLXVideoVAE:
                 ph, pw = lh * 8, lw * 8
                 bw = _make_blend_weight(tile_H, tile_W,
                                         (ov_H, ov_W), n_h, n_w, ti, tj)
-                total_wt[ph:ph+tile_H, pw:pw+tile_W] += bw
+                clip_h = min(tile_H, pixel_H - ph)
+                clip_w = min(tile_W, pixel_W - pw)
+                total_wt[ph:ph+clip_h, pw:pw+clip_w] += bw[:clip_h, :clip_w]
         total_wt = np.maximum(total_wt, 1e-4).astype(np.float16)
 
-        # Output canvas lives in numpy (libc heap), not MLX — pageable under
-        # memory pressure, and keeps MLX's cache_limit budget free for conv
-        # workspaces.  Each tile's blend weight is pre-normalized by total_wt
-        # so we accumulate directly into the final result (no separate out_wt).
         output = np.zeros((1, T_out, pixel_H, pixel_W, 3), dtype=np.float16)
 
         t0 = time.perf_counter()
@@ -1426,15 +1434,16 @@ class MLXVideoVAE:
                 mx.eval(tile_out)
 
                 ph, pw = lh * 8, lw * 8
+                clip_h = min(tile_H, pixel_H - ph)
+                clip_w = min(tile_W, pixel_W - pw)
                 bw = _make_blend_weight(tile_H, tile_W,
                                         (ov_H, ov_W), n_h, n_w, ti, tj)
                 tile_np = np.asarray(tile_out)
                 del tile_out
-                # Normalize blend weight by precomputed total, then accumulate.
-                norm_bw = (bw / total_wt[ph:ph+tile_H, pw:pw+tile_W]).astype(np.float16)
+                norm_bw = (bw[:clip_h, :clip_w] / total_wt[ph:ph+clip_h, pw:pw+clip_w]).astype(np.float16)
                 bw5d = norm_bw[None, None, :, :, None]
-                output[:, :, ph:ph+tile_H, pw:pw+tile_W, :] += (
-                    (tile_np * bw5d).astype(np.float16)
+                output[:, :, ph:ph+clip_h, pw:pw+clip_w, :] += (
+                    (tile_np[:, :, :clip_h, :clip_w, :] * bw5d).astype(np.float16)
                 )
                 del tile_np
                 tc += 1

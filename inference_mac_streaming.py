@@ -118,8 +118,8 @@ PIX_OVERLAP = 8
 DIT_TILE_OVERLAP = 0.1
 
 # Hybrid latent-chunk mode: pixel-space outer loop with streaming VAE
-HYBRID_CHUNK_SIZE = 33        # 4*8+1 pixel frames per outer chunk
-HYBRID_OVERLAP = 8            # pixel-space overlap between outer chunks
+HYBRID_CHUNK_SIZE = 121        
+HYBRID_OVERLAP = 21            # pixel-space overlap between outer chunks
 HYBRID_FIXED_WT = 3           # temporal attention window size for full-latent DiT
 HYBRID_TEMPORAL_ENCODE_SLICE = 11   # pixel frames per streaming encode slice
 HYBRID_TEMPORAL_DECODE_SLICE = 5    # latent frames per streaming decode slice
@@ -1005,6 +1005,11 @@ class VideoUpscaler:
             del self.runner.dit
             gc.collect()
         self.runner.dit = wrapped_dit
+
+        # Expose actual MLX dtypes so precision logging is accurate
+        if use_mlx_dit:
+            self.runner._mlx_dit_dtype = mlx_dtype
+        self.runner._mlx_vae_dtype = str(self.mlx_vae.dtype).replace("mlx.core.", "")
 
         if device == "mps":
             torch.mps.synchronize()
