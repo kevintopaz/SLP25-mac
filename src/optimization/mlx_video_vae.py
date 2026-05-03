@@ -1468,6 +1468,7 @@ class MLXVideoVAE:
         tile_overlap=48,
         temporal_slice=11,
         input_layout='THWC',
+        pixel_scale: float = 0.0,
     ):
         """Encode frames using streaming temporal slices per spatial tile.
 
@@ -1478,15 +1479,18 @@ class MLXVideoVAE:
         proportional to ``temporal_slice`` instead of the full video length.
 
         Args:
-            frames: numpy/memmap array or PyTorch CPU tensor in [-1, 1].
-                    Shape ``[T, H, W, 3]`` when ``input_layout='THWC'`` (default),
+            frames: numpy/memmap array or PyTorch CPU tensor.
+                    When ``pixel_scale > 0`` the data is uint8/uint16 in
+                    [0, scale] and will be normalised to [-1, 1] on-the-fly.
+                    Otherwise expected in [-1, 1] float.
+                    Shape ``[T, H, W, C]`` when ``input_layout='THWC'``,
                     or ``[C, T, H, W]`` when ``input_layout='CTHW'``.
             tile_size: int or (H, W) pixel tile size.
             tile_overlap: int or (H, W) pixel overlap between tiles.
             temporal_slice: number of pixel frames per streaming chunk.
-            input_layout: ``'THWC'`` or ``'CTHW'``.  When ``'CTHW'`` the input
-                          (typically a memmap) is read directly without copying
-                          to an internal memmap.
+            input_layout: ``'THWC'`` or ``'CTHW'``.
+            pixel_scale: if > 0, pixel values are divided by this and
+                         mapped from [0,1] to [-1,1].
 
         Returns:
             latent: numpy ``[1, T_lat, H_lat, W_lat, 16]`` float32 (mean).
@@ -1509,12 +1513,19 @@ class MLXVideoVAE:
         ov_H, ov_W = _as_hw(tile_overlap)
 
         _cthw_input = (input_layout == 'CTHW')
+        _thwc_input = (input_layout == 'THWC')
+        _need_normalize = (pixel_scale > 0)
         _owned_mm_path = None  # track internal memmap for cleanup
 
-        if _cthw_input:
+        if _cthw_input and not _need_normalize:
             frames_arr = np.asarray(frames)
             C_in, T, H, W = frames_arr.shape
-            frames_mm = frames_arr  # keep reference; no internal memmap
+            frames_mm = frames_arr
+            del frames
+        elif _thwc_input:
+            frames_arr = np.asarray(frames)
+            T, H, W, C_in = frames_arr.shape
+            frames_mm = frames_arr
             del frames
         else:
             try:
@@ -1544,6 +1555,7 @@ class MLXVideoVAE:
             del frames_arr, frames
             logger.info("Wrote encoder input to memmap (%s, %.1f MB)",
                         _owned_mm_path, os.path.getsize(_owned_mm_path) / 1e6)
+            _thwc_input = True
 
         lat_tile_H = tile_H // 8
         lat_tile_W = tile_W // 8
@@ -1597,14 +1609,20 @@ class MLXVideoVAE:
                 tile_latents = []
 
                 for si, (ts, te) in enumerate(t_slices):
-                    if _cthw_input:
+                    if _cthw_input and not _need_normalize:
                         cthw_crop = np.array(frames_mm[:, ts:te, hs:hs+tile_H, ws:ws+tile_W])
                         slice_np = np.transpose(cthw_crop, (1, 2, 3, 0))  # [T_s, H, W, C]
                         del cthw_crop
                     else:
                         slice_np = np.array(
                             frames_mm[ts:te, hs:hs+tile_H, ws:ws+tile_W, :]
-                        )
+                        )  # [T_s, tile_H, tile_W, C]
+
+                    if _need_normalize:
+                        slice_f = slice_np.astype(np.float32) / pixel_scale
+                        slice_np = (slice_f * 2.0 - 1.0).astype(np.float16)
+                        del slice_f
+
                     slice_mx = mx.array(slice_np[np.newaxis]).astype(self.dtype)
                     del slice_np
                     enc_out = self.encoder(slice_mx, low_mem=self.low_mem, streaming=True).astype(mx.float32)

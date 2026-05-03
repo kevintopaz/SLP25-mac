@@ -158,7 +158,8 @@ _TOTAL_RAM_GB = _system_ram_gb()
 # Hybrid mode uses smaller VAE tiles than the non-streaming path because
 # conv caches from streaming accumulate across all temporal slices and stay
 # alive alongside the current slice's stage-0 activations.
-HYBRID_VAE_TILE_SIZE = (720, 720) if _TOTAL_RAM_GB >= 24 else (480, 320)
+#HYBRID_VAE_TILE_SIZE = (720, 720) if _TOTAL_RAM_GB >= 24 else (480, 320)
+HYBRID_VAE_TILE_SIZE = (640, 640) 
 HYBRID_VAE_TILE_OVERLAP = (64, 64) if _TOTAL_RAM_GB >= 24 else (48, 32)
 
 
@@ -1284,8 +1285,8 @@ class VideoUpscaler:
 
                 torch.mps.empty_cache()
 
-                # Read directly from the transform memmap (CTHW fp16) written
-                # by encode_whole_video, avoiding a 6 GB contiguous copy.
+                # Read directly from the transform memmap (THWC uint8/uint16)
+                # written by encode_whole_video; encoder normalises on-the-fly.
                 mm_meta = self.ctx.get('_transformed_video_memmap')
                 if mm_meta is not None:
                     transform_mm = np.memmap(
@@ -1297,7 +1298,8 @@ class VideoUpscaler:
                         tile_size=HYBRID_VAE_TILE_SIZE,
                         tile_overlap=HYBRID_VAE_TILE_OVERLAP,
                         temporal_slice=HYBRID_TEMPORAL_ENCODE_SLICE,
-                        input_layout='CTHW',
+                        input_layout=mm_meta.get('layout', 'THWC'),
+                        pixel_scale=mm_meta.get('scale', 255.0),
                     )
                     del transform_mm
                 else:

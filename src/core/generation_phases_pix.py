@@ -281,8 +281,17 @@ def process_pix_chunk(
         import numpy as np, os
         mm = np.memmap(_mm_meta['path'], dtype=_mm_meta['dtype'],
                        mode='r', shape=_mm_meta['shape'])
-        ctx['transformed_video'] = torch.from_numpy(np.array(mm))
+        raw = np.array(mm)
         del mm
+        _mm_layout = _mm_meta.get('layout', 'CTHW')
+        _mm_scale = _mm_meta.get('scale', 0.0)
+        if _mm_scale > 0:
+            raw = raw.astype(np.float32) / _mm_scale
+            raw = (raw * 2.0 - 1.0).astype(np.float16)
+        if _mm_layout == 'THWC':
+            raw = np.transpose(raw, (3, 0, 1, 2))  # THWC → CTHW
+        ctx['transformed_video'] = torch.from_numpy(raw)
+        del raw
         trim = ctx.pop('_transformed_video_trim', None)
         if trim is not None:
             ctx['transformed_video'] = ctx['transformed_video'][:, :, :trim[0], :trim[1]]
@@ -499,12 +508,24 @@ def _streaming_postprocess_chunk(
         )
         return torch.from_numpy(dec_np)  # [count, H, W, 3] fp16
 
+    _trans_layout = (transform_mm_meta or {}).get('layout', 'CTHW')
+    _trans_scale = (transform_mm_meta or {}).get('scale', 0.0)
+
     def _read_transform_range(start, count):
         """Read colour-correction reference for frames [start : start+count]."""
         if trans_mm is None:
             return None
-        count = min(count, trans_mm.shape[1] - start)
-        chunk = np.array(trans_mm[:, start:start + count, :, :])
+        if _trans_layout == 'THWC':
+            count = min(count, trans_mm.shape[0] - start)
+            chunk = np.array(trans_mm[start:start + count, :, :, :])  # [T, H, W, C]
+            if _trans_scale > 0:
+                chunk = chunk.astype(np.float32) / _trans_scale
+                chunk = (chunk * 2.0 - 1.0).astype(np.float16)
+            # THWC → CTHW
+            chunk = np.transpose(chunk, (3, 0, 1, 2))
+        else:
+            count = min(count, trans_mm.shape[1] - start)
+            chunk = np.array(trans_mm[:, start:start + count, :, :])
         t = torch.from_numpy(chunk)
         if transform_trim is not None:
             t = t[:, :, :transform_trim[0], :transform_trim[1]]

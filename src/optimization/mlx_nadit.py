@@ -1330,7 +1330,6 @@ class MLXNaDiT(torch_nn.Module):
         if torch.backends.mps.is_available():
             torch.mps.empty_cache()
         mx.clear_cache()
-        mx.set_cache_limit(4 * 1024**3)
 
         vid_mx = _t_to_mx(vid, dtype=self.dtype)
         txt_mx = _t_to_mx(txt, dtype=self.dtype)
@@ -1377,7 +1376,6 @@ class MLXNaDiT(torch_nn.Module):
         if torch.backends.mps.is_available():
             torch.mps.empty_cache()
         mx.clear_cache()
-        mx.set_cache_limit(4 * 1024**3)
 
         # Convert inputs to MLX
         tile_vids_mx = [_t_to_mx(v, dtype=self.dtype) for v in tile_vids]

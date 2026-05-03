@@ -15,6 +15,7 @@ from typing import Dict, Any, Optional, Callable, Tuple, List
 
 from .generation_utils import (
     setup_video_transform,
+    prepare_video_pixel_transform,
     load_text_embeddings,
     script_directory,
     ensure_precision_initialized,
@@ -237,35 +238,47 @@ def encode_whole_video(
 
     ctx['original_temporal_frames'] = T_input
 
-    # Batch-transform frames (4 at a time) and write directly to a CTHW
-    # memmap.  This avoids the 2x peak from having both the input tensor
-    # and the full transformed tensor in RAM simultaneously.
+    # Store as uint8 (8-bit source) or uint16 (>8-bit source) to halve
+    # memmap size vs fp16.  Normalize on-the-fly when reading.
     import tempfile as _tmpmod, numpy as np
+
+    # Detect source bit depth from input tensor value range
+    _sample_vals = images[0].float()
+    _is_high_bit = bool((_sample_vals * 255.0).frac().abs().max() > 0.01)
+    mm_pixel_dtype = np.uint16 if _is_high_bit else np.uint8
+    del _sample_vals
+
+    pix_transform = prepare_video_pixel_transform(resolution, max_resolution)
+
     _mm_file = _tmpmod.NamedTemporaryFile(suffix='.dat', delete=False)
     mm_path = _mm_file.name
     _mm_file.close()
-    mm_shape = (C_out, T_padded, H_out, W_out)
-    transform_mm = np.memmap(mm_path, dtype=np.float16, mode='w+', shape=mm_shape)
+    # Store as THWC to avoid the permute and match natural pixel layout
+    mm_shape = (T_padded, H_out, W_out, C_out)
+    transform_mm = np.memmap(mm_path, dtype=mm_pixel_dtype, mode='w+', shape=mm_shape)
 
     _TRANSFORM_BATCH = 4
+    _scale = 255.0 if mm_pixel_dtype == np.uint8 else 65535.0
     for i in range(0, T_input, _TRANSFORM_BATCH):
         end = min(i + _TRANSFORM_BATCH, T_input)
         batch = images[i:end].permute(0, 3, 1, 2)  # [B, C, H, W]
-        batch_out = transform(batch).cpu().to(torch.float16)  # [C, B, H_out, W_out]
-        transform_mm[:, i:end, :, :] = batch_out.numpy()
-        del batch, batch_out
+        batch_out = pix_transform(batch).cpu().float()  # [B, C, H_out, W_out] in [0,1]
+        # BCHW → BHWC for THWC memmap
+        batch_hwc = batch_out.permute(0, 2, 3, 1)
+        batch_int = (batch_hwc * _scale).clamp(0, _scale).numpy().astype(mm_pixel_dtype)
+        transform_mm[i:end, :, :, :] = batch_int
+        del batch, batch_out, batch_hwc, batch_int
 
     # Mirror-pad trailing frames
     if pad_count > 0:
-        pad_indices = []
         for p in range(pad_count):
-            pad_indices.append(T_input - 1 - (p % T_input) if T_input > 1 else 0)
-        for pi, src_idx in enumerate(pad_indices):
-            transform_mm[:, T_input + pi, :, :] = transform_mm[:, src_idx, :, :]
+            src_idx = T_input - 1 - (p % T_input) if T_input > 1 else 0
+            transform_mm[T_input + p, :, :, :] = transform_mm[src_idx, :, :, :]
 
     transform_mm.flush()
 
-    debug.log(f"Transformed shape: {mm_shape} (CTHW fp16)", category="vae")
+    _dtype_tag = "uint8" if mm_pixel_dtype == np.uint8 else "uint16"
+    debug.log(f"Transformed shape: {mm_shape} (THWC {_dtype_tag})", category="vae")
     debug.log(f"Batch-transformed to memmap: {mm_path} ({os.path.getsize(mm_path) / 1e9:.2f} GB)",
               category="memory", force=True)
 
@@ -277,8 +290,10 @@ def encode_whole_video(
 
     ctx['_transformed_video_memmap'] = {
         'path': mm_path,
-        'dtype': np.float16,
+        'dtype': mm_pixel_dtype,
         'shape': mm_shape,
+        'layout': 'THWC',
+        'scale': float(_scale),
     }
 
     _hybrid = getattr(runner, '_hybrid_encode_active', False)
@@ -286,10 +301,13 @@ def encode_whole_video(
         del transform_mm
         video_transformed = torch.empty(1)
     else:
-        video_transformed = torch.from_numpy(
-            np.array(transform_mm)
-        ).to(torch.float16)
-        del transform_mm
+        # Legacy non-hybrid path: read memmap, normalize, convert to CTHW fp16
+        mm_f32 = np.array(transform_mm).astype(np.float32) / _scale
+        mm_norm = mm_f32 * 2.0 - 1.0  # [0,1] → [-1,1]
+        # THWC → CTHW
+        mm_cthw = np.transpose(mm_norm, (3, 0, 1, 2))
+        video_transformed = torch.from_numpy(mm_cthw).to(torch.float16)
+        del transform_mm, mm_f32, mm_norm, mm_cthw
         video_transformed = manage_tensor(
             tensor=video_transformed,
             target_device=ctx['vae_device'],
@@ -947,8 +965,17 @@ def postprocess_latent_output(
         if color_correction != "none" and 'transformed_video' not in ctx:
             mm = np.memmap(_mm_meta['path'], dtype=_mm_meta['dtype'],
                            mode='r', shape=_mm_meta['shape'])
-            tv = torch.from_numpy(np.array(mm))
+            raw = np.array(mm)
             del mm
+            _mm_layout = _mm_meta.get('layout', 'CTHW')
+            _mm_scale = _mm_meta.get('scale', 0.0)
+            if _mm_scale > 0:
+                raw = raw.astype(np.float32) / _mm_scale
+                raw = (raw * 2.0 - 1.0).astype(np.float16)
+            if _mm_layout == 'THWC':
+                raw = np.transpose(raw, (3, 0, 1, 2))  # THWC → CTHW
+            tv = torch.from_numpy(raw)
+            del raw
             trim = ctx.pop('_transformed_video_trim', None)
             if trim is not None:
                 tv = tv[:, :, :trim[0], :trim[1]]

@@ -81,7 +81,6 @@ def prepare_video_transforms(resolution: int, max_resolution: int = 0, debug: Op
         NaResize(
             resolution=resolution,
             mode="side",
-            # Upsample image, model only trained for high res
             downsample_only=False,
             max_resolution=max_resolution,
         ),
@@ -89,6 +88,25 @@ def prepare_video_transforms(resolution: int, max_resolution: int = 0, debug: Op
         DivisiblePad((16, 16)),
         Normalize(0.5, 0.5),
         Lambda(lambda x: x.permute(1, 0, 2, 3)),  # t c h w -> c t h w (faster than Rearrange)
+    ])
+
+
+def prepare_video_pixel_transform(resolution: int, max_resolution: int = 0,
+                                   debug: Optional['Debug'] = None):
+    """Pre-normalize transform: resize + clamp + pad.
+
+    Returns [T, C, H, W] in [0, 1] (no Normalize, no CTHW permute).
+    Used to write the transform memmap as uint8/uint16 instead of fp16.
+    """
+    return Compose([
+        NaResize(
+            resolution=resolution,
+            mode="side",
+            downsample_only=False,
+            max_resolution=max_resolution,
+        ),
+        Lambda(lambda x: torch.clamp(x, 0.0, 1.0)),
+        DivisiblePad((16, 16)),
     ])
 
 
