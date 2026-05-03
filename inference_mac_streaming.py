@@ -121,6 +121,8 @@ DIT_TILE_OVERLAP = 0.1
 HYBRID_CHUNK_SIZE = 121        
 HYBRID_OVERLAP = 21            # pixel-space overlap between outer chunks
 HYBRID_FIXED_WT = 3           # temporal attention window size for full-latent DiT
+DIT_LATENT_CHUNK = 0          # latent frames per DiT temporal chunk (0 = all at once)
+DIT_LATENT_OVERLAP = 0        # overlap in latent frames between DiT chunks
 HYBRID_TEMPORAL_ENCODE_SLICE = 11   # pixel frames per streaming encode slice
 HYBRID_TEMPORAL_DECODE_SLICE = 5    # latent frames per streaming decode slice
 COLOR_CORRECTION = "wavelet"
@@ -1095,18 +1097,16 @@ class VideoUpscaler:
         def mlx_vae_decode(latents):
             """MLX VAE decode: List[THWC latent] -> List[CTHW tensor]."""
             import mlx.core as mx
-            # Mirror the encode-path setup: drop DiT IO weights and flush both
-            # allocator pools BEFORE the decoder peak ResNets allocate. Without
-            # this, torch.mps + MLX caches retain DiT activations across the
-            # handoff (~several GB on top of the decoder's transient working
-            # set), which is what made 480x480 tiles peak at ~13 GB.
+            # Free DiT IO weights and flush stale DiT activation buffers from
+            # the MLX Metal cache before decode.  With streaming DiT the block
+            # weights are tiny (~0.4 GB), but the Metal cache can hold several
+            # GB of stale activation buffers from the DiT forward pass.
             _dit = getattr(runner, 'dit', None)
             _dit_io_freed = False
             if _dit is not None and hasattr(_dit, 'io'):
                 _dit._saved_io = _dit.io
                 _dit.io = None
                 _dit_io_freed = True
-                logger.debug("Freed DiT IO weights for VAE decode")
             gc.collect()
             mx.clear_cache()
             torch.mps.empty_cache()
@@ -1116,10 +1116,8 @@ class VideoUpscaler:
                 if latent.dim() == 5:
                     latent = latent.squeeze(0)  # [T, H, W, C]
 
-                # Undo scaling
                 lat_unscaled = latent.float() / scale + shift  # [T, H, W, 16]
                 lat_np = lat_unscaled.cpu().numpy()[np.newaxis]  # [1, T, H, W, 16]
-                # Latent now lives in numpy/host; release the MPS-side copy.
                 del lat_unscaled, latent
 
                 frames_np = mlx_vae.tiled_decode(
@@ -1127,29 +1125,23 @@ class VideoUpscaler:
                     tile_size=VAE_DECODE_TILE_SIZE,
                     tile_overlap=VAE_DECODE_TILE_OVERLAP,
                 )
-                # frames_np: [T_out, H, W, 3] in [-1, 1]
                 sample_t = torch.from_numpy(frames_np)
-                # Convert to CTHW
                 sample_t = sample_t.permute(3, 0, 1, 2)  # [C, T, H, W]
                 samples.append(sample_t)
                 del lat_np, frames_np
                 debug.log(f"MLX Decode: {list(sample_t.shape)}", category="vae")
 
-            # Full cleanup after decode
             mlx_vae.decoder = None
             gc.collect()
             mx.clear_cache()
             torch.mps.empty_cache()
-            logger.debug("Freed VAE decoder weights + caches after decode")
 
-            # Restore DiT IO weights for the next chunk's DiT pass.
             if _dit_io_freed and _dit is not None:
                 _dit.io = _dit._saved_io
                 del _dit._saved_io
                 if hasattr(_dit.io, '__dict__'):
                     mx.eval(*[v for v in _dit.io.__dict__.values()
                               if isinstance(v, mx.array)])
-                logger.debug("Restored DiT IO weights after VAE decode")
             return samples
 
         runner.vae_encode = mlx_vae_encode
@@ -1338,6 +1330,18 @@ class VideoUpscaler:
             @torch.no_grad()
             def _hybrid_vae_decode(latents):
                 import mlx.core as _mx
+                # Flush stale DiT activation buffers from the MLX Metal cache.
+                _dit = getattr(self.runner, 'dit', None)
+                _dit_io_freed = False
+                if _dit is not None and hasattr(_dit, 'io') and _dit.io is not None:
+                    _dit._saved_io = _dit.io
+                    _dit.io = None
+                    _dit_io_freed = True
+                gc.collect()
+                _mx.clear_cache()
+                if torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+
                 samples = []
                 for latent in latents:
                     if latent.dim() == 5:
@@ -1357,7 +1361,6 @@ class VideoUpscaler:
                     )
                     del lat_np
 
-                    # Store tile_infos in ctx for streaming post-process
                     T_pix_full = 1 if T_lat == 1 else (T_lat - 1) * 4 + 1
                     T_pix = min(T_pix_full,
                                 self.ctx.get('original_temporal_frames', T_pix_full))
@@ -1377,6 +1380,12 @@ class VideoUpscaler:
                 mlx_vae.decoder = None
                 gc.collect()
                 _mx.clear_cache()
+
+                if _dit_io_freed and _dit is not None:
+                    _dit.io = _dit._saved_io
+                    del _dit._saved_io
+                    _mx.eval(*[v for v in _dit.io.__dict__.values()
+                               if isinstance(v, _mx.array)])
                 return samples
 
             self.runner.vae_encode = _hybrid_vae_encode
@@ -1391,6 +1400,9 @@ class VideoUpscaler:
             _chunk_size = PIX_CHUNK_SIZE
             _overlap = PIX_OVERLAP
             _shift_back = True
+
+        self.ctx['_dit_latent_chunk'] = DIT_LATENT_CHUNK
+        self.ctx['_dit_latent_overlap'] = DIT_LATENT_OVERLAP
 
         try:
             _, timings = process_video_pix_chunked(

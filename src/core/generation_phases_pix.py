@@ -42,6 +42,7 @@ _CTX_PERSISTENT_KEYS = frozenset({
     'dit_device', 'vae_device', 'dit_offload_device',
     'vae_offload_device', 'tensor_offload_device',
     'compute_dtype', 'cache_context', 'text_embeds',
+    '_dit_latent_chunk', '_dit_latent_overlap',
 })
 
 
@@ -214,12 +215,14 @@ def process_pix_chunk(
     elif torch.backends.mps.is_available():
         torch.mps.empty_cache()
 
-    # Phase 2 -- DiT Upscale  (chunk_size=0 -> process full latent in one shot)
+    # Phase 2 -- DiT Upscale
     # cache_model=True keeps runner.dit alive for subsequent chunks
+    _dit_chunk = ctx.get('_dit_latent_chunk', 0)
+    _dit_ov = ctx.get('_dit_latent_overlap', 0)
     t_dit_start = time.time()
     ctx = upscale_latent_chunked(
         runner, ctx, debug,
-        chunk_size=0, overlap=0,
+        chunk_size=_dit_chunk, overlap=_dit_ov,
         seed=seed,
         latent_noise_scale=latent_noise_scale,
         shared_noise=shared_noise,
@@ -861,6 +864,8 @@ def process_video_pix_chunked(
                 ci + 1, num_chunks, ws, we, chunk_len,
             )
 
+            is_last = (ci == num_chunks - 1) or video_ended_early
+
             t0 = time.time()
             decoded, transformed, chunk_timings = process_pix_chunk(
                 runner, ctx, chunk_input, debug,
@@ -883,8 +888,6 @@ def process_video_pix_chunked(
                 chunk_timings["encode"], chunk_timings["dit"], chunk_timings["decode"],
                 chunk_timings["vram_encode"], chunk_timings["vram_dit"], chunk_timings["vram_decode"],
             )
-
-            is_last = (ci == num_chunks - 1) or video_ended_early
             t_pp0 = time.time()
 
             # ── Streaming decode path ──

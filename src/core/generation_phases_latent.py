@@ -445,7 +445,10 @@ def upscale_latent_chunked(
     manage_model_device(model=runner.dit, target_device=ctx['dit_device'],
                        model_name="DiT", debug=debug, runner=runner)
     
-    # Calculate temporal chunks
+    # Calculate temporal chunks with adaptive last-chunk shift-back.
+    # If the naive last chunk would be shorter than chunk_size, shift its
+    # start backwards so it is exactly chunk_size frames, enlarging the
+    # overlap with the previous chunk instead of producing a runt.
     if chunk_size <= 0 or chunk_size >= T:
         chunks = [(0, T)]
     else:
@@ -454,13 +457,23 @@ def upscale_latent_chunked(
         start = 0
         while start < T:
             end = min(start + chunk_size, T)
+            # Adaptive: if the remainder is too short, shift back
+            if end - start < chunk_size and start > 0:
+                start = max(0, T - chunk_size)
+                end = T
             chunks.append((start, end))
             if end >= T:
                 break
             start += stride
+        # Deduplicate if shift-back produced the same window as the previous
+        if len(chunks) >= 2 and chunks[-1] == chunks[-2]:
+            chunks.pop()
     
     num_chunks = len(chunks)
-    debug.log(f"Processing {num_chunks} temporal chunks", category="dit", force=True)
+    chunk_desc = ", ".join(f"[{s}:{e}]" for s, e in chunks)
+    debug.log(f"DiT temporal chunking: {num_chunks} chunks  {chunk_desc}  "
+              f"(chunk_size={chunk_size}, overlap={overlap}, T={T})",
+              category="dit", force=True)
     
     accum_device = ctx.get('tensor_offload_device') or latent.device
     result = torch.zeros((T, H, W, C), device=accum_device, dtype=latent.dtype)
@@ -558,25 +571,32 @@ def upscale_latent_chunked(
         if accum_device != upscaled_chunk.device:
             upscaled_chunk = upscaled_chunk.to(accum_device)
         
-        # Create temporal weight with sin/cos ramps at chunk boundaries
+        # Compute actual overlaps with adjacent chunks (may differ from
+        # nominal `overlap` when the last chunk was shifted back).
         chunk_len = end - start
+        if chunk_idx > 0:
+            prev_end = chunks[chunk_idx - 1][1]
+            actual_ov_start = max(0, prev_end - start)
+        else:
+            actual_ov_start = 0
+        if chunk_idx < num_chunks - 1:
+            next_start = chunks[chunk_idx + 1][0]
+            actual_ov_end = max(0, end - next_start)
+        else:
+            actual_ov_end = 0
+
         temporal_weight = torch.ones(chunk_len, device=accum_device, dtype=latent.dtype)
         
-        # Apply sin ramp at start (if not first chunk) - ramps from 0 to 1
-        if start > 0 and overlap > 0:
-            ramp_len = min(overlap, chunk_len)
-            t = torch.linspace(0, math.pi / 2, ramp_len, device=accum_device, dtype=latent.dtype)
-            temporal_weight[:ramp_len] = torch.sin(t)  # 0 -> 1
+        if actual_ov_start > 0:
+            ramp_len = min(actual_ov_start, chunk_len)
+            t = torch.linspace(0, 1, ramp_len, device=accum_device, dtype=latent.dtype)
+            temporal_weight[:ramp_len] = t
         
-        # Apply cos ramp at end (if not last chunk) - ramps from 1 to 0
-        if end < T and overlap > 0:
-            ramp_len = min(overlap, chunk_len)
-            t = torch.linspace(0, math.pi / 2, ramp_len, device=accum_device, dtype=latent.dtype)
-            ramp = torch.cos(t)  # 1 -> 0
-            # Multiply (don't replace) to handle small chunks correctly
-            temporal_weight[-ramp_len:] = temporal_weight[-ramp_len:] * ramp
+        if actual_ov_end > 0:
+            ramp_len = min(actual_ov_end, chunk_len)
+            t = torch.linspace(1, 0, ramp_len, device=accum_device, dtype=latent.dtype)
+            temporal_weight[-ramp_len:] = temporal_weight[-ramp_len:] * t
         
-        # Reshape for broadcasting: (chunk_len,) -> (chunk_len, 1, 1, 1)
         temporal_weight = temporal_weight.view(-1, 1, 1, 1)
         
         result[start:end] += upscaled_chunk * temporal_weight
