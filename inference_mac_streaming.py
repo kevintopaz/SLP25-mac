@@ -1366,8 +1366,6 @@ class VideoUpscaler:
                                 self.ctx.get('original_temporal_frames', T_pix_full))
                     true_dims = self.ctx.get('true_target_dims')
                     if true_dims is not None:
-                        pixel_H = min(pixel_H, true_dims[0])
-                        pixel_W = min(pixel_W, true_dims[1])
                         self.ctx['_transformed_video_trim'] = true_dims
                     self.ctx['_decode_tile_infos'] = tile_infos
                     self.ctx['_decode_pixel_H'] = pixel_H

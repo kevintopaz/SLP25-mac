@@ -1288,12 +1288,14 @@ def decode_all_batches(
                 sample = sample[:ori_length]
                 total_padding_removed += padding_removed
             
-            # Trim spatial padding to true target dimensions
+            # Resize back to true target dims (undo DivisiblePad Lanczos resize)
             current_h, current_w = sample.shape[-2:]
             if current_h != true_h or current_w != true_w:
-                debug.log(f"Trimming spatial padding: {current_w}x{current_h} → {true_w}x{true_h}", 
+                debug.log(f"Resize back: {current_w}x{current_h} → {true_w}x{true_h}", 
                          category="video", indent_level=1)
-                sample = sample[:, :, :true_h, :true_w]
+                sample = torch.nn.functional.interpolate(
+                    sample.float(), size=(true_h, true_w),
+                    mode='bicubic', align_corners=False).to(sample.dtype)
             
             # Convert to output format: [T, C, H, W] → [T, H, W, C]
             # Note: We keep values in [-1, 1] range - normalization happens in Phase 4
@@ -1608,11 +1610,13 @@ def postprocess_all_batches(
                     if input_video.shape[0] > sample.shape[0]:
                         input_video = input_video[:sample.shape[0]]
                     
-                    # Trim spatial dimensions to true target size
+                    # Resize back to true target dims (undo DivisiblePad Lanczos resize)
                     if 'true_target_dims' in ctx:
                         true_h, true_w = ctx['true_target_dims']
                         if input_video.shape[-2] != true_h or input_video.shape[-1] != true_w:
-                            input_video = input_video[:, :, :true_h, :true_w]
+                            input_video = torch.nn.functional.interpolate(
+                                input_video.float(), size=(true_h, true_w),
+                                mode='bicubic', align_corners=False).to(input_video.dtype)
             
             # Apply color correction if enabled (RGB only)
             if color_correction != "none" and input_video is not None:

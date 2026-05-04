@@ -42,8 +42,10 @@ class DivisibleCrop:
 
 class DivisiblePad:
     """
-    Pad image to make dimensions divisible by a factor.
-    Uses reflect padding to avoid boundary artifacts.
+    Resize image so dimensions are divisible by a factor using Lanczos.
+    Only adds 0-15 pixels (for factor=16), so the stretch is imperceptible.
+    Lanczos (sinc-windowed sinc) preserves sharp edges better than bicubic
+    with minimal ringing at this tiny scale.
     """
     def __init__(self, factor):
         if not isinstance(factor, tuple):
@@ -58,30 +60,35 @@ class DivisiblePad:
         else:
             raise NotImplementedError
 
-        pad_height = (self.height_factor - (height % self.height_factor)) % self.height_factor
-        pad_width = (self.width_factor - (width % self.width_factor)) % self.width_factor
+        new_height = height + (self.height_factor - (height % self.height_factor)) % self.height_factor
+        new_width = width + (self.width_factor - (width % self.width_factor)) % self.width_factor
 
-        if pad_height == 0 and pad_width == 0:
+        if new_height == height and new_width == width:
             return image
 
         if isinstance(image, torch.Tensor):
-            # Pad format: (left, right, top, bottom)
-            padding = (0, pad_width, 0, pad_height)
-            orig_dtype = image.dtype
-            if image.dtype == torch.float16:
-                image = image.float()
-            image = torch.nn.functional.pad(image, padding, mode='reflect')
-            #image = torch.nn.functional.pad(image, padding, mode='constant', value=0.0)
-            image = image.to(orig_dtype)
-        elif isinstance(image, Image.Image):
+            # TVF.resize has no Lanczos mode; round-trip through PIL per frame.
+            # Input is float [0, 1] with shape (C, H, W) or (T, C, H, W).
             import numpy as np
-            arr = np.array(image)
-            arr = np.pad(arr,
-                         ((0, pad_height), (0, pad_width), (0, 0)),
-                         mode='reflect')
-            #arr = np.pad(arr,
-            #             ((0, pad_height), (0, pad_width), (0, 0)),
-            #             mode='constant', value=0.0)
-            image = Image.fromarray(arr)
+            orig_dtype = image.dtype
+            if image.ndim == 3:
+                arr = image.float().permute(1, 2, 0).clamp(0, 1).mul(255).byte().numpy()
+                pil = Image.fromarray(arr)
+                pil = pil.resize((new_width, new_height), Image.LANCZOS)
+                image = torch.from_numpy(np.array(pil)).permute(2, 0, 1).float().div(255.0).to(orig_dtype)
+            elif image.ndim == 4:
+                frames = []
+                for i in range(image.shape[0]):
+                    arr = image[i].float().permute(1, 2, 0).clamp(0, 1).mul(255).byte().numpy()
+                    pil = Image.fromarray(arr)
+                    pil = pil.resize((new_width, new_height), Image.LANCZOS)
+                    frames.append(torch.from_numpy(np.array(pil)).permute(2, 0, 1))
+                image = torch.stack(frames).float().div(255.0).to(orig_dtype)
+            else:
+                image = TVF.resize(image, [new_height, new_width],
+                                   interpolation=TVF.InterpolationMode.BICUBIC,
+                                   antialias=True)
+        elif isinstance(image, Image.Image):
+            image = image.resize((new_width, new_height), Image.LANCZOS)
 
         return image

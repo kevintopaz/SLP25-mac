@@ -296,8 +296,12 @@ def process_pix_chunk(
         ctx['transformed_video'] = torch.from_numpy(raw)
         del raw
         trim = ctx.pop('_transformed_video_trim', None)
-        if trim is not None:
-            ctx['transformed_video'] = ctx['transformed_video'][:, :, :trim[0], :trim[1]]
+        tv = ctx['transformed_video']
+        if trim is not None and (tv.shape[-2] != trim[0] or tv.shape[-1] != trim[1]):
+            ctx['transformed_video'] = torch.nn.functional.interpolate(
+                tv.float(), size=(trim[0], trim[1]),
+                mode='bicubic', align_corners=False).to(tv.dtype)
+            del tv
         try:
             os.unlink(_mm_meta['path'])
         except OSError:
@@ -509,7 +513,12 @@ def _streaming_postprocess_chunk(
         dec_np = assemble_tiles_from_disk_range(
             tile_infos, pixel_H, pixel_W, start, count,
         )
-        return torch.from_numpy(dec_np)  # [count, H, W, 3] fp16
+        dec = torch.from_numpy(dec_np)  # [count, H, W, 3] fp16
+        if transform_trim is not None and (dec.shape[1] != transform_trim[0] or dec.shape[2] != transform_trim[1]):
+            dec = torch.nn.functional.interpolate(
+                dec.permute(0, 3, 1, 2).float(), size=(transform_trim[0], transform_trim[1]),
+                mode='bicubic', align_corners=False).to(dec.dtype).permute(0, 2, 3, 1)
+        return dec
 
     _trans_layout = (transform_mm_meta or {}).get('layout', 'CTHW')
     _trans_scale = (transform_mm_meta or {}).get('scale', 0.0)
@@ -530,8 +539,10 @@ def _streaming_postprocess_chunk(
             count = min(count, trans_mm.shape[1] - start)
             chunk = np.array(trans_mm[:, start:start + count, :, :])
         t = torch.from_numpy(chunk)
-        if transform_trim is not None:
-            t = t[:, :, :transform_trim[0], :transform_trim[1]]
+        if transform_trim is not None and (t.shape[-2] != transform_trim[0] or t.shape[-1] != transform_trim[1]):
+            t = torch.nn.functional.interpolate(
+                t.float(), size=(transform_trim[0], transform_trim[1]),
+                mode='bicubic', align_corners=False).to(t.dtype)
         return t  # [C, count, H, W] fp16
 
     def _cleanup_all():

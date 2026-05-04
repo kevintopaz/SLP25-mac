@@ -910,23 +910,23 @@ def decode_whole_latent(
         debug.log(f"Trimming temporal: {sample.shape[0]} → {T_original} frames", category="vae")
         sample = sample[:T_original]
     
-    # Trim spatial padding added by DivisiblePad to recover true target dims.
-    # Also trim the colour-correction reference (transformed_video) to match.
+    # Resize back to true target dims (undo DivisiblePad's nearest-neighbor resize).
     true_dims = ctx.get('true_target_dims')  # (true_h, true_w)
     if true_dims is not None:
         true_h, true_w = true_dims
         current_h, current_w = sample.shape[1], sample.shape[2]
         if current_h != true_h or current_w != true_w:
-            debug.log(f"Trimming spatial padding: {current_w}x{current_h} → {true_w}x{true_h}",
+            debug.log(f"Resize back: {current_w}x{current_h} → {true_w}x{true_h}",
                       category="vae", force=True)
-            # decoded sample is [T, H, W, C]
-            sample = sample[:, :true_h, :true_w, :]
-            # Record trim dims so the memmap-backed transformed_video
-            # can be trimmed when reloaded in Phase 4.
+            # sample is [T, H, W, C] → [T, C, H, W] for resize
+            sample = torch.nn.functional.interpolate(
+                sample.permute(0, 3, 1, 2).float(), size=(true_h, true_w),
+                mode='bicubic', align_corners=False).to(sample.dtype).permute(0, 2, 3, 1)
             ctx['_transformed_video_trim'] = (true_h, true_w)
-            # Legacy path: if transformed_video is still in-memory (no memmap)
             if 'transformed_video' in ctx:
-                ctx['transformed_video'] = ctx['transformed_video'][:, :, :true_h, :true_w]
+                ctx['transformed_video'] = torch.nn.functional.interpolate(
+                    ctx['transformed_video'].float(), size=(true_h, true_w),
+                    mode='bicubic', align_corners=False).to(ctx['transformed_video'].dtype)
     
     ctx['decoded_video'] = sample
     del ctx['upscaled_latent']
@@ -997,8 +997,10 @@ def postprocess_latent_output(
             tv = torch.from_numpy(raw)
             del raw
             trim = ctx.pop('_transformed_video_trim', None)
-            if trim is not None:
-                tv = tv[:, :, :trim[0], :trim[1]]
+            if trim is not None and (tv.shape[-2] != trim[0] or tv.shape[-1] != trim[1]):
+                tv = torch.nn.functional.interpolate(
+                    tv.float(), size=(trim[0], trim[1]),
+                    mode='bicubic', align_corners=False).to(tv.dtype)
             ctx['transformed_video'] = tv
             del tv
             debug.log("Reloaded transformed_video from memmap for color correction",
