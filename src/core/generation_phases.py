@@ -59,14 +59,6 @@ from ..optimization.performance import (
     optimized_single_video_rearrange, 
     optimized_sample_to_image_format
 )
-from ..utils.color_fix import (
-    lab_color_transfer,
-    lab_reinhard_transfer,
-    wavelet_adaptive_color_correction,
-    hsv_saturation_histogram_match, 
-    wavelet_reconstruction,
-    adaptive_instance_normalization
-)
 
 
 def _prepare_video_batch(
@@ -251,7 +243,8 @@ def encode_all_batches(
         raise ValueError("No frames to process")
     
     # Setup video transformation pipeline and compute dimensions if not already done
-    if 'true_target_dims' not in ctx:
+    vpp = ctx.get('vpp')
+    if vpp is None or vpp.true_dims is None:
         sample_frame = images[0].permute(2, 0, 1).unsqueeze(0)
         setup_video_transform(ctx, resolution, max_resolution, debug, sample_frame)
         del sample_frame
@@ -1186,10 +1179,11 @@ def decode_all_batches(
     num_valid_latents = len([l for l in ctx['all_upscaled_latents'] if l is not None])
     num_batches = len([l for l in ctx['all_ori_lengths'] if l is not None])
     
-    # Get output dimensions from context (set during Phase 1)
-    if 'true_target_dims' not in ctx:
-        raise ValueError("true_target_dims not found in context. Run encode_all_batches first.")
-    true_h, true_w = ctx['true_target_dims']
+    # Get output dimensions from VPP (set during Phase 1)
+    vpp = ctx.get('vpp')
+    if vpp is None or vpp.true_dims is None:
+        raise ValueError("vpp not found in context. Run encode_all_batches first.")
+    true_h, true_w = vpp.true_dims
     total_frames = ctx.get('total_frames', 0)
     C = 4 if ctx.get('is_rgba', False) else 3
     
@@ -1288,14 +1282,14 @@ def decode_all_batches(
                 sample = sample[:ori_length]
                 total_padding_removed += padding_removed
             
-            # Resize back to true target dims (undo DivisiblePad Lanczos resize)
-            current_h, current_w = sample.shape[-2:]
-            if current_h != true_h or current_w != true_w:
-                debug.log(f"Resize back: {current_w}x{current_h} → {true_w}x{true_h}", 
-                         category="video", indent_level=1)
-                sample = torch.nn.functional.interpolate(
-                    sample.float(), size=(true_h, true_w),
-                    mode='bicubic', align_corners=False).to(sample.dtype)
+            # Resize back to true target dims (undo divisibility rounding)
+            vpp = ctx.get('vpp')
+            if vpp is not None and vpp.needs_resize_back:
+                current_h, current_w = sample.shape[-2:]
+                if current_h != true_h or current_w != true_w:
+                    debug.log(f"Resize back: {current_w}x{current_h} → {true_w}x{true_h}",
+                             category="video", indent_level=1)
+                    sample = vpp.resize_back(sample)
             
             # Convert to output format: [T, C, H, W] → [T, H, W, C]
             # Note: We keep values in [-1, 1] range - normalization happens in Phase 4
@@ -1610,13 +1604,10 @@ def postprocess_all_batches(
                     if input_video.shape[0] > sample.shape[0]:
                         input_video = input_video[:sample.shape[0]]
                     
-                    # Resize back to true target dims (undo DivisiblePad Lanczos resize)
-                    if 'true_target_dims' in ctx:
-                        true_h, true_w = ctx['true_target_dims']
-                        if input_video.shape[-2] != true_h or input_video.shape[-1] != true_w:
-                            input_video = torch.nn.functional.interpolate(
-                                input_video.float(), size=(true_h, true_w),
-                                mode='bicubic', align_corners=False).to(input_video.dtype)
+                    # Resize back to true target dims (undo divisibility rounding)
+                    vpp = ctx.get('vpp')
+                    if vpp is not None and vpp.needs_resize_back:
+                        input_video = vpp.resize_back(input_video)
             
             # Apply color correction if enabled (RGB only)
             if color_correction != "none" and input_video is not None:
@@ -1642,29 +1633,12 @@ def postprocess_all_batches(
                         indent_level=1
                     )
                     
-                # Apply selected color correction method
+                # Apply color correction via VPP facade
                 debug.start_timer(f"color_correction_{color_correction}")
                 
-                if color_correction == "lab":
-                    debug.log("Applying LAB perceptual color transfer", category="video", force=True, indent_level=1)
-                    sample = lab_color_transfer(sample, input_video, debug, luminance_weight=0.8)
-                elif color_correction == "lab_reinhard":
-                    debug.log("Applying Reinhard LAB mean-std color transfer", category="video", force=True, indent_level=1)
-                    sample = lab_reinhard_transfer(sample, input_video, debug)
-                elif color_correction == "wavelet_adaptive":
-                    debug.log("Applying wavelet with adaptive saturation correction", category="video", force=True, indent_level=1)
-                    sample = wavelet_adaptive_color_correction(sample, input_video, debug)
-                elif color_correction == "wavelet":
-                    debug.log("Applying wavelet color reconstruction", category="video", force=True, indent_level=1)
-                    sample = wavelet_reconstruction(sample, input_video, debug)
-                elif color_correction == "hsv":
-                    debug.log("Applying HSV hue-conditional saturation matching", category="video", force=True, indent_level=1)
-                    sample = hsv_saturation_histogram_match(sample, input_video, debug)
-                elif color_correction == "adain":
-                    debug.log("Applying AdaIN color correction", category="video", force=True, indent_level=1)
-                    sample = adaptive_instance_normalization(sample, input_video)
-                else:
-                    debug.log(f"Unknown color correction method: {color_correction}", level="WARNING", category="video", force=True, indent_level=1)
+                vpp = ctx.get('vpp')
+                vpp.configure(color_method=color_correction)
+                sample = vpp.color_correct(sample, input_video, debug)
                 
                 debug.end_timer(f"color_correction_{color_correction}", f"Color correction ({color_correction})")
                 
@@ -1814,8 +1788,6 @@ def postprocess_all_batches(
         # 4. Clean up non-tensor storage
         if 'all_ori_lengths' in ctx:
             del ctx['all_ori_lengths']
-        if 'true_target_dims' in ctx:
-            del ctx['true_target_dims']
         if 'batch_metadata' in ctx:
             del ctx['batch_metadata']
         if 'input_images' in ctx:

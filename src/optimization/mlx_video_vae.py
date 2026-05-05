@@ -1022,25 +1022,6 @@ def _as_hw(v):
     return int(v), int(v)
 
 
-def _make_blend_weight(tile_h, tile_w, overlap, n_h, n_w, ti, tj):
-    """Bilinear cosine ramp at tile borders. ``overlap`` may be an int
-    (square) or an (overlap_h, overlap_w) pair."""
-    if isinstance(overlap, (tuple, list)):
-        ov_h, ov_w = int(overlap[0]), int(overlap[1])
-    else:
-        ov_h = ov_w = int(overlap)
-    bw = np.ones((tile_h, tile_w), dtype=np.float32)
-    if ti > 0:
-        bw[:ov_h, :] *= np.linspace(0, 1, ov_h)[:, None]
-    if ti < n_h - 1:
-        bw[-ov_h:, :] *= np.linspace(1, 0, ov_h)[:, None]
-    if tj > 0:
-        bw[:, :ov_w] *= np.linspace(0, 1, ov_w)[None, :]
-    if tj < n_w - 1:
-        bw[:, -ov_w:] *= np.linspace(1, 0, ov_w)[None, :]
-    return bw
-
-
 def _gpu_blend_paste(canvas, weight_canvas, tile, bw_5d, t_slice, h_slice, w_slice):
     """Add `tile * bw_5d` into `canvas[..., h_slice, w_slice, :]` and accumulate weight.
     All ops stay on GPU. Returns updated (canvas, weight_canvas)."""
@@ -1052,154 +1033,14 @@ def _gpu_blend_paste(canvas, weight_canvas, tile, bw_5d, t_slice, h_slice, w_sli
     return canvas, weight_canvas
 
 
-def _read_tile_as_fp16(info, frame_start, frame_count):
-    """Read a temporal sub-range from a tile memmap, returning fp16 [-1,1]."""
-    _tile_dtype = np.dtype(info.get("dtype", "uint8"))
-    mm = np.memmap(info["path"], dtype=_tile_dtype, mode='r',
-                   shape=tuple(info["shape"]))
-    tile_raw = np.array(mm[frame_start:frame_start + frame_count])
-    del mm
-    if _tile_dtype == np.uint8:
-        return tile_raw.astype(np.float16) / np.float16(127.5) - np.float16(1.0)
-    if _tile_dtype == np.uint16:
-        return tile_raw.astype(np.float16) / np.float16(32767.5) - np.float16(1.0)
-    return tile_raw.astype(np.float16)
-
-
-def assemble_tiles_from_disk(tile_infos, pixel_H, pixel_W, num_frames=None):
-    """Blend decoded pixel tiles from memmap files into a single output.
-
-    Args:
-        tile_infos: list of dicts from ``tiled_decode_streaming``.
-        pixel_H, pixel_W: full output resolution.
-        num_frames: optional frame cap.
-
-    Returns:
-        output: numpy ``[T, H, W, 3]`` float16.
-    """
-    if not tile_infos:
-        raise ValueError("No tile_infos provided")
-
-    info0 = tile_infos[0]
-    T_pix = info0["shape"][0]
-    if num_frames is not None:
-        T_pix = min(T_pix, num_frames)
-    tile_H = info0["tile_H"]
-    tile_W = info0["tile_W"]
-    ov_H = info0["ov_H"]
-    ov_W = info0["ov_W"]
-    n_h = info0["n_h"]
-    n_w = info0["n_w"]
-
-    # Precompute total blend weight map (spatial only)
-    total_wt = np.zeros((pixel_H, pixel_W), dtype=np.float32)
-    for info in tile_infos:
-        bw = _make_blend_weight(tile_H, tile_W, (ov_H, ov_W),
-                                n_h, n_w, info["ti"], info["tj"])
-        ph, pw = info["pixel_h"], info["pixel_w"]
-        clip_h = min(tile_H, pixel_H - ph)
-        clip_w = min(tile_W, pixel_W - pw)
-        total_wt[ph:ph+clip_h, pw:pw+clip_w] += bw[:clip_h, :clip_w]
-    total_wt = np.maximum(total_wt, 1e-4)
-
-    output = np.zeros((T_pix, pixel_H, pixel_W, 3), dtype=np.float32)
-
-    t0 = time.perf_counter()
-    for info in tile_infos:
-        tile_data = _read_tile_as_fp16(info, 0, T_pix).astype(np.float32)
-
-        ph, pw = info["pixel_h"], info["pixel_w"]
-        clip_h = min(tile_H, pixel_H - ph)
-        clip_w = min(tile_W, pixel_W - pw)
-        bw = _make_blend_weight(tile_H, tile_W, (ov_H, ov_W),
-                                n_h, n_w, info["ti"], info["tj"])
-        bw = bw[:clip_h, :clip_w]
-        norm_bw = bw / total_wt[ph:ph+clip_h, pw:pw+clip_w]
-        bw4d = norm_bw[None, :, :, None]
-        output[:, ph:ph+clip_h, pw:pw+clip_w, :] += (
-            tile_data[:, :clip_h, :clip_w, :] * bw4d
-        )
-        del tile_data
-
-    elapsed = time.perf_counter() - t0
-    logger.info(f"Assembled tiles from disk in {elapsed:.1f}s -> {output.shape}")
-    return output.astype(np.float16)
-
-
-def assemble_tiles_from_disk_range(tile_infos, pixel_H, pixel_W,
-                                   frame_start, frame_count):
-    """Blend a temporal sub-range of decoded pixel tiles from memmap files.
-
-    Same spatial blending as ``assemble_tiles_from_disk`` but only reads
-    frames ``[frame_start : frame_start + frame_count]`` from each tile,
-    allowing the caller to process the output in small temporal batches
-    without materialising the full ``[T, H, W, 3]`` tensor.
-
-    Args:
-        tile_infos: list of dicts from ``tiled_decode_streaming``.
-        pixel_H, pixel_W: full output spatial resolution.
-        frame_start: first pixel frame index to read.
-        frame_count: number of pixel frames to read.
-
-    Returns:
-        output: numpy ``[frame_count, H, W, 3]`` float16.
-    """
-    if not tile_infos:
-        raise ValueError("No tile_infos provided")
-
-    info0 = tile_infos[0]
-    tile_H = info0["tile_H"]
-    tile_W = info0["tile_W"]
-    ov_H = info0["ov_H"]
-    ov_W = info0["ov_W"]
-    n_h = info0["n_h"]
-    n_w = info0["n_w"]
-
-    total_wt = np.zeros((pixel_H, pixel_W), dtype=np.float32)
-    for info in tile_infos:
-        bw = _make_blend_weight(tile_H, tile_W, (ov_H, ov_W),
-                                n_h, n_w, info["ti"], info["tj"])
-        ph, pw = info["pixel_h"], info["pixel_w"]
-        clip_h = min(tile_H, pixel_H - ph)
-        clip_w = min(tile_W, pixel_W - pw)
-        total_wt[ph:ph+clip_h, pw:pw+clip_w] += bw[:clip_h, :clip_w]
-    total_wt = np.maximum(total_wt, 1e-4)
-
-    output = np.zeros((frame_count, pixel_H, pixel_W, 3), dtype=np.float32)
-
-    fs, fe = frame_start, frame_start + frame_count
-    for info in tile_infos:
-        tile_data = _read_tile_as_fp16(info, fs, fe - fs).astype(np.float32)
-
-        ph, pw = info["pixel_h"], info["pixel_w"]
-        clip_h = min(tile_H, pixel_H - ph)
-        clip_w = min(tile_W, pixel_W - pw)
-        bw = _make_blend_weight(tile_H, tile_W, (ov_H, ov_W),
-                                n_h, n_w, info["ti"], info["tj"])
-        bw = bw[:clip_h, :clip_w]
-        norm_bw = bw / total_wt[ph:ph+clip_h, pw:pw+clip_w]
-        bw4d = norm_bw[None, :, :, None]
-        output[:, ph:ph+clip_h, pw:pw+clip_w, :] += (
-            tile_data[:, :clip_h, :clip_w, :] * bw4d
-        )
-        del tile_data
-
-    return output.astype(np.float16)
-
-
-def cleanup_tile_files(tile_infos):
-    """Remove temporary memmap files and their parent directory."""
-    dirs = set()
-    for info in tile_infos:
-        p = info["path"]
-        if os.path.exists(p):
-            os.remove(p)
-        dirs.add(os.path.dirname(p))
-    for d in dirs:
-        try:
-            os.rmdir(d)
-        except OSError:
-            pass
+# Re-export tile assembly functions (moved to src/video_utils/tile_assembly.py)
+from ..video_utils.tile_assembly import (  # noqa: E402, F401
+    make_blend_weight as _make_blend_weight,
+    read_tile_as_fp16 as _read_tile_as_fp16,
+    assemble_tiles_from_disk,
+    assemble_tiles_from_disk_range,
+    cleanup_tile_files,
+)
 
 
 # ── High-Level Wrapper ───────────────────────────────────────────────────────
@@ -1679,6 +1520,7 @@ class MLXVideoVAE:
         num_frames=None,
         tmp_dir=None,
         tile_dtype="uint8",
+        vpp=None,
     ):
         """Decode latent using streaming temporal slices, saving tiles to disk.
 
@@ -1745,11 +1587,12 @@ class MLXVideoVAE:
             t_slices.append((pos, end))
             pos = end
 
-        if tmp_dir is None:
+        if vpp is None and tmp_dir is None:
             tmp_dir = tempfile.mkdtemp(prefix="vae_tiles_")
         logger.info(
-            "Streaming decode: %d spatial tiles, %d temporal slices (slice=%d lat frames), tmp=%s",
-            n_h * n_w, len(t_slices), temporal_slice, tmp_dir,
+            "Streaming decode: %d spatial tiles, %d temporal slices (slice=%d lat frames), managed_by=%s",
+            n_h * n_w, len(t_slices), temporal_slice,
+            "vpp" if vpp is not None else tmp_dir,
         )
 
         t0 = time.perf_counter()
@@ -1782,21 +1625,36 @@ class MLXVideoVAE:
                 if num_frames is not None and full_tile.shape[0] > T_pix:
                     full_tile = full_tile[:T_pix]
 
-                mm_path = os.path.join(tmp_dir, f"tile_{ti}_{tj}.dat")
                 actual_shape = full_tile.shape
                 np_dtype = np.dtype(tile_dtype)
-                mm = np.memmap(mm_path, dtype=np_dtype, mode='w+', shape=actual_shape)
-                if tile_dtype == "uint8":
-                    mm[:] = ((full_tile.astype(np.float32) + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
-                elif tile_dtype == "uint16":
-                    mm[:] = ((full_tile.astype(np.float32) + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
-                else:
-                    mm[:] = full_tile.astype(np_dtype)
-                mm.flush()
-                del mm, full_tile
+                tile_name = f"tile_{ti}_{tj}"
 
-                tile_infos.append({
-                    "path": mm_path,
+                # Quantize decoded tile from [-1,1] float16 to integer
+                if tile_dtype == "uint8":
+                    quantized = ((full_tile.astype(np.float32) + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
+                elif tile_dtype == "uint16":
+                    quantized = ((full_tile.astype(np.float32) + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+                else:
+                    quantized = full_tile.astype(np_dtype)
+                del full_tile
+
+                if vpp is not None:
+                    tmm = vpp.create_memmap(
+                        tile_name, actual_shape[0], actual_shape[1],
+                        actual_shape[2], actual_shape[3], mode=tile_dtype,
+                    )
+                    tmm.write_raw_batch(quantized, 0)
+                    tmm.flush()
+                    tile_path = tmm.path
+                else:
+                    tile_path = os.path.join(tmp_dir, f"{tile_name}.dat")
+                    mm = np.memmap(tile_path, dtype=np_dtype, mode='w+', shape=actual_shape)
+                    mm[:] = quantized
+                    mm.flush()
+                    del mm
+                del quantized
+
+                info = {
                     "shape": actual_shape,
                     "dtype": tile_dtype,
                     "pixel_h": ph,
@@ -1806,7 +1664,11 @@ class MLXVideoVAE:
                     "ti": ti, "tj": tj,
                     "n_h": n_h, "n_w": n_w,
                     "ov_H": ov_H, "ov_W": ov_W,
-                })
+                    "path": tile_path,
+                }
+                if vpp is not None:
+                    info["vpp_name"] = tile_name
+                tile_infos.append(info)
                 tc += 1
                 logger.info(f"  Dec tile {tc}/{n_h*n_w}: {time.perf_counter()-t0:.1f}s")
 

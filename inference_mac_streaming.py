@@ -76,7 +76,7 @@ from .src.core.generation_phases_latent import (
 from .src.core.generation_phases_pix import process_video_pix_chunked
 from .src.core.model_loader import materialize_model
 from .src.utils.debug import Debug
-from .src.optimization.mlx_video_vae import assemble_tiles_from_disk, cleanup_tile_files
+from .src.video_utils.tile_assembly import assemble_tiles_from_disk, cleanup_tile_files
 
 logging.basicConfig(
     format='%(asctime)s %(levelname)-8s %(message)s',
@@ -86,27 +86,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ─── MLX wavelet color correction monkey-patch ─────────────────────────────
-# generation_phases_pix.py imports ``wavelet_reconstruction`` from
-# ``src.utils.color_fix`` at function-call time. We replace the module-level
-# symbol with the MLX-native version so the post-decode color correction runs
-# on Apple GPU (~5x faster on 4K than torch CPU). Disable with
-# MLX_WAVELET=0 to fall back to the torch implementation.
+# ─── MLX wavelet color correction override ────────────────────────────────
+# Build a color-override dict that is passed through ctx to every
+# ColorMatcher instance via VideoPrePostProcess. This replaces the old
+# monkey-patch approach and removes the import-order dependency.
+# Disable with MLX_WAVELET=0 to fall back to the torch implementation.
+_COLOR_OVERRIDES: dict = {}
 if os.environ.get("MLX_WAVELET", "1") == "1":
     try:
-        from .src.utils import color_fix as _color_fix_mod
         from .src.utils.color_fix_mlx import wavelet_reconstruction_mlx
-        _color_fix_mod.wavelet_reconstruction = wavelet_reconstruction_mlx
-        logger.info("Patched wavelet_reconstruction with MLX implementation")
+        _COLOR_OVERRIDES["wavelet"] = wavelet_reconstruction_mlx
+        logger.info("MLX wavelet override registered for ColorMatcher")
     except ImportError:
-        # Fallback to relative import path if the package layout differs
         try:
-            import src.utils.color_fix as _color_fix_mod
             from src.utils.color_fix_mlx import wavelet_reconstruction_mlx
-            _color_fix_mod.wavelet_reconstruction = wavelet_reconstruction_mlx
-            logger.info("Patched wavelet_reconstruction with MLX implementation")
+            _COLOR_OVERRIDES["wavelet"] = wavelet_reconstruction_mlx
+            logger.info("MLX wavelet override registered for ColorMatcher")
         except Exception as _e:
-            logger.warning(f"Failed to patch wavelet_reconstruction: {_e}")
+            logger.warning(f"Failed to load MLX wavelet: {_e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -288,15 +285,17 @@ def _select_h264_codec_args():
 class FFMPEGVideoWriter:
     def __init__(self, path, width, height, fps, use_10bit=False, encoding_options=""):
         ffmpeg_bin = _find_ffmpeg()
+        self.use_10bit = use_10bit
+        input_pix_fmt = 'rgb48le' if use_10bit else 'rgb24'
         if encoding_options:
             codec_args = shlex.split(encoding_options)
         else:
-            pix_fmt = 'yuv420p10le' if use_10bit else 'yuv420p'
+            out_pix_fmt = 'yuv420p10le' if use_10bit else 'yuv420p'
             codec = 'libx265' if use_10bit else 'libx264'
-            codec_args = ['-c:v', codec, '-pix_fmt', pix_fmt,
+            codec_args = ['-c:v', codec, '-pix_fmt', out_pix_fmt,
                           '-preset', 'medium', '-crf', '15']
         self.proc = subprocess.Popen(
-            [ffmpeg_bin, '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
+            [ffmpeg_bin, '-y', '-f', 'rawvideo', '-pix_fmt', input_pix_fmt,
              '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
              *codec_args, '-movflags', '+faststart', path],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -304,7 +303,10 @@ class FFMPEGVideoWriter:
 
     def write(self, frame_bgr):
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        self.proc.stdin.write(frame_rgb.astype(np.uint8).tobytes())
+        if self.use_10bit:
+            self.proc.stdin.write(frame_rgb.astype(np.uint16).tobytes())
+        else:
+            self.proc.stdin.write(frame_rgb.astype(np.uint8).tobytes())
         self.proc.stdin.flush()
 
     def isOpened(self):
@@ -469,6 +471,17 @@ class LazyVideoReader:
             available = min(available, load_cap)
         self._total_frames = available
 
+        # Detect source bit depth from the pixel format
+        pix_fmt = stream.codec_context.pix_fmt or ""
+        self.bit_depth = 10 if any(t in pix_fmt for t in ("10le", "10be", "p010", "p016", "16le", "16be")) else 8
+        if self.bit_depth > 8:
+            self._decode_fmt = 'rgb48le'
+            self._decode_scale = np.float32(65535.0)
+        else:
+            self._decode_fmt = 'rgb24'
+            self._decode_scale = np.float32(255.0)
+        logger.info(f"LazyVideoReader: source pix_fmt={pix_fmt!r}, bit_depth={self.bit_depth}, decode_fmt={self._decode_fmt}")
+
         self._filter_chain = _parse_ffmpeg_filters(ffmpeg_preproc_filters) if ffmpeg_preproc_filters else []
         self._filter_graph = None
 
@@ -546,7 +559,7 @@ class LazyVideoReader:
         if item is None:
             self._exhausted = True
             return False
-        self._buffer[self._decode_pos] = (item.to_ndarray(format='rgb24').astype(np.float16) / np.float16(255.0))
+        self._buffer[self._decode_pos] = item.to_ndarray(format=self._decode_fmt)
         self._decode_pos += 1
         return True
 
@@ -566,6 +579,14 @@ class LazyVideoReader:
         raise TypeError(f"LazyVideoReader only supports slice indexing, got {type(key)}")
 
     def _read_range(self, start, end):
+        """Read decoded frames [start, end), applying SAR correction.
+
+        Returns np.ndarray [N, H, W, C] in raw uint8 or uint16.
+
+        SAR (sample aspect ratio) correction is a container-level property
+        that converts coded pixels to display pixels.  This happens *before*
+        frames reach VideoPrePostProcess, which handles divisible-crop resize.
+        """
         abs_end = self.skip_frames + end - 1
         self._decode_up_to(abs_end)
         abs_start = self.skip_frames + start
@@ -574,13 +595,13 @@ class LazyVideoReader:
             if k < abs_start:
                 del self._buffer[k]
         if not frames:
-            return torch.empty(0, self._display_h, self._display_w, 3, dtype=torch.float16)
+            return np.empty((0, self._display_h, self._display_w, 3), dtype=np.uint8)
         if self._sar != 1.0:
             h, w = frames[0].shape[:2]
             new_w = round(w * self._sar)
             if new_w != w:
-                frames = [cv2.resize(f.astype(np.float32), (new_w, h), interpolation=cv2.INTER_CUBIC).astype(np.float16) for f in frames]
-        return torch.from_numpy(np.stack(frames))
+                frames = [cv2.resize(f, (new_w, h), interpolation=cv2.INTER_CUBIC) for f in frames]
+        return np.stack(frames)
 
     def close(self):
         if self._container is not None:
@@ -904,6 +925,8 @@ class VideoUpscaler:
             tensor_offload_device=None, debug=self.debug,
         )
         self.ctx['compute_dtype'] = torch.bfloat16
+        if _COLOR_OVERRIDES:
+            self.ctx['color_overrides'] = _COLOR_OVERRIDES
 
         # Prepare runner — sets up diffusion config + schedule.
         # dit_name is only used to select the config YAML (3B vs 7B) and as a
@@ -1202,6 +1225,7 @@ class VideoUpscaler:
             input_path, skip_frames=skip_frames, load_cap=load_cap,
             ffmpeg_preproc_filters=ffmpeg_preproc_filters,
         )
+        self.ctx['source_bit_depth'] = reader.bit_depth
         fps = reader.fps
 
         if reader.shape[0] < 5:
@@ -1218,28 +1242,37 @@ class VideoUpscaler:
 
         self.streaming_dit.stream_manager.prefetch_start(num_blocks=2)
 
-        writer_holder = [None]
-        saved_frames = [0]
         total_frames = reader.shape[0]
 
-        def _output_callback(frames_tensor):
-            if writer_holder[0] is None:
-                _, H, W, _ = frames_tensor.shape
-                writer_holder[0] = FFMPEGVideoWriter(
-                    output_path, W, H, fps,
-                    use_10bit=use_10bit,
-                    encoding_options=ffmpeg_encoding,
-                )
-            for i in range(frames_tensor.shape[0]):
-                frame_np = (frames_tensor[i].cpu().float().numpy() * 255.0).astype(np.uint8)
-                writer_holder[0].write(cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR))
-            saved_frames[0] += frames_tensor.shape[0]
+        # Ensure VPP exists before opening the writer.
+        # encode_whole_video will reuse this instance via ctx['vpp'].
+        if 'vpp' not in self.ctx:
+            from .src.video_utils import VideoPrePostProcess
+            self.ctx['vpp'] = VideoPrePostProcess(
+                resolution=resolution,
+                source_bit_depth=reader.bit_depth,
+                color_overrides=self.ctx.get('color_overrides'),
+            )
 
-            frac = saved_frames[0] / total_frames
-            progress = 0.05 + frac * 0.85
-            if progress_func:
-                progress_func(progress, message=f"Processed {saved_frames[0]}/{total_frames} frames...")
-            logger.info(f"Saved {saved_frames[0]}/{total_frames} frames")
+        def _ffmpeg_writer_factory(H, W):
+            writer = FFMPEGVideoWriter(
+                output_path, W, H, fps,
+                use_10bit=use_10bit,
+                encoding_options=ffmpeg_encoding,
+            )
+            def _write_frame(frame):
+                writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            return _write_frame, writer.release
+
+        def _scaled_progress(frac, message=""):
+            progress_func(0.05 + frac * 0.85, message=message)
+
+        vpp = self.ctx['vpp']
+        vpp.open_writer(
+            writer_factory=_ffmpeg_writer_factory,
+            total_frames=total_frames,
+            progress_fn=_scaled_progress if progress_func else None,
+        )
 
         t_start = time.time()
 
@@ -1277,23 +1310,20 @@ class VideoUpscaler:
 
                 torch.mps.empty_cache()
 
-                # Read directly from the transform memmap (THWC uint8/uint16)
-                # written by encode_whole_video; encoder normalises on-the-fly.
-                mm_meta = self.ctx.get('_transformed_video_memmap')
-                if mm_meta is not None:
-                    transform_mm = np.memmap(
-                        mm_meta['path'], dtype=mm_meta['dtype'],
-                        mode='r', shape=mm_meta['shape'],
-                    )
+                # Read from VPP's memmap (THWC uint8/uint16 raw pixels);
+                # tiled_encode_streaming normalises on-the-fly via pixel_scale.
+                vpp = self.ctx.get('vpp')
+                _input_mm = vpp.get_memmap("input") if vpp is not None else None
+                if _input_mm is not None:
                     latent_np = mlx_vae.tiled_encode_streaming(
-                        transform_mm,
+                        _input_mm._mm,
                         tile_size=HYBRID_VAE_TILE_SIZE,
                         tile_overlap=HYBRID_VAE_TILE_OVERLAP,
                         temporal_slice=HYBRID_TEMPORAL_ENCODE_SLICE,
-                        input_layout=mm_meta.get('layout', 'THWC'),
-                        pixel_scale=mm_meta.get('scale', 255.0),
+                        input_layout=_input_mm.layout,
+                        pixel_scale=_input_mm.scale,
                     )
-                    del transform_mm
+                    del _input_mm
                 else:
                     sample = samples[0]
                     samples[0] = None
@@ -1358,19 +1388,19 @@ class VideoUpscaler:
                         tile_size=VAE_DECODE_TILE_SIZE,
                         tile_overlap=VAE_DECODE_TILE_OVERLAP,
                         temporal_slice=HYBRID_TEMPORAL_DECODE_SLICE,
+                        vpp=self.ctx.get('vpp'),
                     )
                     del lat_np
 
                     T_pix_full = 1 if T_lat == 1 else (T_lat - 1) * 4 + 1
                     T_pix = min(T_pix_full,
                                 self.ctx.get('original_temporal_frames', T_pix_full))
-                    true_dims = self.ctx.get('true_target_dims')
-                    if true_dims is not None:
-                        self.ctx['_transformed_video_trim'] = true_dims
-                    self.ctx['_decode_tile_infos'] = tile_infos
-                    self.ctx['_decode_pixel_H'] = pixel_H
-                    self.ctx['_decode_pixel_W'] = pixel_W
-                    self.ctx['_decode_T_pix'] = T_pix
+                    self.ctx['_decode_meta'] = {
+                        'tile_infos': tile_infos,
+                        'pixel_H': pixel_H,
+                        'pixel_W': pixel_W,
+                        'T_pix': T_pix,
+                    }
 
                     sample_t = torch.empty(3, T_pix, pixel_H, pixel_W,
                                           dtype=torch.float16)
@@ -1417,13 +1447,12 @@ class VideoUpscaler:
                 color_correction=color_correction,
                 usm_weight=USM_WEIGHT, usm_radius=USM_RADIUS,
                 usm_threshold=USM_THRESHOLD,
-                device=self.device, output_callback=_output_callback,
+                device=self.device, output_callback=vpp.write_frames,
                 shift_back=_shift_back,
             )
         finally:
             reader.close()
-            if writer_holder[0] is not None:
-                writer_holder[0].release()
+            vpp.close_writer()
             # Restore original VAE patches if hybrid mode was used
             if _orig_vae_encode is not None:
                 self.runner.vae_encode = _orig_vae_encode
@@ -1438,7 +1467,7 @@ class VideoUpscaler:
 
         # Align the muxed audio with the rendered frame range
         audio_start = (skip_frames / fps) if fps and skip_frames > 0 else 0.0
-        frames_written = saved_frames[0] if saved_frames[0] > 0 else (load_cap if load_cap > 0 else 0)
+        frames_written = vpp.frames_written if vpp.frames_written > 0 else (load_cap if load_cap > 0 else 0)
         audio_duration = (frames_written / fps) if (fps and frames_written > 0) else None
         copy_audio_to_video(
             input_path, output_path,
@@ -1446,7 +1475,7 @@ class VideoUpscaler:
             audio_duration=audio_duration,
         )
 
-        logger.info(f"Saved {saved_frames[0]} frames to {output_path}")
+        logger.info(f"Saved {vpp.frames_written} frames to {output_path}")
         logger.info(f"Total time: {elapsed:.1f}s")
         logger.info(f"Encode: {timings.get('encode', 0):.1f}s, "
                     f"DiT: {timings.get('dit', 0):.1f}s, "

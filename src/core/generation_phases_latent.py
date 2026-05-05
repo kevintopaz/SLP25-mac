@@ -14,12 +14,9 @@ import torch.nn as nn
 from typing import Dict, Any, Optional, Callable, Tuple, List
 
 from .generation_utils import (
-    setup_video_transform,
-    prepare_video_pixel_transform,
     load_text_embeddings,
     script_directory,
     ensure_precision_initialized,
-    pad_video_temporal
 )
 from .generation_phases import _compute_dit_tile_params
 from .model_loader import materialize_model
@@ -31,6 +28,7 @@ from ..optimization.memory_manager import (
     cleanup_text_embeddings,
     clear_memory
 )
+
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -189,7 +187,7 @@ def get_text_embeddings(
 def encode_whole_video(
     runner: 'VideoDiffusionInfer',
     ctx: Dict[str, Any],
-    images: torch.Tensor,
+    images,
     debug: 'Debug',
     resolution: int = 1080,
     max_resolution: int = 0,
@@ -197,37 +195,31 @@ def encode_whole_video(
 ) -> Dict[str, Any]:
     """
     Phase 1: Encode entire video to latent space at once.
+
+    Parameters
+    ----------
+    images : np.ndarray or torch.Tensor
+        ``[T, H, W, C]`` raw uint8/uint16 pixels (numpy) or legacy
+        float16 ``[0, 1]`` tensor.
     """
     debug.log("", category="none", force=True)
     debug.log("━━━━━━━━ Phase 1: VAE Encode (whole video) ━━━━━━━━", category="none", force=True)
     debug.start_timer("phase1_encode_whole")
     
+    import numpy as _np
+    _is_numpy = isinstance(images, _np.ndarray)
+
     ctx['total_frames'] = len(images)
-    
-    if 'true_target_dims' not in ctx:
-        sample_frame = images[0].permute(2, 0, 1).unsqueeze(0)
-        setup_video_transform(ctx, resolution, max_resolution, debug, sample_frame)
-        del sample_frame
-    else:
-        setup_video_transform(ctx, resolution, max_resolution, debug)
-    
-    debug.log(f"Input frames: {images.shape}", category="vae", force=True)
-    
+    T_input = images.shape[0]
+
+    debug.log(f"Input frames: shape={images.shape}, dtype={images.dtype}", category="vae", force=True)
+
     # Materialize VAE if still on meta device
     if runner.vae and next(runner.vae.parameters()).device.type == 'meta':
         materialize_model(runner, "vae", ctx['vae_device'], runner.config, debug)
-    
+
     manage_model_device(model=runner.vae, target_device=ctx['vae_device'],
                        model_name="VAE", debug=debug, runner=runner)
-    
-    transform = ctx['video_transform']
-    T_input = images.shape[0]
-
-    # Determine output spatial dims by transforming a single frame.
-    with torch.no_grad():
-        _probe = transform(images[0:1].permute(0, 3, 1, 2))  # [C,1,H_out,W_out]
-        C_out, _, H_out, W_out = _probe.shape
-        del _probe
 
     # Temporal padding for 4n+1 constraint
     T_padded = T_input
@@ -238,76 +230,40 @@ def encode_whole_video(
 
     ctx['original_temporal_frames'] = T_input
 
-    # Store as uint8 (8-bit source) or uint16 (>8-bit source) to halve
-    # memmap size vs fp16.  Normalize on-the-fly when reading.
-    import tempfile as _tmpmod, numpy as np
+    vpp = ctx.get('vpp')
 
-    # Detect source bit depth from input tensor value range
-    _sample_vals = images[0].float()
-    _is_high_bit = bool((_sample_vals * 255.0).frac().abs().max() > 0.01)
-    mm_pixel_dtype = np.uint16 if _is_high_bit else np.uint8
-    del _sample_vals
-
-    pix_transform = prepare_video_pixel_transform(resolution, max_resolution)
-
-    _mm_file = _tmpmod.NamedTemporaryFile(suffix='.dat', delete=False)
-    mm_path = _mm_file.name
-    _mm_file.close()
-    # Store as THWC to avoid the permute and match natural pixel layout
-    mm_shape = (T_padded, H_out, W_out, C_out)
-    transform_mm = np.memmap(mm_path, dtype=mm_pixel_dtype, mode='w+', shape=mm_shape)
-
-    _TRANSFORM_BATCH = 4
-    _scale = 255.0 if mm_pixel_dtype == np.uint8 else 65535.0
-    for i in range(0, T_input, _TRANSFORM_BATCH):
-        end = min(i + _TRANSFORM_BATCH, T_input)
-        batch = images[i:end].permute(0, 3, 1, 2)  # [B, C, H, W]
-        batch_out = pix_transform(batch).cpu().float()  # [B, C, H_out, W_out] in [0,1]
-        # BCHW → BHWC for THWC memmap
-        batch_hwc = batch_out.permute(0, 2, 3, 1)
-        batch_int = (batch_hwc * _scale).clamp(0, _scale).numpy().astype(mm_pixel_dtype)
-        transform_mm[i:end, :, :, :] = batch_int
-        del batch, batch_out, batch_hwc, batch_int
-
-    # Mirror-pad trailing frames
-    if pad_count > 0:
-        for p in range(pad_count):
-            src_idx = T_input - 1 - (p % T_input) if T_input > 1 else 0
-            transform_mm[T_input + p, :, :, :] = transform_mm[src_idx, :, :, :]
-
-    transform_mm.flush()
-
-    _dtype_tag = "uint8" if mm_pixel_dtype == np.uint8 else "uint16"
-    debug.log(f"Transformed shape: {mm_shape} (THWC {_dtype_tag})", category="vae")
-    debug.log(f"Batch-transformed to memmap: {mm_path} ({os.path.getsize(mm_path) / 1e9:.2f} GB)",
+    # Ingest: resize + store to disk-backed memmap via VPP.
+    # VPP probes dimensions internally; H_out/W_out come from vpp.padded_dims.
+    _images_ref = images
+    if _is_numpy:
+        vpp.ingest(
+            reader_fn=lambda start, count: _images_ref[start:start + count],
+            total_frames=T_input,
+            padded_frames=T_padded,
+        )
+    else:
+        def _legacy_reader(start, count):
+            chunk = _images_ref[start:start + count]
+            return (chunk.cpu().float().clamp(0.0, 1.0).numpy() * 255.0).astype(_np.uint8)
+        vpp.ingest(
+            reader_fn=_legacy_reader,
+            total_frames=T_input,
+            padded_frames=T_padded,
+        )
+    debug.log(f"Batch-transformed to memmap: {vpp.memmap}",
               category="memory", force=True)
 
     # Free input frames — everything is now in the memmap.
-    del images
+    del images, _images_ref
     if 'input_images' in ctx:
         del ctx['input_images']
     import gc; gc.collect()
 
-    ctx['_transformed_video_memmap'] = {
-        'path': mm_path,
-        'dtype': mm_pixel_dtype,
-        'shape': mm_shape,
-        'layout': 'THWC',
-        'scale': float(_scale),
-    }
-
     _hybrid = getattr(runner, '_hybrid_encode_active', False)
     if _hybrid:
-        del transform_mm
         video_transformed = torch.empty(1)
     else:
-        # Legacy non-hybrid path: read memmap, normalize, convert to CTHW fp16
-        mm_f32 = np.array(transform_mm).astype(np.float32) / _scale
-        mm_norm = mm_f32 * 2.0 - 1.0  # [0,1] → [-1,1]
-        # THWC → CTHW
-        mm_cthw = np.transpose(mm_norm, (3, 0, 1, 2))
-        video_transformed = torch.from_numpy(mm_cthw).to(torch.float16)
-        del transform_mm, mm_f32, mm_norm, mm_cthw
+        video_transformed = vpp.read_reference(as_cthw=True)
         video_transformed = manage_tensor(
             tensor=video_transformed,
             target_device=ctx['vae_device'],
@@ -342,36 +298,14 @@ def encode_whole_video(
     
     ctx['full_latent'] = latent
     
-    # Offload transformed_video to a memory-mapped file so it doesn't
-    # consume physical RAM during DiT (Phase 2) and decode (Phase 3).
-    # The OS will page it back in when color correction reads it.
-    if 'transformed_video' in ctx:
-        import tempfile, numpy as np
-        tv = ctx['transformed_video']
-        tv_shape = tuple(tv.shape)
-        tv_np = tv.numpy()
-        tmp = tempfile.NamedTemporaryFile(suffix='.dat', delete=False)
-        mm = np.memmap(tmp.name, dtype=tv_np.dtype, mode='w+', shape=tv_np.shape)
-        mm[:] = tv_np
-        mm.flush()
-        del mm, tv_np, tv
-        ctx['_transformed_video_memmap'] = {
-            'path': tmp.name,
-            'dtype': np.float16,
-            'shape': tv_shape,
-        }
-        del ctx['transformed_video']
-        tmp.close()
-        import gc; gc.collect()
-        debug.log(f"Offloaded transformed_video to memmap: {tmp.name} "
-                  f"(shape={tv_shape})", category="memory", force=True)
+    ctx.pop('transformed_video', None)
 
     if ctx['vae_offload_device'] is not None:
         manage_model_device(model=runner.vae, target_device=ctx['vae_offload_device'],
                            model_name="VAE", debug=debug, reason="VAE offload", runner=runner)
     
     if progress_callback:
-        progress_callback(1, 1, len(images), "Phase 1: Encoding")
+        progress_callback(1, 1, ctx['total_frames'], "Phase 1: Encoding")
     
     debug.end_timer("phase1_encode_whole", "Phase 1: VAE encoding complete")
     debug.log_memory_state("After Phase 1 (whole video encoding)", show_tensors=False)
@@ -910,23 +844,17 @@ def decode_whole_latent(
         debug.log(f"Trimming temporal: {sample.shape[0]} → {T_original} frames", category="vae")
         sample = sample[:T_original]
     
-    # Resize back to true target dims (undo DivisiblePad's nearest-neighbor resize).
-    true_dims = ctx.get('true_target_dims')  # (true_h, true_w)
-    if true_dims is not None:
-        true_h, true_w = true_dims
+    # Resize back to true target dims (undo divisibility rounding).
+    vpp = ctx.get('vpp')
+    if vpp is not None and vpp.needs_resize_back:
+        true_h, true_w = vpp.true_dims
         current_h, current_w = sample.shape[1], sample.shape[2]
         if current_h != true_h or current_w != true_w:
             debug.log(f"Resize back: {current_w}x{current_h} → {true_w}x{true_h}",
                       category="vae", force=True)
-            # sample is [T, H, W, C] → [T, C, H, W] for resize
-            sample = torch.nn.functional.interpolate(
-                sample.permute(0, 3, 1, 2).float(), size=(true_h, true_w),
-                mode='bicubic', align_corners=False).to(sample.dtype).permute(0, 2, 3, 1)
-            ctx['_transformed_video_trim'] = (true_h, true_w)
+            sample = vpp.resize_back(sample)
             if 'transformed_video' in ctx:
-                ctx['transformed_video'] = torch.nn.functional.interpolate(
-                    ctx['transformed_video'].float(), size=(true_h, true_w),
-                    mode='bicubic', align_corners=False).to(ctx['transformed_video'].dtype)
+                ctx['transformed_video'] = vpp.resize_back(ctx['transformed_video'])
     
     ctx['decoded_video'] = sample
     del ctx['upscaled_latent']
@@ -978,180 +906,36 @@ def postprocess_latent_output(
     if progress_callback:
         progress_callback(0, 1, T, "Phase 4: Post-processing")
     
-    # Reload transformed_video from memmap if it was offloaded
-    _mm_meta = ctx.pop('_transformed_video_memmap', None)
-    if _mm_meta is not None:
-        import numpy as np, os
-        if color_correction != "none" and 'transformed_video' not in ctx:
-            mm = np.memmap(_mm_meta['path'], dtype=_mm_meta['dtype'],
-                           mode='r', shape=_mm_meta['shape'])
-            raw = np.array(mm)
-            del mm
-            _mm_layout = _mm_meta.get('layout', 'CTHW')
-            _mm_scale = _mm_meta.get('scale', 0.0)
-            if _mm_scale > 0:
-                raw = raw.astype(np.float32) / _mm_scale
-                raw = (raw * 2.0 - 1.0).astype(np.float16)
-            if _mm_layout == 'THWC':
-                raw = np.transpose(raw, (3, 0, 1, 2))  # THWC → CTHW
-            tv = torch.from_numpy(raw)
-            del raw
-            trim = ctx.pop('_transformed_video_trim', None)
-            if trim is not None and (tv.shape[-2] != trim[0] or tv.shape[-1] != trim[1]):
-                tv = torch.nn.functional.interpolate(
-                    tv.float(), size=(trim[0], trim[1]),
-                    mode='bicubic', align_corners=False).to(tv.dtype)
+    # Reload transformed_video from VPP's memmap for color correction.
+    if color_correction != "none" and 'transformed_video' not in ctx:
+        vpp = ctx.get('vpp')
+        if vpp is not None and vpp.memmap is not None:
+            tv = vpp.read_reference(as_cthw=True)
+            if vpp.needs_resize_back:
+                tv = vpp.resize_back(tv)
             ctx['transformed_video'] = tv
             del tv
-            debug.log("Reloaded transformed_video from memmap for color correction",
+            vpp.cleanup_memmap()
+            debug.log("Reloaded transformed_video from VPP memmap for color correction",
                       category="memory", force=True)
-        else:
-            ctx.pop('_transformed_video_trim', None)
-        try:
-            os.unlink(_mm_meta['path'])
-        except OSError:
-            pass
 
-    if color_correction != "none" and 'transformed_video' in ctx:
-        from ..utils.color_fix import (
-            lab_color_transfer, lab_reinhard_transfer, wavelet_reconstruction,
-            hsv_saturation_histogram_match, wavelet_adaptive_color_correction,
-            adaptive_instance_normalization
-        )
-        
-        # transformed_video is [C, T_ref, H, W] on CPU in [-1, 1] range
-        # Permute to [T_ref, C, H, W] for per-frame chunking
-        reference_cpu = ctx['transformed_video'].permute(1, 0, 2, 3)  # [T_ref, C, H, W]
-        T_ref = reference_cpu.shape[0]
-        
-        # video is [T, H, W, C] in [-1, 1] -> [T, C, H, W] (stay in [-1, 1] for color correction)
-        video = video.permute(0, 3, 1, 2)  # [T, C, H, W]
-        
-        # Build frame indices for temporal alignment
-        if T_ref != T:
-            indices = torch.linspace(0, T_ref - 1, T).long()
-        else:
-            indices = None
-        
-        debug.log(f"Applying {color_correction} color correction ({T} frames, ref={T_ref})", category="color")
-        
-        H, W = video.shape[-2], video.shape[-1]
-        pix = H * W
-        if pix > 4_000_000:
-            chunk_size = max(1, min(4, T))
-        elif pix > 2_000_000:
-            chunk_size = max(1, min(8, T))
-        else:
-            chunk_size = max(1, min(32, T))
-        result_chunks = []
-        
-        for start in range(0, T, chunk_size):
-            end = min(start + chunk_size, T)
-            video_chunk = video[start:end]  # [chunk, C, H, W] already on GPU
-            
-            # Get corresponding reference frames on GPU
-            if indices is not None:
-                ref_chunk = reference_cpu[indices[start:end]].to(video.device)
-            else:
-                ref_chunk = reference_cpu[start:end].to(video.device)
-            
-            # Apply selected color correction method
-            # content=video_chunk (upscaled), style=ref_chunk (original)
-            if color_correction == "lab":
-                video_chunk = lab_color_transfer(video_chunk, ref_chunk, debug, luminance_weight=0.8)
-            elif color_correction == "lab_reinhard":
-                video_chunk = lab_reinhard_transfer(video_chunk, ref_chunk, debug)
-            elif color_correction == "wavelet":
-                video_chunk = wavelet_reconstruction(video_chunk, ref_chunk, debug)
-            elif color_correction == "hsv":
-                # HSV runs on CPU to avoid GPU OOM (heavy per-hue-bin histogram matching)
-                orig_device = video_chunk.device
-                video_chunk = hsv_saturation_histogram_match(video_chunk.cpu(), ref_chunk.cpu(), debug).to(orig_device)
-            elif color_correction == "wavelet_adaptive":
-                video_chunk = wavelet_adaptive_color_correction(video_chunk, ref_chunk, debug)
-            elif color_correction == "adain":
-                video_chunk = adaptive_instance_normalization(video_chunk, ref_chunk)
-            else:
-                debug.log(f"Unknown color correction method: {color_correction}",
-                          level="WARNING", category="color", force=True)
-            
-            video_chunk.clamp_(-1, 1).mul_(0.5).add_(0.5)
-            video_chunk = video_chunk.permute(0, 2, 3, 1).float().to(dtype=torch.float16).cpu()
-            result_chunks.append(video_chunk)
-            del ref_chunk
-        
-        del video  # free the GPU source tensor before CPU concat
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        elif torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-        video = torch.cat(result_chunks, dim=0)  # [T, H, W, C] in [0, 1] on CPU
-        del result_chunks, reference_cpu
+    vpp = ctx.get('vpp')
+    reference = ctx.get('transformed_video')
+
+    if vpp is not None:
+        vpp.configure(color_method=color_correction,
+                      usm_weight=usm_weight, usm_radius=usm_radius,
+                      usm_threshold=usm_threshold)
+        gpu_device = ('cuda' if torch.cuda.is_available()
+                      else 'mps' if torch.backends.mps.is_available()
+                      else 'cpu')
+        debug.log(f"Applying postprocess ({color_correction}, USM={usm_weight})",
+                  category="color", force=True)
+        video = vpp.color_correct_and_finalize(video, reference=reference, device=gpu_device)
     else:
         video.clamp_(-1, 1).mul_(0.5).add_(0.5)
         video = video.float().to(dtype=torch.float16).cpu()
-    
-    # ── USM Sharpening (GPU, separable Gaussian conv) ──
-    if usm_weight > 0:
-        import torch.nn.functional as F
 
-        radius = usm_radius if usm_radius % 2 == 1 else usm_radius + 1
-        debug.log(f"Applying USM sharpening (GPU): weight={usm_weight}, radius={radius}, "
-                  f"threshold={usm_threshold}", category="color", force=True)
-
-        gpu_device = torch.device('cuda')
-        T_frames, H, W, C = video.shape
-
-        # Build separable Gaussian kernel (sigma matches OpenCV sigmaX=0)
-        sigma = 0.3 * ((radius - 1) * 0.5 - 1) + 0.8
-        ax = torch.arange(radius, device=gpu_device, dtype=torch.float32) - (radius - 1) / 2.0
-        gauss_1d = torch.exp(-0.5 * (ax / sigma) ** 2)
-        gauss_1d = gauss_1d / gauss_1d.sum()
-        pad = radius // 2
-
-        # Separable conv weights: [C_out, C_in/groups, kH, kW] with groups=C
-        kernel_h = gauss_1d.view(1, 1, 1, -1).expand(C, -1, -1, -1).contiguous()
-        kernel_v = gauss_1d.view(1, 1, -1, 1).expand(C, -1, -1, -1).contiguous()
-
-        def _gpu_blur(x):
-            """Separable Gaussian blur on [N, C, H, W] GPU tensor."""
-            x = F.pad(x, [pad, pad, 0, 0], mode='reflect')
-            x = F.conv2d(x, kernel_h, groups=C)
-            x = F.pad(x, [0, 0, pad, pad], mode='reflect')
-            x = F.conv2d(x, kernel_v, groups=C)
-            return x
-
-        chunk_size = max(1, min(8, T_frames))
-
-        debug.log(f"Sharpening {T_frames} frames on GPU in-place (chunks of {chunk_size})...",
-                  category="color", indent_level=1)
-
-        for start in range(0, T_frames, chunk_size):
-            end = min(start + chunk_size, T_frames)
-            chunk = video[start:end].to(device=gpu_device, dtype=torch.float32).permute(0, 3, 1, 2)
-
-            blur = _gpu_blur(chunk)
-            residual = chunk - blur
-            del blur
-
-            mask = (residual.abs() * 255.0 > usm_threshold).float()
-            soft_mask = _gpu_blur(mask)
-            del mask
-
-            sharp = (chunk + usm_weight * residual).clamp_(0, 1)
-            out = soft_mask * sharp + (1.0 - soft_mask) * chunk
-            del residual, soft_mask, sharp, chunk
-
-            video[start:end] = out.permute(0, 2, 3, 1).float().to(dtype=torch.float16).cpu()
-            del out
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            elif torch.backends.mps.is_available():
-                torch.mps.empty_cache()
-
-        del kernel_h, kernel_v, gauss_1d
-        debug.log("USM sharpening completed (GPU)", category="color", force=True)
-    
     ctx['final_video'] = video
     
     if 'transformed_video' in ctx:

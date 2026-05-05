@@ -6,7 +6,6 @@ These are helper functions used to prepare, configure, and support the video ups
 but do not contain the core 4-phase orchestration logic itself.
 
 Setup Functions:
-- prepare_video_transforms: Create video transformation pipeline (resize, pad, normalize)
 - setup_video_transform: Initialize transforms and compute target dimensions
 - setup_generation_context: Initialize context with device configuration
 - prepare_runner: Configure VideoDiffusionInfer with all settings
@@ -34,8 +33,7 @@ from torchvision.transforms import Compose, Lambda, Normalize
 
 from .model_configuration import configure_runner
 from .infer import VideoDiffusionInfer
-from ..data.image.transforms.divisible_crop import DivisiblePad
-from ..data.image.transforms.na_resize import NaResize
+from ..video_utils import VideoPrePostProcess
 from ..optimization.compatibility import COMPUTE_DTYPE, BFLOAT16_SUPPORTED
 from ..optimization.memory_manager import manage_tensor
 from ..utils.constants import get_script_directory
@@ -50,64 +48,6 @@ EMBEDDING_NAME_MAP = {
     "pos_emb.pt.enc": "model.part3.bin.enc",
     "neg_emb.pt.enc": "model.part1.bin.enc",
 }
-
-
-def prepare_video_transforms(resolution: int, max_resolution: int = 0, debug: Optional['Debug'] = None) -> Compose:
-    """
-    Prepare optimized video transformation pipeline
-    
-    Args:
-        resolution (int): Target resolution for shortest edge
-        max_resolution (int): Maximum resolution for any edge (0 = no limit)
-        debug (Debug, optional): Debug instance for logging
-        
-    Returns:
-        Compose: Configured transformation pipeline
-        
-    Features:
-        - Resolution-aware upscaling (no downsampling)
-        - Optional max resolution constraint on longest edge
-        - Padding to divisible by 16 (no data loss)
-        - Proper normalization for model compatibility
-        - Memory-efficient tensor operations
-    """
-    if debug:
-        msg = f"Initializing video transformation pipeline for {resolution}px (shortest edge)"
-        if max_resolution > 0:
-            msg += f", max {max_resolution}px (any edge)"
-        debug.log(msg, category="setup", indent_level=1)
-    
-    return Compose([
-        NaResize(
-            resolution=resolution,
-            mode="side",
-            downsample_only=False,
-            max_resolution=max_resolution,
-        ),
-        Lambda(lambda x: torch.clamp(x, 0.0, 1.0)),
-        DivisiblePad((16, 16)),
-        Normalize(0.5, 0.5),
-        Lambda(lambda x: x.permute(1, 0, 2, 3)),  # t c h w -> c t h w (faster than Rearrange)
-    ])
-
-
-def prepare_video_pixel_transform(resolution: int, max_resolution: int = 0,
-                                   debug: Optional['Debug'] = None):
-    """Pre-normalize transform: resize + clamp + pad.
-
-    Returns [T, C, H, W] in [0, 1] (no Normalize, no CTHW permute).
-    Used to write the transform memmap as uint8/uint16 instead of fp16.
-    """
-    return Compose([
-        NaResize(
-            resolution=resolution,
-            mode="side",
-            downsample_only=False,
-            max_resolution=max_resolution,
-        ),
-        Lambda(lambda x: torch.clamp(x, 0.0, 1.0)),
-        DivisiblePad((16, 16)),
-    ])
 
 
 def setup_video_transform(ctx: Dict[str, Any], resolution: int, max_resolution: int = 0, 
@@ -127,58 +67,58 @@ def setup_video_transform(ctx: Dict[str, Any], resolution: int, max_resolution: 
         (true_height, true_width, padded_height, padded_width) if dimensions computed,
         (0, 0, 0, 0) otherwise
     """
-    # Check if transform exists AND is not None
-    existing_transform = ctx.get('video_transform')
-    
-    if existing_transform is not None:
-        # Transform exists - check if we need to compute dimensions
-        if 'true_target_dims' in ctx and sample_frame is not None:
-            # Return cached dimensions + recompute padded from sample
-            true_h, true_w = ctx['true_target_dims']
-            transformed = existing_transform(sample_frame)
-            padded_h, padded_w = transformed.shape[-2:]
+    # Check if VPP (or legacy resizer) already exists
+    vpp = ctx.get('vpp')
+
+    if vpp is not None:
+        if vpp.true_dims is not None and sample_frame is not None:
+            true_h, true_w = vpp.true_dims
+            padded_h, padded_w = vpp.padded_dims
             if debug:
                 debug.log("Reusing pre-initialized video transformation pipeline", category="reuse")
             return true_h, true_w, padded_h, padded_w
         elif debug:
             debug.log("Reusing pre-initialized video transformation pipeline", category="reuse")
         return 0, 0, 0, 0
-    
-    # Create transformation pipeline (first time or after cleanup)
-    ctx['video_transform'] = prepare_video_transforms(resolution, max_resolution, debug)
-    
-    # Compute dimensions if sample frame provided
+
+    # Create VideoPrePostProcess — single source of truth for dimensions
+    vpp = VideoPrePostProcess(
+        resolution=resolution,
+        max_resolution=max_resolution,
+        source_bit_depth=ctx.get('source_bit_depth', 8),
+        color_overrides=ctx.get('color_overrides'),
+    )
+    ctx['vpp'] = vpp
+
+    ctx['video_transform'] = Compose([
+        vpp.resize,
+        Lambda(lambda x: torch.clamp(x, 0.0, 1.0)),
+        Normalize(0.5, 0.5),
+        Lambda(lambda x: x.permute(1, 0, 2, 3)),  # t c h w -> c t h w
+    ])
+
+    if debug:
+        msg = f"Initializing video transformation pipeline for {resolution}px (shortest edge)"
+        if max_resolution > 0:
+            msg += f", max {max_resolution}px (any edge)"
+        debug.log(msg, category="setup", indent_level=1)
+
+    # Compute dimensions by running resizer on sample frame
     if sample_frame is not None:
-        # Get true target size (after resize, before padding)
-        temp_transform = Compose([
-            NaResize(resolution=resolution, mode="side", downsample_only=False, max_resolution=max_resolution),
-            Lambda(lambda x: torch.clamp(x, 0.0, 1.0))
-        ])
-        resized_sample = temp_transform(sample_frame)
-        true_h, true_w = resized_sample.shape[-2:]
-        
-        # Round to even numbers for video codec compatibility (libx264 requirement)
-        true_h = (true_h // 2) * 2
-        true_w = (true_w // 2) * 2
-        
-        # Cache for later use in trimming
-        ctx['true_target_dims'] = (true_h, true_w)
-        
-        # Get padded dimensions
-        transformed_sample = ctx['video_transform'](sample_frame)
-        padded_h, padded_w = transformed_sample.shape[-2:]
-        
+        vpp.resize(sample_frame)
+        true_h, true_w = vpp.true_dims
+        padded_h, padded_w = vpp.padded_dims
+
         if debug:
             if true_h == padded_h and true_w == padded_w:
-                debug.log(f"Target dimensions: {true_w}x{true_h} (no padding needed)", 
+                debug.log(f"Target dimensions: {true_w}x{true_h} (no padding needed)",
                          category="setup", indent_level=1)
             else:
-                debug.log(f"Target dimensions: {true_w}x{true_h} (padded to {padded_w}x{padded_h} for processing)", 
+                debug.log(f"Target dimensions: {true_w}x{true_h} (padded to {padded_w}x{padded_h} for processing)",
                          category="setup", indent_level=1)
-        
-        del temp_transform, resized_sample, transformed_sample
+
         return true_h, true_w, padded_h, padded_w
-    
+
     return 0, 0, 0, 0
 
 
@@ -307,35 +247,14 @@ def log_generation_start(info: Dict[str, Any], debug: Optional['Debug'] = None) 
     debug.log(f"{params_info}", category="generation", force=True, indent_level=1)
 
 
+from ..video_utils import Blend
+
+_hann_blender = Blend(mode="hann")
+
+
 def blend_overlapping_frames(prev_tail: torch.Tensor, cur_head: torch.Tensor, overlap: int) -> torch.Tensor:
-    """
-    Blend two overlapping frame sequences in-place.
-    
-    Args:
-        prev_tail: Last `overlap` frames from previous batch [overlap, H, W, C]
-        cur_head: First `overlap` frames from current batch [overlap, H, W, C]
-        overlap: Number of overlapping frames
-        
-    Returns:
-        torch.Tensor: Blended frames [overlap, H, W, C]
-    """
-    device = prev_tail.device
-    dtype = prev_tail.dtype
-    
-    # Smooth crossfade with Hann window for overlap >= 3, linear for smaller overlaps
-    if overlap >= 3:
-        t = torch.linspace(0.0, 1.0, steps=overlap, device=device, dtype=dtype)
-        blend_start = 1.0 / 3.0
-        blend_end = 2.0 / 3.0
-        u = ((t - blend_start) / (blend_end - blend_start)).clamp(0.0, 1.0)
-        w_prev_1d = 0.5 + 0.5 * torch.cos(torch.pi * u)  # Hann window
-    else:
-        w_prev_1d = torch.linspace(1.0, 0.0, steps=overlap, device=device, dtype=dtype)
-    
-    w_prev = w_prev_1d.view(overlap, 1, 1, 1)
-    w_cur = 1.0 - w_prev
-    
-    return prev_tail * w_prev + cur_head * w_cur
+    """Blend two overlapping frame sequences ``[overlap, H, W, C]`` with Hann crossfade."""
+    return _hann_blender.temporal_thwc(prev_tail, cur_head, overlap)
 
 
 def setup_generation_context(

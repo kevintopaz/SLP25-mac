@@ -23,9 +23,13 @@ Compared to generation_phases_latent.py (latent-domain chunking):
 import time
 import logging
 import math
+import numpy as np
 import torch
 import torch.nn.functional as F
-from typing import Callable, Dict, Any, Optional, Tuple, List
+from typing import Callable, Dict, Any, Optional, Tuple, List, Union, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..video_utils import VideoPrePostProcess
 
 from .generation_phases_latent import (
     encode_whole_video,
@@ -43,6 +47,7 @@ _CTX_PERSISTENT_KEYS = frozenset({
     'vae_offload_device', 'tensor_offload_device',
     'compute_dtype', 'cache_context', 'text_embeds',
     '_dit_latent_chunk', '_dit_latent_overlap',
+    'vpp', 'video_transform',
 })
 
 
@@ -57,30 +62,18 @@ def _reset_ctx(ctx: Dict[str, Any]) -> None:
             del ctx[key]
 
 
+from ..video_utils import Blend
+
+_blender = Blend(mode="linear")
+
+
 def _blend_overlapping_frames(
     prev_tail: torch.Tensor,
     cur_head: torch.Tensor,
     overlap: int,
 ) -> torch.Tensor:
-    """
-    Blend two overlapping frame sequences using linear crossfade.
-
-    Args:
-        prev_tail: Last *overlap* frames from previous batch ``[overlap, H, W, C]``.
-        cur_head:  First *overlap* frames from current batch ``[overlap, H, W, C]``.
-        overlap:   Number of overlapping frames.
-
-    Returns:
-        Blended frames ``[overlap, H, W, C]``.
-    """
-    device = prev_tail.device
-    dtype = prev_tail.dtype
-
-    w_prev_1d = torch.linspace(1.0, 0.0, steps=overlap, device=device, dtype=dtype)
-    w_prev = w_prev_1d.view(overlap, 1, 1, 1)
-    w_cur = 1.0 - w_prev
-
-    return prev_tail * w_prev + cur_head * w_cur
+    """Blend two overlapping frame sequences ``[overlap, H, W, C]``."""
+    return _blender.temporal_thwc(prev_tail, cur_head, overlap)
 
 
 def _blend_overlapping_transformed(
@@ -88,19 +81,8 @@ def _blend_overlapping_transformed(
     cur_head: torch.Tensor,
     overlap: int,
 ) -> torch.Tensor:
-    """
-    Blend overlapping transformed frames ``[C, T, H, W]`` layout.
-
-    Same linear crossfade as ``_blend_overlapping_frames`` but for CTHW tensors.
-    """
-    device = prev_tail.device
-    dtype = prev_tail.dtype
-
-    w_prev_1d = torch.linspace(1.0, 0.0, steps=overlap, device=device, dtype=dtype)
-    w_prev = w_prev_1d.view(1, overlap, 1, 1)
-    w_cur = 1.0 - w_prev
-
-    return prev_tail * w_prev + cur_head * w_cur
+    """Blend overlapping transformed frames ``[C, T, H, W]``."""
+    return _blender.temporal_cthw(prev_tail, cur_head, overlap)
 
 
 def _compute_dit_tiles(
@@ -150,7 +132,7 @@ def _compute_dit_tiles(
 def process_pix_chunk(
     runner,
     ctx: Dict[str, Any],
-    chunk_frames: torch.Tensor,
+    chunk_frames,
     debug,
     resolution: int,
     max_resolution: int,
@@ -172,7 +154,8 @@ def process_pix_chunk(
     Args:
         runner:             VideoDiffusionInfer instance (DiT + VAE loaded).
         ctx:                Shared generation context.
-        chunk_frames:       Input frames ``[T, H, W, C]`` float16 ``[0, 1]``.
+        chunk_frames:       Input frames ``[T, H, W, C]`` raw uint8/uint16 numpy
+                            or legacy float16 ``[0, 1]`` tensor.
         debug:              Debug logger.
         resolution:         Target shortest-edge resolution.
         max_resolution:     Max resolution cap (0 = no limit).
@@ -258,54 +241,27 @@ def process_pix_chunk(
     }
 
     # ── Streaming decode path ──
-    # When _decode_tile_infos is in ctx, the decoded video is still on disk
+    # When _decode_meta is in ctx, the decoded video is still on disk
     # as tile memmaps.  Return metadata instead of full tensors so the caller
     # can do streaming assembly + post-process in temporal batches.
-    _tile_infos = ctx.pop('_decode_tile_infos', None)
-    if _tile_infos is not None:
-        _mm_meta = ctx.get('_transformed_video_memmap')
-        _trim = ctx.get('_transformed_video_trim')
-        return {
-            'tile_infos': _tile_infos,
-            'pixel_H': ctx.pop('_decode_pixel_H'),
-            'pixel_W': ctx.pop('_decode_pixel_W'),
-            'T_pix': ctx.pop('_decode_T_pix'),
-            'transform_memmap': _mm_meta,
-            'transform_trim': _trim,
-        }, None, chunk_timings
+    _dm = ctx.pop('_decode_meta', None)
+    if _dm is not None:
+        _dm['vpp'] = ctx.get('vpp')
+        return _dm, None, chunk_timings
 
     # ── Legacy path: materialise full tensors ──
     decoded = ctx['decoded_video']
     if decoded.is_cuda or (hasattr(decoded, 'is_mps') and decoded.is_mps):
         decoded = decoded.cpu()
 
-    _mm_meta = ctx.pop('_transformed_video_memmap', None)
-    if _mm_meta is not None and 'transformed_video' not in ctx:
-        import numpy as np, os
-        mm = np.memmap(_mm_meta['path'], dtype=_mm_meta['dtype'],
-                       mode='r', shape=_mm_meta['shape'])
-        raw = np.array(mm)
-        del mm
-        _mm_layout = _mm_meta.get('layout', 'CTHW')
-        _mm_scale = _mm_meta.get('scale', 0.0)
-        if _mm_scale > 0:
-            raw = raw.astype(np.float32) / _mm_scale
-            raw = (raw * 2.0 - 1.0).astype(np.float16)
-        if _mm_layout == 'THWC':
-            raw = np.transpose(raw, (3, 0, 1, 2))  # THWC → CTHW
-        ctx['transformed_video'] = torch.from_numpy(raw)
-        del raw
-        trim = ctx.pop('_transformed_video_trim', None)
-        tv = ctx['transformed_video']
-        if trim is not None and (tv.shape[-2] != trim[0] or tv.shape[-1] != trim[1]):
-            ctx['transformed_video'] = torch.nn.functional.interpolate(
-                tv.float(), size=(trim[0], trim[1]),
-                mode='bicubic', align_corners=False).to(tv.dtype)
-            del tv
-        try:
-            os.unlink(_mm_meta['path'])
-        except OSError:
-            pass
+    _vpp = ctx.get('vpp')
+    if _vpp is not None and _vpp.memmap is not None and 'transformed_video' not in ctx:
+        tv = _vpp.read_reference(as_cthw=True)
+        if _vpp.needs_resize_back:
+            tv = _vpp.resize_back(tv)
+        ctx['transformed_video'] = tv
+        del tv
+        _vpp.cleanup_memmap()
 
     transformed = ctx.get('transformed_video')
     if transformed is not None:
@@ -326,131 +282,31 @@ def _postprocess_frames_inline(
     usm_radius: int,
     usm_threshold: int,
     device: str = "cuda:0",
-) -> torch.Tensor:
-    """
-    Post-process a small batch of decoded frames **in-place** so they can be
-    written to disk immediately.
+    vpp: Optional['VideoPrePostProcess'] = None,
+) -> Union[np.ndarray, torch.Tensor]:
+    """Post-process decoded frames (color correct + denormalize + sharpen).
 
-    This is the streaming equivalent of ``postprocess_latent_output`` —
-    it applies color correction + USM sharpening on a per-batch basis
-    instead of on the whole video.
+    Delegates to ``vpp.color_correct_and_finalize()`` when available.
 
     Args:
         decoded:          ``[T, H, W, C]`` in ``[-1, 1]`` on **CPU**.
-        transformed:      ``[C, T, H, W]`` in ``[-1, 1]`` on **CPU** (reference
-                          for color correction, or ``None``).
+        transformed:      ``[C, T, H, W]`` in ``[-1, 1]`` on **CPU** (reference).
         color_correction: Color-correction method name.
-        usm_weight:       USM sharpening weight (0 = disabled).
-        usm_radius:       USM Gaussian kernel size (must be odd).
-        usm_threshold:    USM pixel-difference threshold.
+        usm_weight, usm_radius, usm_threshold: USM params.
         device:           GPU device string.
+        vpp:              VideoPrePostProcess facade.
 
     Returns:
-        ``[T, H, W, C]`` float16 ``[0, 1]`` on **CPU**, ready for saving.
+        When *vpp* is set: ``np.ndarray [T, H, W, C]`` uint8/uint16 pixel values.
+        Fallback:          ``Tensor [T, H, W, C]`` float16 ``[0, 1]`` on CPU.
     """
-    T = decoded.shape[0]
-    if T == 0:
-        return decoded.to(dtype=torch.float16)
+    if vpp is not None:
+        vpp.configure(color_method=color_correction,
+                      usm_weight=usm_weight, usm_radius=usm_radius,
+                      usm_threshold=usm_threshold)
+        return vpp.color_correct_and_finalize(decoded, reference=transformed, device=device)
 
-    # ── Color correction ──
-    if color_correction != "none" and transformed is not None:
-        from ..utils.color_fix import (
-            lab_color_transfer, lab_reinhard_transfer, wavelet_reconstruction,
-            hsv_saturation_histogram_match, wavelet_adaptive_color_correction,
-            adaptive_instance_normalization,
-        )
-
-        # transformed: [C, T, H, W] → reference_cpu: [T, C, H, W]
-        reference_cpu = transformed.permute(1, 0, 2, 3)
-
-        # video: [T, H, W, C] → [T, C, H, W]
-        video = decoded.permute(0, 3, 1, 2).to(device)
-
-        H, W = video.shape[-2], video.shape[-1]
-        pix = H * W
-        if pix > 4_000_000:
-            chunk_sz = max(1, min(4, T))
-        elif pix > 2_000_000:
-            chunk_sz = max(1, min(8, T))
-        else:
-            chunk_sz = max(1, min(32, T))
-        result_chunks = []
-        for s in range(0, T, chunk_sz):
-            e = min(s + chunk_sz, T)
-            vc = video[s:e]
-            rc = reference_cpu[s:e].to(device)
-
-            if color_correction == "lab":
-                vc = lab_color_transfer(vc, rc, None, luminance_weight=0.8)
-            elif color_correction == "lab_reinhard":
-                vc = lab_reinhard_transfer(vc, rc, None)
-            elif color_correction == "wavelet":
-                vc = wavelet_reconstruction(vc, rc, None)
-            elif color_correction == "hsv":
-                orig_dev = vc.device
-                vc = hsv_saturation_histogram_match(vc.cpu(), rc.cpu(), None).to(orig_dev)
-            elif color_correction == "wavelet_adaptive":
-                vc = wavelet_adaptive_color_correction(vc, rc, None)
-            elif color_correction == "adain":
-                vc = adaptive_instance_normalization(vc, rc)
-
-            vc.clamp_(-1, 1).mul_(0.5).add_(0.5)
-            result_chunks.append(vc.permute(0, 2, 3, 1).float().to(dtype=torch.float16).cpu())
-            del rc
-        del video
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        elif torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-        video_out = torch.cat(result_chunks, dim=0)
-        del result_chunks, reference_cpu
-    else:
-        video_out = decoded.clamp(-1, 1).mul(0.5).add(0.5).float().to(dtype=torch.float16)
-
-    # ── USM sharpening ──
-    if usm_weight > 0:
-        radius = usm_radius if usm_radius % 2 == 1 else usm_radius + 1
-        gpu_device = torch.device(device)
-        _, H, W, C = video_out.shape
-
-        sigma = 0.3 * ((radius - 1) * 0.5 - 1) + 0.8
-        ax = torch.arange(radius, device=gpu_device, dtype=torch.float32) - (radius - 1) / 2.0
-        gauss_1d = torch.exp(-0.5 * (ax / sigma) ** 2)
-        gauss_1d = gauss_1d / gauss_1d.sum()
-        pad = radius // 2
-
-        kernel_h = gauss_1d.view(1, 1, 1, -1).expand(C, -1, -1, -1).contiguous()
-        kernel_v = gauss_1d.view(1, 1, -1, 1).expand(C, -1, -1, -1).contiguous()
-
-        def _blur(x):
-            x = F.pad(x, [pad, pad, 0, 0], mode='reflect')
-            x = F.conv2d(x, kernel_h, groups=C)
-            x = F.pad(x, [0, 0, pad, pad], mode='reflect')
-            x = F.conv2d(x, kernel_v, groups=C)
-            return x
-
-        usm_chunk = max(1, min(8, T))
-        for s in range(0, T, usm_chunk):
-            e = min(s + usm_chunk, T)
-            chunk = video_out[s:e].to(device=gpu_device, dtype=torch.float32).permute(0, 3, 1, 2)
-            blur = _blur(chunk)
-            residual = chunk - blur
-            del blur
-            mask = (residual.abs() * 255.0 > usm_threshold).float()
-            soft_mask = _blur(mask)
-            del mask
-            sharp = (chunk + usm_weight * residual).clamp_(0, 1)
-            out = soft_mask * sharp + (1.0 - soft_mask) * chunk
-            del residual, soft_mask, sharp, chunk
-            video_out[s:e] = out.permute(0, 2, 3, 1).float().to(dtype=torch.float16).cpu()
-            del out
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            elif torch.backends.mps.is_available():
-                torch.mps.empty_cache()
-
-        del kernel_h, kernel_v, gauss_1d
-
+    video_out = decoded.clamp(-1, 1).mul(0.5).add(0.5).float().to(dtype=torch.float16)
     return video_out
 
 
@@ -466,11 +322,6 @@ def _streaming_postprocess_chunk(
     extra_skip_val: int,
     overlap_dec: Optional[torch.Tensor],
     overlap_trans: Optional[torch.Tensor],
-    color_correction: str,
-    usm_weight: float,
-    usm_radius: int,
-    usm_threshold: int,
-    device: str,
     pp_func,
     debug,
 ):
@@ -486,7 +337,7 @@ def _streaming_postprocess_chunk(
         next chunk, or (None, None) if this is the last chunk.
     """
     import numpy as np
-    from ..optimization.mlx_video_vae import (
+    from ..video_utils.tile_assembly import (
         assemble_tiles_from_disk_range, cleanup_tile_files,
     )
 
@@ -494,18 +345,8 @@ def _streaming_postprocess_chunk(
     pixel_H = decode_meta['pixel_H']
     pixel_W = decode_meta['pixel_W']
     T_pix = decode_meta['T_pix']
-    transform_mm_meta = decode_meta.get('transform_memmap')
-    transform_trim = decode_meta.get('transform_trim')
-
-    # Open transform memmap for reading colour-correction reference.
-    trans_mm = None
-    if transform_mm_meta is not None:
-        trans_mm = np.memmap(
-            transform_mm_meta['path'],
-            dtype=transform_mm_meta['dtype'],
-            mode='r',
-            shape=transform_mm_meta['shape'],
-        )
+    _vpp = decode_meta.get('vpp')
+    _has_transform_ref = (_vpp is not None and _vpp.get_memmap("input") is not None)
 
     def _read_decoded_range(start, count):
         """Assemble spatial tiles for frames [start : start+count]."""
@@ -514,46 +355,22 @@ def _streaming_postprocess_chunk(
             tile_infos, pixel_H, pixel_W, start, count,
         )
         dec = torch.from_numpy(dec_np)  # [count, H, W, 3] fp16
-        if transform_trim is not None and (dec.shape[1] != transform_trim[0] or dec.shape[2] != transform_trim[1]):
-            dec = torch.nn.functional.interpolate(
-                dec.permute(0, 3, 1, 2).float(), size=(transform_trim[0], transform_trim[1]),
-                mode='bicubic', align_corners=False).to(dec.dtype).permute(0, 2, 3, 1)
+        if _vpp is not None and _vpp.needs_resize_back:
+            dec = _vpp.resize_back(dec)
         return dec
-
-    _trans_layout = (transform_mm_meta or {}).get('layout', 'CTHW')
-    _trans_scale = (transform_mm_meta or {}).get('scale', 0.0)
 
     def _read_transform_range(start, count):
         """Read colour-correction reference for frames [start : start+count]."""
-        if trans_mm is None:
+        if not _has_transform_ref:
             return None
-        if _trans_layout == 'THWC':
-            count = min(count, trans_mm.shape[0] - start)
-            chunk = np.array(trans_mm[start:start + count, :, :, :])  # [T, H, W, C]
-            if _trans_scale > 0:
-                chunk = chunk.astype(np.float32) / _trans_scale
-                chunk = (chunk * 2.0 - 1.0).astype(np.float16)
-            # THWC → CTHW
-            chunk = np.transpose(chunk, (3, 0, 1, 2))
-        else:
-            count = min(count, trans_mm.shape[1] - start)
-            chunk = np.array(trans_mm[:, start:start + count, :, :])
-        t = torch.from_numpy(chunk)
-        if transform_trim is not None and (t.shape[-2] != transform_trim[0] or t.shape[-1] != transform_trim[1]):
-            t = torch.nn.functional.interpolate(
-                t.float(), size=(transform_trim[0], transform_trim[1]),
-                mode='bicubic', align_corners=False).to(t.dtype)
-        return t  # [C, count, H, W] fp16
+        t = _vpp.read_reference(start, count, as_cthw=True)
+        if _vpp.needs_resize_back:
+            t = _vpp.resize_back(t)
+        return t
 
     def _cleanup_all():
-        """Clean up tile files and transform memmap."""
-        cleanup_tile_files(tile_infos)
-        if transform_mm_meta is not None:
-            import os as _os
-            try:
-                _os.unlink(transform_mm_meta['path'])
-            except OSError:
-                pass
+        """Clean up tile files."""
+        cleanup_tile_files(tile_infos, vpp=_vpp)
 
     # Materialise the full decoded + transformed only for the overlap
     # region (small: ≤21 frames for 4K).  Process the rest in streaming
@@ -699,7 +516,7 @@ def process_video_pix_chunked(
 
     **Streaming mode** (``output_callback is not None``):
         Finalized frames are post-processed per-chunk and streamed via
-        ``output_callback(tensor)`` (``[N, H, W, C]`` float16 ``[0, 1]``).
+        ``output_callback(frames)`` (``[N, H, W, C]`` numpy uint8/uint16 pixels).
         Only the overlap buffer is kept in RAM.  Returns ``(None, timings)``.
 
     **Accumulate mode** (``output_callback is None``):
@@ -709,8 +526,9 @@ def process_video_pix_chunked(
     Args:
         runner:             VideoDiffusionInfer (loaded DiT + VAE).
         ctx:                Shared generation context dict.
-        frames:             Input frames -- ``torch.Tensor [T, H, W, C]`` or a
-                            lazy reader with ``.shape`` and slice support.
+        frames:             Input frames -- ``np.ndarray [T, H, W, C]`` raw
+                            uint8/uint16, a lazy reader with ``.shape`` and
+                            slice support, or legacy ``torch.Tensor``.
         debug:              Debug logger.
         resolution:         Target shortest-edge resolution.
         max_resolution:     Max resolution cap (0 = no limit).
@@ -822,6 +640,7 @@ def process_video_pix_chunked(
         processed = _postprocess_frames_inline(
             dec, trans, color_correction,
             usm_weight, usm_radius, usm_threshold, device,
+            vpp=ctx.get('vpp'),
         )
         if streaming:
             output_callback(processed)
@@ -909,8 +728,7 @@ def process_video_pix_chunked(
                 decoded, transformed = _streaming_postprocess_chunk(
                     decoded, ci, num_chunks, is_last, overlap,
                     extra_skip[ci], overlap_dec, overlap_trans,
-                    color_correction, usm_weight, usm_radius,
-                    usm_threshold, device, _pp, debug,
+                    _pp, debug,
                 )
                 # _streaming_postprocess_chunk handles blending, _pp calls,
                 # and returns new overlap buffers.
@@ -1201,7 +1019,8 @@ def process_video_pix_chunked(
         }
 
         result = ctx['final_video']
-        if result.is_cuda or (hasattr(result, 'is_mps') and result.is_mps):
-            result = result.cpu()
+        if isinstance(result, torch.Tensor):
+            if result.is_cuda or (hasattr(result, 'is_mps') and result.is_mps):
+                result = result.cpu()
 
         return result, timings

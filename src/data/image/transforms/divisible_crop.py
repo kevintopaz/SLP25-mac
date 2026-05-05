@@ -15,6 +15,7 @@
 from typing import Union
 import torch
 from PIL import Image
+from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
 
 
@@ -41,11 +42,8 @@ class DivisibleCrop:
 
 
 class DivisiblePad:
-    """
-    Resize image so dimensions are divisible by a factor using Lanczos.
-    Only adds 0-15 pixels (for factor=16), so the stretch is imperceptible.
-    Lanczos (sinc-windowed sinc) preserves sharp edges better than bicubic
-    with minimal ringing at this tiny scale.
+    """Legacy fallback — kept for backward compatibility.
+    Prefer ResizeDivisible which combines resize + divisibility in one step.
     """
     def __init__(self, factor):
         if not isinstance(factor, tuple):
@@ -66,29 +64,11 @@ class DivisiblePad:
         if new_height == height and new_width == width:
             return image
 
+        antialias = not (isinstance(image, torch.Tensor) and image.device.type == 'mps')
         if isinstance(image, torch.Tensor):
-            # TVF.resize has no Lanczos mode; round-trip through PIL per frame.
-            # Input is float [0, 1] with shape (C, H, W) or (T, C, H, W).
-            import numpy as np
-            orig_dtype = image.dtype
-            if image.ndim == 3:
-                arr = image.float().permute(1, 2, 0).clamp(0, 1).mul(255).byte().numpy()
-                pil = Image.fromarray(arr)
-                pil = pil.resize((new_width, new_height), Image.LANCZOS)
-                image = torch.from_numpy(np.array(pil)).permute(2, 0, 1).float().div(255.0).to(orig_dtype)
-            elif image.ndim == 4:
-                frames = []
-                for i in range(image.shape[0]):
-                    arr = image[i].float().permute(1, 2, 0).clamp(0, 1).mul(255).byte().numpy()
-                    pil = Image.fromarray(arr)
-                    pil = pil.resize((new_width, new_height), Image.LANCZOS)
-                    frames.append(torch.from_numpy(np.array(pil)).permute(2, 0, 1))
-                image = torch.stack(frames).float().div(255.0).to(orig_dtype)
-            else:
-                image = TVF.resize(image, [new_height, new_width],
-                                   interpolation=TVF.InterpolationMode.BICUBIC,
-                                   antialias=True)
+            image = TVF.resize(image, [new_height, new_width],
+                               interpolation=InterpolationMode.BILINEAR,
+                               antialias=antialias)
         elif isinstance(image, Image.Image):
-            image = image.resize((new_width, new_height), Image.LANCZOS)
-
+            image = image.resize((new_width, new_height), Image.BILINEAR)
         return image
