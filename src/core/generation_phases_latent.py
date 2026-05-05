@@ -236,7 +236,8 @@ def get_text_embeddings(
 def encode_whole_video(
     runner: 'VideoDiffusionInfer',
     ctx: Dict[str, Any],
-    images,
+    reader_fn: Callable[[int, int], Any],
+    frame_count: int,
     debug: 'Debug',
     resolution: int = 1080,
     max_resolution: int = 0,
@@ -247,21 +248,21 @@ def encode_whole_video(
 
     Parameters
     ----------
-    images : np.ndarray or torch.Tensor
-        ``[T, H, W, C]`` raw uint8/uint16 pixels (numpy) or legacy
-        float16 ``[0, 1]`` tensor.
+    reader_fn : callable(start, count) -> np.ndarray
+        Returns ``[count, H, W, C]`` raw uint8/uint16 pixels for frames
+        ``[start, start+count)``.
+    frame_count : int
+        Total number of input frames.
     """
     debug.log("", category="none", force=True)
     debug.log("━━━━━━━━ Phase 1: VAE Encode (whole video) ━━━━━━━━", category="none", force=True)
     debug.start_timer("phase1_encode_whole")
-    
-    import numpy as _np
-    _is_numpy = isinstance(images, _np.ndarray)
 
-    ctx['total_frames'] = len(images)
-    T_input = images.shape[0]
+    T_input = frame_count
 
-    debug.log(f"Input frames: shape={images.shape}, dtype={images.dtype}", category="vae", force=True)
+    ctx['total_frames'] = T_input
+
+    debug.log(f"Input: {T_input} frames (streamed via reader_fn)", category="vae", force=True)
 
     # Materialize VAE if still on meta device
     if runner.vae and next(runner.vae.parameters()).device.type == 'meta':
@@ -283,29 +284,14 @@ def encode_whole_video(
 
     # Ingest: resize + store to disk-backed memmap via VPP.
     # VPP probes dimensions internally; H_out/W_out come from vpp.padded_dims.
-    _images_ref = images
-    if _is_numpy:
-        vpp.ingest(
-            reader_fn=lambda start, count: _images_ref[start:start + count],
-            total_frames=T_input,
-            padded_frames=T_padded,
-        )
-    else:
-        def _legacy_reader(start, count):
-            chunk = _images_ref[start:start + count]
-            return (chunk.cpu().float().clamp(0.0, 1.0).numpy() * 255.0).astype(_np.uint8)
-        vpp.ingest(
-            reader_fn=_legacy_reader,
-            total_frames=T_input,
-            padded_frames=T_padded,
-        )
+    vpp.ingest(
+        reader_fn=reader_fn,
+        total_frames=T_input,
+        padded_frames=T_padded,
+    )
     debug.log(f"Batch-transformed to memmap: {vpp.memmap}",
               category="memory", force=True)
 
-    # Free input frames — everything is now in the memmap.
-    del images, _images_ref
-    if 'input_images' in ctx:
-        del ctx['input_images']
     import gc; gc.collect()
 
     _hybrid = getattr(runner, '_hybrid_encode_active', False)

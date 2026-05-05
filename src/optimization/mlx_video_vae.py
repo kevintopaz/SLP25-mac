@@ -339,36 +339,61 @@ class CausalConv(nn.Module):
         processed one at a time with ``mx.eval`` after each, matching the
         ``_per_frame`` memory profile.  Otherwise all T frames are stacked
         and convolved in one shot (fast but large intermediate).
+
+        Memory note: avoids materialising a padded ``xp = concat(cache, x)``
+        buffer (which would duplicate ``x`` in MLX memory — ~1.15 GB for the
+        first ResnetBlock at 640×640, T=11, 128 ch).  Instead, indexes
+        virtually across the (cache, x) sequence.  Bit-identical output.
         """
         B, T, H, W, C = x.shape
         if self.kT <= 1:
             return self._batched(x)
 
         pad_n = self.temporal_padding * 2  # kT - 1
-        if self._cache is None:
-            first = mx.broadcast_to(x[:, :1], [B, pad_n, H, W, C])
-            xp = mx.concatenate([first, x], axis=1)
-        else:
-            xp = mx.concatenate([self._cache, x], axis=1)
+        old_cache = self._cache
+        cache_len = old_cache.shape[1] if old_cache is not None else pad_n
 
-        self._cache = _detach_copy(xp[:, -(self.kT - 1):])
+        # Virtual indexing into the (cache + x) sequence — never materialise xp.
+        # idx range: [0, cache_len + T)
+        def vget(idx):
+            src = idx - cache_len
+            if src >= 0:
+                return x[:, src]
+            if old_cache is not None:
+                return old_cache[:, idx]
+            return x[:, 0]  # first-frame replication when no cache yet
 
-        T_out = xp.shape[1] - self.kT + 1  # == T (stride=1)
+        T_padded = cache_len + T
+        T_out = T_padded - self.kT + 1  # stride=1; equals T
+
+        # New cache = last (kT-1) virtual frames.  In normal operation these
+        # all come from x; vget handles the edge case where T < kT-1.
+        # mx.stack from individual vget slices already creates an independent
+        # contiguous buffer — no _detach_copy needed.
+        new_cache = mx.stack(
+            [vget(i) for i in range(T_padded - (self.kT - 1), T_padded)],
+            axis=1,
+        )
+        mx.eval(new_cache)
 
         # Adaptive: use fast batched path when the stacked intermediate is
         # small enough (later encoder stages).  Same heuristic as __call__.
         stacked_bytes = B * T_out * H * W * self.kT * C * 2
         if not low_mem or stacked_bytes <= _STREAMING_BATCHED_MAX:
-            windows = [xp[:, i : i + T_out] for i in range(self.kT)]
+            windows = [
+                mx.stack([vget(t + k) for t in range(T_out)], axis=1)
+                for k in range(self.kT)
+            ]
             stacked = mx.concatenate(windows, axis=-1)
             flat = stacked.reshape(B * T_out, H, W, self.kT * C)
             out = self._do_conv(flat)
             _, Ho, Wo, Co = out.shape
+            self._cache = new_cache
             return out.reshape(B, T_out, Ho, Wo, Co)
 
         # Per-frame path — mirrors _per_frame's eager_scatter heuristic.
         o0 = self._do_conv(
-            mx.concatenate([xp[:, 0 + k] for k in range(self.kT)], axis=-1)
+            mx.concatenate([vget(0 + k) for k in range(self.kT)], axis=-1)
         )
         mx.eval(o0)
         _, Ho, Wo, Co = o0.shape
@@ -381,7 +406,7 @@ class CausalConv(nn.Module):
         del o0
         for t in range(1, T_out):
             ot = self._do_conv(
-                mx.concatenate([xp[:, t + k] for k in range(self.kT)], axis=-1)
+                mx.concatenate([vget(t + k) for k in range(self.kT)], axis=-1)
             )
             mx.eval(ot)
             out[:, t] = ot
@@ -390,6 +415,7 @@ class CausalConv(nn.Module):
             del ot
         if not eager_scatter:
             mx.eval(out)
+        self._cache = new_cache
         return out
 
     def __call__(self, x, low_mem=False, streaming=False):
@@ -513,32 +539,46 @@ class StridedCausalConv(nn.Module):
 
         When ``low_mem=True``, processes one output frame at a time with
         ``mx.eval`` after each to limit peak memory.
+
+        Memory note: avoids materialising ``xp = concat(cache, x)`` (a
+        duplicate of ``x`` in MLX memory).  Indexes virtually across the
+        (cache, x) sequence — bit-identical output.
         """
         B, T, H, W, C = x.shape
         if self.kT <= 1:
             return self._batched(x)
 
-        if self._cache is None:
-            pad_n = self.temporal_padding * 2
-            first = mx.broadcast_to(x[:, :1], [B, pad_n, H, W, C])
-            xp = mx.concatenate([first, x], axis=1)
-        else:
-            xp = mx.concatenate([self._cache, x], axis=1)
+        pad_n = self.temporal_padding * 2
+        old_cache = self._cache
+        cache_len = old_cache.shape[1] if old_cache is not None else pad_n
 
-        T_padded = xp.shape[1]
+        def vget(idx):
+            src = idx - cache_len
+            if src >= 0:
+                return x[:, src]
+            if old_cache is not None:
+                return old_cache[:, idx]
+            return x[:, 0]  # first-frame replication
+
+        T_padded = cache_len + T
         T_out = (T_padded - self.kT) // self.stride_t + 1
 
         if T_out <= 0:
-            self._cache = _detach_copy(xp)
+            # Not enough frames yet — stash the whole virtual sequence.
+            self._cache = mx.stack([vget(i) for i in range(T_padded)], axis=1)
+            mx.eval(self._cache)
             Ho = (H + 2 * self._pad[0] - (self.weight.shape[1] - 1) - 1) // self.stride_hw[0] + 1
             Wo = (W + 2 * self._pad[1] - (self.weight.shape[2] - 1) - 1) // self.stride_hw[1] + 1
             Co = self.weight.shape[0]
             return mx.zeros((B, 0, Ho, Wo, Co), dtype=x.dtype)
 
         cache_start = T_out * self.stride_t
-        _raw = xp[:, cache_start:] if cache_start < T_padded else xp[:, -(self.kT - self.stride_t):]
-        self._cache = _detach_copy(_raw)
-        del _raw
+        if cache_start < T_padded:
+            new_cache_indices = range(cache_start, T_padded)
+        else:
+            new_cache_indices = range(T_padded - (self.kT - self.stride_t), T_padded)
+        new_cache = mx.stack([vget(i) for i in new_cache_indices], axis=1)
+        mx.eval(new_cache)
 
         # Adaptive: use fast batched path when stacked intermediate is small.
         stacked_bytes = B * T_out * H * W * self.kT * C * 2
@@ -546,18 +586,18 @@ class StridedCausalConv(nn.Module):
             slices = []
             for t in range(T_out):
                 t_start = t * self.stride_t
-                windows = [xp[:, t_start + k] for k in range(self.kT)]
+                windows = [vget(t_start + k) for k in range(self.kT)]
                 slices.append(mx.concatenate(windows, axis=-1))
             batched = mx.stack(slices, axis=1)
             flat = batched.reshape(B * T_out, H, W, self.kT * C)
             out = self._do_conv(flat)
             _, Ho, Wo, Co = out.shape
+            self._cache = new_cache
             return out.reshape(B, T_out, Ho, Wo, Co)
 
         # Per-frame path — mirrors _per_frame's eager_scatter heuristic.
-        t_start0 = 0
         o0 = self._do_conv(
-            mx.concatenate([xp[:, t_start0 + k] for k in range(self.kT)], axis=-1)
+            mx.concatenate([vget(0 + k) for k in range(self.kT)], axis=-1)
         )
         mx.eval(o0)
         _, Ho, Wo, Co = o0.shape
@@ -571,7 +611,7 @@ class StridedCausalConv(nn.Module):
         for t in range(1, T_out):
             t_start = t * self.stride_t
             ot = self._do_conv(
-                mx.concatenate([xp[:, t_start + k] for k in range(self.kT)], axis=-1)
+                mx.concatenate([vget(t_start + k) for k in range(self.kT)], axis=-1)
             )
             mx.eval(ot)
             out[:, t] = ot
@@ -580,6 +620,7 @@ class StridedCausalConv(nn.Module):
             del ot
         if not eager_scatter:
             mx.eval(out)
+        self._cache = new_cache
         return out
 
     def __call__(self, x, low_mem=False, streaming=False):

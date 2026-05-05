@@ -132,7 +132,8 @@ def _compute_dit_tiles(
 def process_pix_chunk(
     runner,
     ctx: Dict[str, Any],
-    chunk_frames,
+    reader_fn: Callable[[int, int], Any],
+    frame_count: int,
     debug,
     resolution: int,
     max_resolution: int,
@@ -154,8 +155,9 @@ def process_pix_chunk(
     Args:
         runner:             VideoDiffusionInfer instance (DiT + VAE loaded).
         ctx:                Shared generation context.
-        chunk_frames:       Input frames ``[T, H, W, C]`` raw uint8/uint16 numpy
-                            or legacy float16 ``[0, 1]`` tensor.
+        reader_fn:          ``callable(start, count) -> np.ndarray`` returning
+                            ``[count, H, W, C]`` raw uint8/uint16 pixels.
+        frame_count:        Number of frames in this chunk.
         debug:              Debug logger.
         resolution:         Target shortest-edge resolution.
         max_resolution:     Max resolution cap (0 = no limit).
@@ -177,7 +179,6 @@ def process_pix_chunk(
     _reset_ctx(ctx)
 
     def _peak_vram_gb():
-        """Total GPU memory in use (PyTorch + TRT + any other allocator)."""
         if torch.backends.mps.is_available():
             return torch.mps.driver_allocated_memory() / (1024 ** 3) if hasattr(torch.mps, 'driver_allocated_memory') else 0.0
         if torch.cuda.is_available():
@@ -188,7 +189,7 @@ def process_pix_chunk(
     # Phase 1 -- VAE Encode
     t_enc_start = time.time()
     ctx = encode_whole_video(
-        runner, ctx, chunk_frames, debug, resolution, max_resolution
+        runner, ctx, reader_fn, frame_count, debug, resolution, max_resolution
     )
     t_enc_end = time.time()
     vram_encode = getattr(runner, '_trt_vram_encode', None) or _peak_vram_gb()
@@ -652,8 +653,7 @@ def process_video_pix_chunked(
         overlap_trans: Optional[torch.Tensor] = None    # [C, overlap, H, W]
 
         for ci, (ws, we) in enumerate(read_windows):
-            chunk_input = frames[ws:we]
-            chunk_len = chunk_input.shape[0]
+            chunk_len = min(we, T_total) - ws
 
             if chunk_len == 0:
                 logger.warning(
@@ -662,6 +662,12 @@ def process_video_pix_chunked(
                     ci + 1, num_chunks, ws, we,
                 )
                 break
+
+            # Build a reader_fn that reads from the original frames
+            # with offsets relative to this chunk's window.
+            _ws = ws
+            def _chunk_reader(start, count, _base=_ws):
+                return frames[_base + start : _base + start + count]
 
             # Free reader buffer entries that won't be needed by any
             # future chunk so decoded frames don't linger in RAM during
@@ -694,7 +700,7 @@ def process_video_pix_chunked(
 
             t0 = time.time()
             decoded, transformed, chunk_timings = process_pix_chunk(
-                runner, ctx, chunk_input, debug,
+                runner, ctx, _chunk_reader, chunk_len, debug,
                 resolution, max_resolution, seed,
                 latent_noise_scale, shared_noise,
                 dit_tiles, dit_tile_overlap,
@@ -809,7 +815,7 @@ def process_video_pix_chunked(
             t_pp1 = time.time()
             total_post_time += t_pp1 - t_pp0
 
-            del decoded, transformed, chunk_input
+            del decoded, transformed
             if not is_last:
                 clear_memory(debug=debug, force=True)
             elif video_ended_early:
@@ -851,8 +857,7 @@ def process_video_pix_chunked(
         current_write_idx = 0
 
         for ci, (ws, we) in enumerate(read_windows):
-            chunk_input = frames[ws:we]
-            chunk_len = chunk_input.shape[0]
+            chunk_len = min(we, T_total) - ws
 
             if chunk_len == 0:
                 logger.warning(
@@ -861,6 +866,10 @@ def process_video_pix_chunked(
                     ci + 1, num_chunks, ws, we,
                 )
                 break
+
+            _ws = ws
+            def _chunk_reader(start, count, _base=_ws):
+                return frames[_base + start : _base + start + count]
 
             video_ended_early = chunk_len < (we - ws)
             if video_ended_early:
@@ -877,7 +886,7 @@ def process_video_pix_chunked(
 
             t0 = time.time()
             decoded, transformed, chunk_timings = process_pix_chunk(
-                runner, ctx, chunk_input, debug,
+                runner, ctx, _chunk_reader, chunk_len, debug,
                 resolution, max_resolution, seed,
                 latent_noise_scale, shared_noise,
                 dit_tiles, dit_tile_overlap,
@@ -962,7 +971,7 @@ def process_video_pix_chunked(
                     final_transformed[:, current_write_idx:write_end] = non_overlap_t[:, :frames_to_write]
                 current_write_idx = write_end
 
-            del decoded, transformed, chunk_input
+            del decoded, transformed
             if video_ended_early:
                 break
             if ci < num_chunks - 1:

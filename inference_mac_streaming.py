@@ -120,7 +120,7 @@ HYBRID_OVERLAP = 21            # pixel-space overlap between outer chunks
 HYBRID_FIXED_WT = 3           # temporal attention window size for full-latent DiT
 DIT_LATENT_CHUNK = 0          # latent frames per DiT temporal chunk (0 = all at once)
 DIT_LATENT_OVERLAP = 0        # overlap in latent frames between DiT chunks
-HYBRID_TEMPORAL_ENCODE_SLICE = 11   # pixel frames per streaming encode slice
+HYBRID_TEMPORAL_ENCODE_SLICE = 5   # pixel frames per streaming encode slice
 HYBRID_TEMPORAL_DECODE_SLICE = 5    # latent frames per streaming decode slice
 COLOR_CORRECTION = "wavelet"
 USM_WEIGHT = 0.0
@@ -212,7 +212,7 @@ def _auto_mlx_cache_gb() -> float:
         return 2.0
     if _TOTAL_RAM_GB <= 24:
         return 4.0
-    return 1.0
+    return 6.0
 
 
 MLX_VAE_CACHE_LIMIT_GB = _auto_mlx_cache_gb()
@@ -1304,6 +1304,9 @@ class VideoUpscaler:
                 if _dit is not None and hasattr(_dit, 'io') and _dit.io is not None:
                     _dit._saved_io = _dit.io
                     _dit.io = None
+                    _bp = getattr(_dit, 'block_pool', None)
+                    if _bp is not None:
+                        _bp.reset_pool_state()
                     gc.collect()
                     _mx.clear_cache()
                     _dit_io_freed = True
@@ -1355,6 +1358,9 @@ class VideoUpscaler:
                     del _dit._saved_io
                     _mx.eval(*[v for v in _dit.io.__dict__.values()
                                if isinstance(v, _mx.array)])
+                    _bp = getattr(_dit, 'block_pool', None)
+                    if _bp is not None:
+                        _bp.prefetch_block(0)
                 return [latent_t]
 
             @torch.no_grad()
@@ -1366,6 +1372,9 @@ class VideoUpscaler:
                 if _dit is not None and hasattr(_dit, 'io') and _dit.io is not None:
                     _dit._saved_io = _dit.io
                     _dit.io = None
+                    _bp = getattr(_dit, 'block_pool', None)
+                    if _bp is not None:
+                        _bp.reset_pool_state()
                     _dit_io_freed = True
                 gc.collect()
                 _mx.clear_cache()
