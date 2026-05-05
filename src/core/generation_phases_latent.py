@@ -262,7 +262,7 @@ def encode_whole_video(
 
     ctx['total_frames'] = T_input
 
-    debug.log(f"Input: {T_input} frames (streamed via reader_fn)", category="vae", force=True)
+    debug.log(f"Input: frames streamed)", category="vae", force=True)
 
     # Materialize VAE if still on meta device
     if runner.vae and next(runner.vae.parameters()).device.type == 'meta':

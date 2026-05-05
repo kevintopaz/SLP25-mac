@@ -44,7 +44,7 @@ if matrix_root not in sys.path:
     sys.path.insert(0, matrix_root)
 
 from utils.register.registry_class import MODEL
-from .inference_mac_streaming import VideoUpscaler
+from .src.inference_mac_streaming import VideoUpscaler
 
 logger = logging.getLogger(__name__)
 
