@@ -1,11 +1,10 @@
 """
 Latent Domain Temporal Chunking - Generation Phases
 
-This module provides phase functions for latent-domain temporal chunking pipeline.
-Used by inference_latent_chunked.py (mirrors how generation_phases.py is used by inference_cli.py).
+Phase functions for the streaming / latent-domain temporal chunking pipeline.
 
 Pipeline:
-    Video → VAE Encode (whole) → Latent → [Chunk1, Chunk2, ...] → DiT → Merge latents → VAE Decode (whole)
+    Video → VAE Encode (whole) → [Latent chunks] → DiT → Merge latents → VAE Decode (whole)
 """
 
 import math
@@ -18,7 +17,6 @@ from .generation_utils import (
     script_directory,
     ensure_precision_initialized,
 )
-from .generation_phases import _compute_dit_tile_params
 from .model_loader import materialize_model
 from ..common.seed import set_seed
 from ..optimization.memory_manager import (
@@ -32,6 +30,57 @@ from ..optimization.memory_manager import (
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+
+
+def _compute_dit_tile_params(
+    latent_shape: Tuple[int, int, int, int],
+    tiles: Tuple[int, int],
+    min_overlap: float = 0.25,
+    debug: Optional['Debug'] = None
+) -> Tuple[List[Tuple[int, int, int, int]], Tuple[int, int], Tuple[int, int]]:
+    """Compute tile positions and sizes for tiled DiT processing.
+
+    Latent shape is [T, H, W, C]. We tile spatially (H, W dimensions).
+    Tile sizes are adjusted to be divisible by 4 for DiT compatibility.
+    """
+    T, H, W, C = latent_shape
+    tile_rows, tile_cols = tiles
+
+    min_overlap = max(0.0, min(0.5, min_overlap))
+
+    base_tile_h = H // tile_rows
+    base_tile_w = W // tile_cols
+
+    overlap_h = max(4, int(base_tile_h * min_overlap))
+    overlap_w = max(4, int(base_tile_w * min_overlap))
+
+    tile_h = base_tile_h + overlap_h
+    tile_w = base_tile_w + overlap_w
+
+    tile_h = (tile_h + 3) // 4 * 4
+    tile_w = (tile_w + 3) // 4 * 4
+
+    tile_h = min(tile_h, H)
+    tile_w = min(tile_w, W)
+
+    # When only 1 tile along an axis the stride is unused, fall back to
+    # tile size to avoid division-by-zero.
+    stride_h = tile_h if tile_rows <= 1 else tile_h - ((tile_h * tile_rows - H) // (tile_rows - 1))
+    stride_w = tile_w if tile_cols <= 1 else tile_w - ((tile_w * tile_cols - W) // (tile_cols - 1))
+
+    tiles_info = []
+    for row in range(tile_rows):
+        for col in range(tile_cols):
+            y_start = min(row * stride_h, max(0, H - tile_h))
+            x_start = min(col * stride_w, max(0, W - tile_w))
+            tiles_info.append((y_start, x_start, tile_h, tile_w))
+
+    if debug:
+        debug.log(f"DiT tiling: {len(tiles_info)} tiles, size=({tile_h}x{tile_w}), "
+                 f"overlap=({overlap_h}x{overlap_w}), stride=({stride_h}x{stride_w}), full size=({H}x{W})",
+                 category="dit", force=True, indent_level=1)
+
+    return tiles_info
 
 
 # Global text encoder cache to avoid reloading
@@ -664,7 +713,6 @@ def _tiled_dit_block_first(
     Requires the underlying DiT to expose ``forward_tiles()``.
     Falls back to per-tile ``runner.inference()`` if not available.
     """
-    from .generation_phases import _compute_dit_tile_params
     from ..models.dit_3b import na
 
     device = noises[0].device

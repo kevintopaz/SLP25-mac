@@ -389,7 +389,6 @@ def _streaming_postprocess_chunk(
                 pp_func(dec_b, trans_b)
                 del dec_b, trans_b
             _cleanup_all()
-            del trans_mm
             return None, None
         else:
             # First of multiple chunks — stream non-overlap, hold overlap.
@@ -404,7 +403,6 @@ def _streaming_postprocess_chunk(
             new_ov_dec = _read_decoded_range(safe_end, overlap)
             new_ov_trans = _read_transform_range(safe_end, overlap)
             _cleanup_all()
-            del trans_mm
             return new_ov_dec, new_ov_trans
     else:
         # Subsequent chunk — handle skip + overlap blending.
@@ -453,13 +451,11 @@ def _streaming_postprocess_chunk(
                     pp_func(dec_b, trans_b)
                     del dec_b, trans_b
             _cleanup_all()
-            del trans_mm
             return None, None
         else:
             new_ov_dec = _read_decoded_range(T_pix - overlap, overlap)
             new_ov_trans = _read_transform_range(T_pix - overlap, overlap)
             _cleanup_all()
-            del trans_mm
             return new_ov_dec, new_ov_trans
 
 

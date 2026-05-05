@@ -1,39 +1,23 @@
 """
 Generation Utilities for SeedVR2
 
-This module provides setup, configuration, and utility functions for the generation pipeline.
-These are helper functions used to prepare, configure, and support the video upscaling process,
-but do not contain the core 4-phase orchestration logic itself.
+Setup, configuration, and utility functions shared by the streaming pipeline.
 
 Setup Functions:
-- setup_video_transform: Initialize transforms and compute target dimensions
 - setup_generation_context: Initialize context with device configuration
 - prepare_runner: Configure VideoDiffusionInfer with all settings
 
-Video Processing Utilities:
-- pad_video_temporal: Unified temporal padding with reversed frames (prepend/append, any format)
-- blend_overlapping_frames: Smooth blending for temporal overlap between batches
-
 Configuration Helpers:
 - load_text_embeddings: Load positive/negative text embeddings for DiT
-- calculate_optimal_batch_params: Compute batch processing parameters
-- check_interrupt: Check for user interruption
-
-Debugging Utilities:
-- _draw_tile_boundaries: Draw tile boundaries for debugging VAE tiling
 - ensure_precision_initialized: Log model dtype information
-
-These utilities support the 4-phase pipeline implemented in generation_phases.py.
 """
 
 import os
 import torch
-from typing import Dict, List, Optional, Tuple, Any, Callable, Union
-from torchvision.transforms import Compose, Lambda, Normalize
+from typing import Dict, List, Optional, Tuple, Any, Union
 
 from .model_configuration import configure_runner
 from .infer import VideoDiffusionInfer
-from ..video_utils import VideoPrePostProcess
 from ..optimization.compatibility import COMPUTE_DTYPE, BFLOAT16_SUPPORTED
 from ..optimization.memory_manager import manage_tensor
 from ..utils.constants import get_script_directory
@@ -50,213 +34,6 @@ EMBEDDING_NAME_MAP = {
 }
 
 
-def setup_video_transform(ctx: Dict[str, Any], resolution: int, max_resolution: int = 0, 
-                         debug: Optional['Debug'] = None, 
-                         sample_frame: Optional[torch.Tensor] = None) -> Tuple[int, int, int, int]:
-    """
-    Setup video transformation pipeline and compute target dimensions.
-    
-    Args:
-        ctx: Generation context dictionary
-        resolution: Target resolution for shortest edge
-        max_resolution: Maximum resolution for any edge (0 = no limit)
-        debug: Debug instance for logging
-        sample_frame: Optional sample frame tensor (C, H, W) to compute dimensions
-        
-    Returns:
-        (true_height, true_width, padded_height, padded_width) if dimensions computed,
-        (0, 0, 0, 0) otherwise
-    """
-    # Check if VPP (or legacy resizer) already exists
-    vpp = ctx.get('vpp')
-
-    if vpp is not None:
-        if vpp.true_dims is not None and sample_frame is not None:
-            true_h, true_w = vpp.true_dims
-            padded_h, padded_w = vpp.padded_dims
-            if debug:
-                debug.log("Reusing pre-initialized video transformation pipeline", category="reuse")
-            return true_h, true_w, padded_h, padded_w
-        elif debug:
-            debug.log("Reusing pre-initialized video transformation pipeline", category="reuse")
-        return 0, 0, 0, 0
-
-    # Create VideoPrePostProcess — single source of truth for dimensions
-    vpp = VideoPrePostProcess(
-        resolution=resolution,
-        max_resolution=max_resolution,
-        source_bit_depth=ctx.get('source_bit_depth', 8),
-        color_overrides=ctx.get('color_overrides'),
-    )
-    ctx['vpp'] = vpp
-
-    ctx['video_transform'] = Compose([
-        vpp.resize,
-        Lambda(lambda x: torch.clamp(x, 0.0, 1.0)),
-        Normalize(0.5, 0.5),
-        Lambda(lambda x: x.permute(1, 0, 2, 3)),  # t c h w -> c t h w
-    ])
-
-    if debug:
-        msg = f"Initializing video transformation pipeline for {resolution}px (shortest edge)"
-        if max_resolution > 0:
-            msg += f", max {max_resolution}px (any edge)"
-        debug.log(msg, category="setup", indent_level=1)
-
-    # Compute dimensions by running resizer on sample frame
-    if sample_frame is not None:
-        vpp.resize(sample_frame)
-        true_h, true_w = vpp.true_dims
-        padded_h, padded_w = vpp.padded_dims
-
-        if debug:
-            if true_h == padded_h and true_w == padded_w:
-                debug.log(f"Target dimensions: {true_w}x{true_h} (no padding needed)",
-                         category="setup", indent_level=1)
-            else:
-                debug.log(f"Target dimensions: {true_w}x{true_h} (padded to {padded_w}x{padded_h} for processing)",
-                         category="setup", indent_level=1)
-
-        return true_h, true_w, padded_h, padded_w
-
-    return 0, 0, 0, 0
-
-
-def compute_generation_info(
-    ctx: Dict[str, Any],
-    images: torch.Tensor,
-    resolution: int = 1080,
-    max_resolution: int = 0,
-    batch_size: int = 5,
-    uniform_batch_size: bool = False,
-    seed: int = 42,
-    prepend_frames: int = 0,
-    temporal_overlap: int = 0,
-    debug: Optional['Debug'] = None
-) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    """
-    Compute all generation parameters and dimensions for logging.
-    
-    Args:
-        ctx: Generation context dictionary
-        images: Input frames tensor [T, H, W, C]
-        resolution: Target resolution for shortest edge
-        max_resolution: Maximum resolution for any edge (0 = no limit)
-        batch_size: Frames per batch
-        uniform_batch_size: Whether to pad final batch to match batch_size
-        seed: Random seed
-        prepend_frames: Number of frames to prepend
-        temporal_overlap: Overlapping frames between batches
-        debug: Debug instance for logging
-    
-    Returns:
-        Tuple of (processed_images, info_dict)
-        - processed_images: Input images with prepending applied if needed
-        - info_dict: Information dictionary for logging
-    """
-    # Track input frames before any modifications
-    input_frames = len(images)
-    input_h, input_w = images.shape[1], images.shape[2]
-    channels_info = "RGBA" if images.shape[-1] == 4 else "RGB"
-    
-    # Apply prepending if requested
-    if prepend_frames > 0:
-        images = pad_video_temporal(images, count=prepend_frames, temporal_dim=0, prepend=True, debug=debug)
-    
-    # Track total frames after prepending
-    total_frames = len(images)
-    ctx['total_frames'] = total_frames
-    
-    # Setup transform and compute dimensions on final frame count
-    sample_frame = images[0].permute(2, 0, 1).unsqueeze(0)
-    true_h, true_w, padded_h, padded_w = setup_video_transform(
-        ctx, resolution, max_resolution, debug, sample_frame
-    )
-    del sample_frame
-    
-    info = {
-        'input_frames': input_frames,
-        'input_h': input_h,
-        'input_w': input_w,
-        'total_frames': total_frames,
-        'true_h': true_h,
-        'true_w': true_w,
-        'padded_h': padded_h,
-        'padded_w': padded_w,
-        'channels_info': channels_info,
-        'batch_size': batch_size,
-        'uniform_batch_size': uniform_batch_size,
-        'seed': seed,
-        'prepend_frames': prepend_frames,
-        'temporal_overlap': temporal_overlap,
-        'resolution': resolution,
-        'max_resolution': max_resolution
-    }
-    
-    return images, info
-
-
-def log_generation_start(info: Dict[str, Any], debug: Optional['Debug'] = None) -> None:
-    """
-    Log generation start information in a consistent format.
-    
-    Args:
-        info: Information dictionary from compute_generation_info()
-        debug: Debug instance for logging
-    """
-    if debug is None:
-        return
-    
-    debug.log("", category="none", force=True)
-    debug.log("Starting upscaling generation...", category="generation", force=True)
-    
-    # Build concise parameter info
-    batch_text = f"Batch size: {info['batch_size']}"
-    if info.get('uniform_batch_size', False):
-        batch_text += " (uniform)"
-    params_info = batch_text
-    if info['prepend_frames'] > 0:
-        params_info += f", Prepend frames: {info['prepend_frames']}"
-    if info['temporal_overlap'] > 0:
-        params_info += f", Temporal overlap: {info['temporal_overlap']}"
-    params_info += f", Seed: {info['seed']}, Channels: {info['channels_info']}"
-    
-    # Build resolution constraint info
-    res_constraint = f"shortest edge: {info['resolution']}px"
-    if info['max_resolution'] > 0:
-        res_constraint += f", max edge: {info['max_resolution']}px"
-    
-    # Log dimension flow with full context
-    if info['true_h'] > 0:
-        frame_text = "frame" if info['input_frames'] <= 1 else "frames"
-        if info['true_h'] == info['padded_h'] and info['true_w'] == info['padded_w']:
-            debug.log(
-                f"Input: {info['input_frames']} {frame_text}, "
-                f"{info['input_w']}x{info['input_h']}px → Output: {info['true_w']}x{info['true_h']}px "
-                f"({res_constraint})",
-                category="generation", force=True, indent_level=1
-            )
-        else:
-            debug.log(
-                f"Input: {info['input_frames']} {frame_text}, "
-                f"{info['input_w']}x{info['input_h']}px → Padded: {info['padded_w']}x{info['padded_h']}px → "
-                f"Output: {info['true_w']}x{info['true_h']}px ({res_constraint})",
-                category="generation", force=True, indent_level=1
-            )
-    
-    debug.log(f"{params_info}", category="generation", force=True, indent_level=1)
-
-
-from ..video_utils import Blend
-
-_hann_blender = Blend(mode="hann")
-
-
-def blend_overlapping_frames(prev_tail: torch.Tensor, cur_head: torch.Tensor, overlap: int) -> torch.Tensor:
-    """Blend two overlapping frame sequences ``[overlap, H, W, C]`` with Hann crossfade."""
-    return _hann_blender.temporal_thwc(prev_tail, cur_head, overlap)
-
-
 def setup_generation_context(
     dit_device: Optional[Union[str, torch.device]] = None,
     vae_device: Optional[Union[str, torch.device]] = None,
@@ -270,21 +47,8 @@ def setup_generation_context(
     
     Processes device objects, configures environment variables, and creates the
     generation context dictionary with all necessary state.
-    
-    Args:
-        dit_device: Device for DiT model (str or torch.device, defaults to 'cpu')
-        vae_device: Device for VAE model (str or torch.device, defaults to 'cpu')
-        dit_offload_device: Device to offload DiT to when not in use (optional)
-        vae_offload_device: Device to offload VAE to when not in use (optional)
-        tensor_offload_device: Device to offload intermediate tensors to (optional)
-        debug: Debug instance for logging
-        
-    Returns:
-        Dict[str, Any]: Generation context dictionary with torch.device objects
     """
-    # Normalize devices to torch.device objects (follows PyTorch convention)
     def _normalize_device(device_spec: Optional[Union[str, torch.device]]) -> torch.device:
-        """Convert device specification to torch.device object."""
         if device_spec is None:
             return torch.device("cpu")
         if isinstance(device_spec, torch.device):
@@ -302,11 +66,8 @@ def setup_generation_context(
     else:
         tensor_offload_device = _normalize_device(tensor_offload_device) if tensor_offload_device is not None else None
     
-    # Set LOCAL_RANK to 0 for single-GPU inference mode
-    # CLI multi-GPU uses CUDA_VISIBLE_DEVICES to restrict visibility per worker
     os.environ.setdefault("LOCAL_RANK", "0")
     
-    # Detect ComfyUI integration for interrupt support
     try:
         import comfy.model_management
         interrupt_fn = comfy.model_management.throw_exception_if_processing_interrupted
@@ -315,7 +76,6 @@ def setup_generation_context(
         interrupt_fn = None
         comfyui_available = False
     
-    # Create generation context
     ctx = {
         'dit_device': dit_device,
         'vae_device': vae_device,
@@ -334,7 +94,6 @@ def setup_generation_context(
     }
     
     if debug:
-        # Build device configuration summary
         offload_info = []
         if dit_offload_device:
             offload_info.append(f"DiT offload={str(dit_offload_device)}")
@@ -389,52 +148,7 @@ def prepare_runner(
     """
     Prepare runner with model state management and global cache integration.
     Handles model changes and caching logic with independent DiT/VAE caching support.
-    
-    Args:
-        dit_model: DiT model filename (e.g., "seedvr2_ema_3b_fp16.safetensors")
-        vae_model: VAE model filename (e.g., "ema_vae_fp16.safetensors")
-        model_dir: Base directory containing model files
-        debug: Debug instance for logging (required)
-        ctx: Generation context from setup_generation_context
-        dit_cache: Whether to cache DiT model between runs
-        vae_cache: Whether to cache VAE model between runs
-        dit_id: Node instance ID for DiT model caching
-        vae_id: Node instance ID for VAE model caching
-        block_swap_config: Optional BlockSwap configuration for DiT memory optimization
-        encode_tiled: Enable tiled encoding to reduce VRAM during VAE encoding
-        encode_tile_size: Tile size for encoding (height, width)
-        encode_tile_overlap: Tile overlap for encoding (height, width)
-        decode_tiled: Enable tiled decoding to reduce VRAM during VAE decoding
-        decode_tile_size: Tile size for decoding (height, width)
-        decode_tile_overlap: Tile overlap for decoding (height, width)
-        tile_debug: Tile visualization mode (false/encode/decode)
-        attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
-        torch_compile_args_dit: Optional torch.compile configuration for DiT model
-        torch_compile_args_vae: Optional torch.compile configuration for VAE model
-        skip_vae_weights: If True, skip loading VAE model weights. The VAE config
-            on the runner is still set up. Use when VAE will be replaced by TRT engines.
-        
-    Returns:
-        Tuple['VideoDiffusionInfer', Dict[str, Any]]: Tuple containing:
-            - VideoDiffusionInfer: Configured runner instance with models loaded and settings applied
-            - Dict[str, Any]: Cache context dictionary containing cache state and metadata with keys:
-                - 'global_cache': GlobalModelCache instance
-                - 'dit_cache', 'vae_cache': Caching enabled flags
-                - 'dit_id', 'vae_id': Node IDs for cache lookup
-                - 'cached_dit', 'cached_vae': Cached model instances (if found)
-                - 'reusing_runner': Flag indicating if runner template was reused
-        
-    Features:
-        - Independent DiT and VAE caching for flexible memory management
-        - Dynamic model reloading when models change
-        - Optional torch.compile optimization for inference speedup
-        - Separate encode/decode tiling configuration for optimal performance
-        - Memory optimization and BlockSwap integration
     """
-    dit_changed = False
-    vae_changed = False
-    
-    # Configure runner
     debug.log("Configuring inference runner...", category="runner")
     runner, cache_context = configure_runner(
         dit_model=dit_model,
@@ -465,24 +179,7 @@ def prepare_runner(
 
 def load_text_embeddings(script_directory: str, device: torch.device, 
                         dtype: torch.dtype, debug: Optional['Debug'] = None) -> Dict[str, List[torch.Tensor]]:
-    """
-    Load and prepare text embeddings for generation
-    
-    Args:
-        script_directory (str): Script directory path
-        device (torch.device): Target device
-        dtype (torch.dtype): Target dtype
-        debug: Optional debug instance for logging
-        
-    Returns:
-        dict: Text embeddings dictionary
-        
-    Features:
-        - Adaptive dtype handling
-        - Device-optimized loading
-        - Memory-efficient embedding preparation
-        - Consistent movement logging
-    """
+    """Load and prepare text embeddings for generation."""
     if os.environ.get('CLOUD_RUN', 'false') == 'true' and os.path.isdir('/app/data'):
         text_pos_embeds = torch.load(get_path_or_bytesio('/app/data/pos_emb.pt.enc', EMBEDDING_NAME_MAP), weights_only=True)
         text_neg_embeds = torch.load(get_path_or_bytesio('/app/data/neg_emb.pt.enc', EMBEDDING_NAME_MAP), weights_only=True)
@@ -510,237 +207,12 @@ def load_text_embeddings(script_directory: str, device: torch.device,
     return {"texts_pos": [text_pos_embeds], "texts_neg": [text_neg_embeds]}
 
 
-def calculate_optimal_batch_params(total_frames: int, batch_size: int, 
-                                  temporal_overlap: int) -> Dict[str, Any]:
-    """
-    Calculate batch processing parameters.
-    
-    Args:
-        total_frames (int): Total number of frames to process
-        batch_size (int): Desired batch size
-        temporal_overlap (int): Number of overlapping frames between batches
-        
-    Returns:
-        dict: {
-            'step': Effective step size between batches,
-            'temporal_overlap': Adjusted temporal overlap,
-            'best_batch': Optimal batch size matching video length (4n+1 format)
-        }
-        
-    The 4n+1 constraint (1, 5, 9, 13, 17, 21...) is required by the model.
-    """
-    # Calculate step size
-    step = batch_size - temporal_overlap
-    if step <= 0:
-        step = batch_size
-        temporal_overlap = 0
-    
-    # Find all valid 4n+1 batch sizes up to total_frames
-    valid_sizes = [i for i in range(1, total_frames + 1) if i % 4 == 1]
-    
-    # Best batch: largest valid size ≤ total_frames (maximizes temporal stability)
-    best_batch = max(valid_sizes) if valid_sizes else 1
-    
-    return {
-        'step': step,
-        'temporal_overlap': temporal_overlap,
-        'best_batch': best_batch
-    }
-
-
-def pad_video_temporal(videos: torch.Tensor, count: int = 0, temporal_dim: int = 1, 
-                       prepend: bool = False, debug: Optional['Debug'] = None) -> torch.Tensor:
-    """
-    Extend video with reversed frames for temporal continuity.
-    
-    Single source of truth for all temporal padding (prepend/append, 4n+1 constraint).
-    
-    Args:
-        videos: Video tensor (TCHW or CTHW format)
-        count: Frames to add (0 = auto-calculate for 4n+1 when prepend=False)
-        temporal_dim: Temporal axis (0=TCHW, 1=CTHW)
-        prepend: Add to start (True) or end (False)
-        debug: Optional debug logger
-        
-    Returns:
-        torch.Tensor: Extended video
-    """
-    t = videos.size(temporal_dim)
-    
-    # Auto-calculate for 4n+1 constraint
-    if count == 0 and not prepend:
-        if t % 4 == 1:
-            return videos
-        count = ((t - 1) // 4 + 1) * 4 + 1 - t
-    
-    if count <= 0:
-        return videos
-    
-    if debug and prepend:
-        debug.log(f"Prepending {count} reversed frames to reduce start artifacts", 
-                 category="video", indent_level=1)
-    
-    # Helper to select frames along temporal dimension
-    def select(start, end):
-        return videos[start:end] if temporal_dim == 0 else videos[:, start:end]
-    
-    # Padding exceeds video length: repeat + reverse
-    if count >= t:
-        repeat_count = count - t + 1
-        last = select(-1, None)
-        
-        # Repeat last frame
-        if temporal_dim == 0:
-            repeated = last.repeat(repeat_count, 1, 1, 1)
-            reversed_frames = select(1, None).flip(temporal_dim) if t > 1 else last[:0]
-        else:
-            repeated = last.expand(-1, repeat_count, -1, -1).contiguous()
-            reversed_frames = select(1, None).flip(temporal_dim) if t > 1 else last[:, :0]
-        
-        return torch.cat([repeated, reversed_frames, videos] if prepend else 
-                        [videos, reversed_frames, repeated], dim=temporal_dim)
-    
-    # Normal case: extract and reverse frames
-    if prepend:
-        reversed_frames = select(1, count+1).flip(temporal_dim)
-    else:
-        reversed_frames = select(-count-1, -1).flip(temporal_dim)
-    
-    return torch.cat([reversed_frames, videos] if prepend else 
-                    [videos, reversed_frames], dim=temporal_dim)
-
-
-def check_interrupt(ctx: Dict[str, Any]) -> None:
-    """Single interrupt check to avoid redundant imports"""
-    if ctx.get('interrupt_fn') is not None:
-        ctx['interrupt_fn']()
-
-
-def _draw_tile_boundaries(image: torch.Tensor, debug: 'Debug', tile_boundaries: list, phase: str) -> torch.Tensor:
-    """
-    Draw tile boundary overlays on all frames for debugging (non-destructive).
-    
-    Args:
-        image: Image tensor [T, H, W, C] or [H, W, C] in range [0, 1]
-        debug: Debug instance for logging
-        tile_boundaries: List of tile boundary info dictionaries
-        phase: Phase name ('encode' or 'decode') for logging
-        
-    Returns:
-        Image with boundary overlays drawn inside tiles on all frames
-    """
-    if not tile_boundaries:
-        return image
-
-    # Try to import required libraries
-    try:
-        import cv2
-        import numpy as np
-        import random
-        import colorsys
-    except ImportError as e:
-        debug.log(f"Tile debug ignored: missing imports ({e})", level="WARNING", category="video")
-        return image
-
-    # Handle both [T, H, W, C] and [H, W, C]
-    squeeze_t = False
-    if image.ndim == 3:
-        image = image.unsqueeze(0)
-        squeeze_t = True
-    
-    T, H, W, C = image.shape
-    original_dtype = image.dtype
-    
-    log_frames = f"all {T} frames" if T > 1 else "1 frame"
-    debug.log(f"Drawing {phase} tile boundaries ({len(tile_boundaries)} tiles) on {log_frames}", category="video", indent_level=1, force=True)
-
-    # Scale line thickness and font size based on video width
-    # Reference points: 512px (min) to 1920px (max)
-    min_width, max_width = 512, 1920
-    min_line_thickness, max_line_thickness = 2, 6
-    min_font_scale, max_font_scale = 0.8, 2.5
-    min_text_thickness, max_text_thickness = 2, 4
-    
-    # Calculate scale factor (clamped between 0 and 1)
-    scale_factor = max(0.0, min(1.0, (W - min_width) / (max_width - min_width)))
-    
-    # Apply scaling
-    line_thickness = int(min_line_thickness + scale_factor * (max_line_thickness - min_line_thickness))
-    font_scale = min_font_scale + scale_factor * (max_font_scale - min_font_scale)
-    text_thickness = int(min_text_thickness + scale_factor * (max_text_thickness - min_text_thickness))
-    
-    # Generate high-contrast colors using HSV color space
-    num_tiles = len(tile_boundaries)
-    colors = []
-    for i in range(num_tiles):
-        hue = (i * 360 / num_tiles) % 360
-        saturation = 0.9 + (i % 2) * 0.1
-        brightness = 0.8 + ((i // 2) % 2) * 0.2
-        r, g, b = colorsys.hsv_to_rgb(hue / 360, saturation, brightness)
-        colors.append((int(b * 255), int(g * 255), int(r * 255)))  # BGR for OpenCV
-    
-    random.seed(42)
-    random.shuffle(colors)
-    
-    # Process all frames
-    annotated_frames = []
-    for frame_idx in range(T):
-        # Convert frame to numpy (handle RGB and RGBA)
-        img = np.ascontiguousarray((image[frame_idx].float().cpu().numpy() * 255).astype(np.uint8))  # [H, W, C]
-        
-        # Draw boundary lines inside each tile
-        for idx, tile_info in enumerate(tile_boundaries):
-            tile_id = tile_info['id']
-            x, y = tile_info['x'], tile_info['y']
-            w, h = tile_info['w'], tile_info['h']
-            color = colors[idx]
-            
-            inset = line_thickness // 2
-            
-            # Draw four edges
-            cv2.line(img, (x, y + inset), (x + w, y + inset), color, line_thickness)
-            cv2.line(img, (x, y + h - inset), (x + w, y + h - inset), color, line_thickness)
-            cv2.line(img, (x + inset, y), (x + inset, y + h), color, line_thickness)
-            cv2.line(img, (x + w - inset, y), (x + w - inset, y + h), color, line_thickness)
-            
-            # Draw tile number
-            text = str(tile_id)
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, text_thickness)
-            margin = int(15 * scale_factor) if scale_factor > 0.5 else 8  # Scale margin too
-            text_x = x + margin
-            text_y = y + text_h + margin
-            cv2.putText(img, text, (text_x, text_y), font, font_scale, color, text_thickness, cv2.LINE_AA)
-        
-        # Convert back to tensor
-        frame_tensor = torch.from_numpy(img.astype(np.float32) / 255.0).to(device=image.device, dtype=original_dtype)
-        annotated_frames.append(frame_tensor)
-    
-    # Stack all frames
-    image = torch.stack(annotated_frames, dim=0)
-    
-    if squeeze_t:
-        image = image.squeeze(0)
-    
-    return image
-
-
 def ensure_precision_initialized(
     ctx: Dict[str, Any],
     runner: 'VideoDiffusionInfer',
     debug: Optional['Debug'] = None
 ) -> None:
-    """
-    Log model dtypes for debugging. Compute dtype is hardcoded in context.
-    
-    Since compute_dtype is hardcoded to bfloat16 in setup_generation_context(),
-    this function only logs model dtypes for informational purposes.
-    
-    Args:
-        ctx: Generation context dictionary (compute_dtype already set)
-        runner: VideoDiffusionInfer instance with loaded models
-        debug: Optional Debug instance for logging
-    """
+    """Log model dtypes for debugging. Compute dtype is hardcoded in context."""
     if not debug:
         return
     
@@ -748,7 +220,6 @@ def ensure_precision_initialized(
         dit_dtype = None
         vae_dtype = None
 
-        # Check for MLX models first (actual compute precision)
         mlx_dit_dtype = getattr(runner, '_mlx_dit_dtype', None)
         mlx_vae_dtype = getattr(runner, '_mlx_vae_dtype', None)
 
