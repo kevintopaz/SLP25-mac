@@ -161,7 +161,7 @@ def load_quantized_state_dict(checkpoint_path: Union[str, bytes], device: torch.
             if is_mps_alloc_error:
                 # Transparent fallback - only log if debug enabled
                 if debug:
-                    debug.log("Using CPU intermediate loading for MPS compatibility", 
+                    debug.log("Using CPU intermediate loading for GPU compatibility", 
                             category="info", indent_level=1)
                 state = load_safetensors_file(checkpoint_path, device="cpu")
                 # Tensors will be moved to MPS during model.load_state_dict()
@@ -450,7 +450,6 @@ def prepare_model_structure(
     checkpoint_path: str,
     config: OmegaConf,
     debug: 'Debug',
-    block_swap_config: Optional[Dict[str, Any]] = None
 ) -> VideoDiffusionInfer:
     """
     Prepare model structure on meta device without loading weights.
@@ -462,7 +461,6 @@ def prepare_model_structure(
         checkpoint_path: Path to checkpoint (stored for later loading)
         config: Model configuration
         debug: Debug instance for logging (required)
-        block_swap_config: BlockSwap config (stored for DiT, optional)
         
     Returns:
         runner: Updated runner with model structure on meta device
@@ -471,11 +469,10 @@ def prepare_model_structure(
         raise ValueError(f"Debug instance required for prepare_model_structure")
     
     is_dit = (model_type == "dit")
-    model_type_upper = "DiT" if is_dit else "VAE"
+    model_type_upper = "Enhancement model" if is_dit else "Codec"
     model_config = config.dit.model if is_dit else config.vae.model
     
-    # Always create on meta device for zero memory usage
-    debug.log(f"Creating {model_type_upper} model structure on meta device", 
+    debug.log(f"Creating {model_type_upper.lower()} structure", 
              category=model_type, force=True)
     debug.start_timer(f"{model_type}_structure")
     
@@ -488,7 +485,6 @@ def prepare_model_structure(
     if is_dit:
         runner.dit = model
         runner._dit_checkpoint = checkpoint_path
-        runner._dit_block_swap_config = block_swap_config
     else:
         runner.vae = model  
         runner._vae_checkpoint = checkpoint_path
@@ -513,27 +509,25 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
         raise ValueError(f"Debug instance required for materialize_model")
         
     is_dit = (model_type == "dit")
-    model_type_upper = "DiT" if is_dit else "VAE"
+    model_type_upper = "Enhancement model" if is_dit else "Codec"
     
     # Get model and checkpoint path
     if is_dit:
         model = runner.dit
         checkpoint_path = runner._dit_checkpoint
-        block_swap_config = runner._dit_block_swap_config
         override_dtype = getattr(runner, '_dit_dtype_override', None)
     else:
         model = runner.vae
         checkpoint_path = runner._vae_checkpoint
-        block_swap_config = None
         override_dtype = getattr(runner, '_vae_dtype_override', None)
     
     # Check if already materialized
     if model is None:
-        debug.log(f"No {model_type_upper} model structure found", level="WARNING", category=model_type, force=True)
+        debug.log(f"No {model_type_upper.lower()} structure found", level="WARNING", category=model_type, force=True)
         return
     param_device = next(model.parameters()).device
     if param_device.type != 'meta':
-        debug.log(f"{model_type_upper} already materialized on {model.device}", category=model_type)
+        debug.log(f"{model_type_upper} already loaded", category=model_type)
         return
     
     # Determine target device for materialization
@@ -565,7 +559,7 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
     debug.end_timer(f"{model_type}_materialize", f"{model_type_upper} materialized")
     
     # Clean up checkpoint paths (no longer needed after weights are loaded)
-    # Note: Config attributes (_dit_block_swap_config, _dit_compile_args) are preserved
+    # Note: Config attributes (_dit_compile_args) are preserved
     # for configuration change detection on subsequent runs
     if is_dit:
         runner._dit_checkpoint = None
@@ -600,7 +594,7 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     model_type_lower = model_type.lower()
     
     # Handle encrypted models
-    logger.info(f"Checkpoint path: {checkpoint_path}")
+    logger.debug(f"Loading weights from: {checkpoint_path}")
     model_path_or_bytes = checkpoint_path
     if isinstance(checkpoint_path, str) and checkpoint_path.endswith('.enc'):
         try:
@@ -618,7 +612,7 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     # Log loading action
     action = "Materializing" if used_meta else "Loading"
     target_device_str = str(target_device).upper()
-    debug.log(f"{action} {model_type} weights to {target_device_str}{cpu_reason}: {checkpoint_path}", 
+    debug.log(f"{action} {model_type} weights to {target_device_str}", 
              category=model_type_lower, force=True)
     
     # Load state dict from file

@@ -63,7 +63,6 @@ class Debug:
         "setup": "🔧",        # Configuration/setup
         "generation": "🎬",   # Generation process
         "dit": "🚀",          # Model loading/operations
-        "blockswap": "🔀",    # BlockSwap operations
         "download": "📥",     # Download operations
         "success": "✅",      # Successful completion
         "warning": "⚠️",      # Warnings
@@ -92,7 +91,6 @@ class Debug:
         self.timer_hierarchy: Dict[str, List[str]] = {}
         self.timer_durations: Dict[str, float] = {}
         self.timer_messages: Dict[str, str] = {} 
-        self.swap_times: List[Dict[str, Any]] = []
         self.current_phase: Optional[str] = None
         self.vram_history: List[float] = []
         self.active_timer_stack: List[str] = [] 
@@ -459,7 +457,7 @@ class Debug:
                 metrics['vram_total'] = vram_info["total_gb"]
                 metrics['vram_overflow'] = max(0.0, metrics['vram_peak_rsv'] - metrics['vram_total'])
                 
-                backend = "Unified Memory" if is_mps else "VRAM"
+                backend = "GPU" if is_mps else "VRAM"
                 metrics['summary_vram'] = (
                     f"  [{backend}] {metrics['vram_allocated']:.2f}GB allocated / "
                     f"{metrics['vram_reserved']:.2f}GB reserved / "
@@ -678,86 +676,10 @@ class Debug:
             self.memory_checkpoints = (self.memory_checkpoints[:mid] + 
                                       self.memory_checkpoints[-mid:])
     
-    def log_swap_time(self, component_id: Union[int, str], duration: float, 
-                 component_type: str = "block", force: bool = False) -> None:
-        """
-        Log swap timing information for BlockSwap operations
-        
-        Args:
-            component_id: Identifier for the component being swapped
-            duration: Duration of the swap in seconds
-            component_type: Type of component ('block' or other)
-            force: If True, always log regardless of enabled state
-        """
-        if self.enabled or force:
-            # Store timing data
-            self.swap_times.append({
-                'component_id': component_id,
-                'component_type': component_type,
-                'duration': duration,
-            })
-            
-            # Format message based on component type
-            if component_type == "block":
-                message = f"Block {component_id} swap: {duration*1000:.2f}ms"
-            else:
-                message = f"{component_type} {component_id} swap: {duration*1000:.2f}ms"
-            
-            self.log(message, category="blockswap", force=force)
-    
-    def get_swap_summary(self) -> Dict[str, Any]:
-        """Get summary of swap operations for analysis"""
-        if not self.swap_times:
-            return {}
-        
-        # Group by component type
-        block_swaps = [s for s in self.swap_times if s['component_type'] == 'block']
-        io_swaps = [s for s in self.swap_times if s['component_type'] != 'block']
-        
-        # Calculate statistics
-        summary = {
-            'total_swaps': len(self.swap_times),
-            'block_swaps': len(block_swaps),
-            'io_swaps': len(io_swaps),
-        }
-        
-        if block_swaps:
-            block_times = [s['duration'] for s in block_swaps]
-            summary['block_avg_ms'] = sum(block_times) * 1000 / len(block_times)
-            summary['block_total_ms'] = sum(block_times) * 1000
-            summary['block_min_ms'] = min(block_times) * 1000
-            summary['block_max_ms'] = max(block_times) * 1000
-            
-            # Track which blocks are swapped most frequently
-            block_frequency = {}
-            for swap in block_swaps:
-                block_id = swap['component_id']
-                block_frequency[block_id] = block_frequency.get(block_id, 0) + 1
-            summary['most_swapped_block'] = max(block_frequency, key=block_frequency.get)
-            summary['most_swapped_count'] = block_frequency[summary['most_swapped_block']]
-        
-        if io_swaps:
-            io_times = [s['duration'] for s in io_swaps]
-            summary['io_avg_ms'] = sum(io_times) * 1000 / len(io_times)
-            summary['io_total_ms'] = sum(io_times) * 1000
-            
-            # Track which I/O components are swapped
-            io_components = list(set(s['component_id'] for s in io_swaps))
-            summary['io_components_swapped'] = io_components
-        
-        # VRAM efficiency metrics
-        if self.vram_history:
-            summary['peak_vram_gb'] = max(self.vram_history)
-            summary['avg_vram_gb'] = sum(self.vram_history) / len(self.vram_history)
-            summary['vram_variation_gb'] = max(self.vram_history) - min(self.vram_history)
-        
-        return summary
-    
     def clear_history(self) -> None:
         """Clear all history tracking"""
         self.timers.clear()
         self.memory_checkpoints.clear()
-        self.swap_times.clear()
         self.vram_history.clear()
         self.timer_hierarchy.clear()
         self.timer_durations.clear()

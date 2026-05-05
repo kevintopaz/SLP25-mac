@@ -69,13 +69,13 @@ class SLP25MLX:
             mlx_dtype="bf16",
             mlx_stream=True,
         )
-        logger.info("SLP25MLX initialized (split_dir=%s, model_store=%s)", split_dir, model_store)
+        logger.info("Model initialized")
 
     def __call__(self, input_path, output_path, model_parameters, progress_func):
         if not os.path.exists(input_path):
             return 9  # MEDIA_READ_ERROR
 
-        progress_func(0.0, message="Starting MLX upscale...")
+        progress_func(0.0, message="Starting enhancement...")
 
         # If "resolution" shorthand is provided (short-side target), derive
         # output_width / output_height so VideoUpscaler picks them up.
@@ -101,7 +101,7 @@ class SLP25MLX:
             self.upscaler(input_path, output_path, model_parameters,
                           progress_func=progress_func)
         except FileNotFoundError as e:
-            logger.error("SLP25MLX: input not found: %s", e)
+            logger.error("Input file not found: %s", e)
             return 9  # MEDIA_READ_ERROR
         except Exception:
             logger.exception("SLP25MLX processing failed")

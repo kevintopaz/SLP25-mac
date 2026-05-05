@@ -1267,11 +1267,10 @@ class MLXNaDiT(torch_nn.Module):
         self.num_blocks = num_blocks if num_blocks is not None else len(self.manifest["blocks"])
 
         # IO components are tiny; always resident.
-        log(f"[mlx-dit] loading IO components ({self.dtype})")
+        log("Loading model components")
         self.io = load_io_weights(self.manifest["io_components"], dtype=self.dtype)
         mx.eval(*[v for v in self.io.__dict__.values() if isinstance(v, mx.array)])
-        active0 = mx.get_active_memory() / 1024**3
-        log(f"[mlx-dit] IO loaded, active mem: {active0:.2f} GB")
+        log("Model components loaded")
 
         block_paths = [self.manifest["blocks"][i] for i in range(self.num_blocks)]
         # Block pool — works in both full_pool and streaming modes.
@@ -1286,22 +1285,15 @@ class MLXNaDiT(torch_nn.Module):
         self.stream_manager = _MLXStreamManagerShim(self.block_pool)
 
         if full_pool:
-            log(f"[mlx-dit] preloading all {self.num_blocks} blocks (full_pool=True)")
+            log("Loading model...")
             for i in range(self.num_blocks):
                 self.block_pool.prefetch_block(i)
             for i in range(self.num_blocks):
                 self.block_pool.wait_for_load(i)
                 if (i + 1) % 8 == 0:
-                    am = mx.get_active_memory() / 1024**3
-                    pm = mx.get_peak_memory() / 1024**3
-                    log(f"[mlx-dit]   loaded {i + 1}/{self.num_blocks} blocks "
-                        f"(active={am:.2f}GB peak={pm:.2f}GB)")
-        else:
-            log(f"[mlx-dit] streaming mode (pool_size={pool_size})")
+                    log(f"Loading model ({100 * (i + 1) // self.num_blocks}%)")
 
-        am = mx.get_active_memory() / 1024**3
-        pm = mx.get_peak_memory() / 1024**3
-        log(f"[mlx-dit] ready (active={am:.2f}GB peak={pm:.2f}GB)")
+        log("Model ready")
 
     @property
     def blocks(self) -> List[BlockWeights]:
@@ -1354,7 +1346,8 @@ class MLXNaDiT(torch_nn.Module):
         out_t = torch.from_numpy(out_np).to(device=target_device, dtype=target_dtype)
         return NaDiTOutput(vid_sample=out_t)
 
-    def forward_tiles(self, tile_vids, tile_vid_shapes, txt, txt_shape, timestep):
+    def forward_tiles(self, tile_vids, tile_vid_shapes, txt, txt_shape, timestep,
+                      progress_callback=None):
         """Block-first multi-tile forward: each block loaded once, all tiles processed.
 
         Args:
@@ -1394,6 +1387,7 @@ class MLXNaDiT(torch_nn.Module):
             tile_vids_mx, tile_shapes, txt_mx, ts, txt_len,
             self.io, self.block_pool, self.cfg, self.num_blocks,
             fixed_wt=self.fixed_wt,
+            progress_callback=progress_callback,
         )
 
         # Convert outputs back to PyTorch
@@ -1541,6 +1535,7 @@ def run_full_dit_streaming_tiled(
     cfg: NaDiTConfig,
     num_blocks: int,
     fixed_wt: Optional[int] = None,
+    progress_callback: Optional[Callable] = None,
 ) -> List[mx.array]:
     """Block-first multi-tile streaming: load each block once, process all tiles.
 
@@ -1623,6 +1618,9 @@ def run_full_dit_streaming_tiled(
             block_pool.release_block(block_idx)
             del block
             mx.clear_cache()
+
+        if progress_callback is not None:
+            progress_callback(block_idx + 1, num_blocks)
 
         if log_mem:
             am = mx.get_active_memory() / 1024**3

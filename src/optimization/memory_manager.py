@@ -132,8 +132,7 @@ def get_basic_vram_info(device: Optional[torch.device] = None) -> Dict[str, Any]
 # Initial VRAM check at module load
 vram_info = get_basic_vram_info(device=None)
 if "error" not in vram_info:
-    backend = "MPS" if is_mps_available() else "CUDA"
-    print(f"📊 Initial {backend} memory: {vram_info['free_gb']:.2f}GB free / {vram_info['total_gb']:.2f}GB total")
+    print(f"📊 Initial GPU memory: {vram_info['free_gb']:.2f}GB free / {vram_info['total_gb']:.2f}GB total")
 else:
     print(f"⚠️ Memory check failed: {vram_info['error']} - No available backend!")
 
@@ -268,7 +267,7 @@ def clear_memory(debug: Optional['Debug'] = None, deep: bool = False, force: boo
             if free_ratio < 0.05:
                 should_clear = True
                 if debug:
-                    backend = "Unified Memory" if is_mps_available() else "VRAM"
+                    backend = "GPU" if is_mps_available() else "VRAM"
                     debug.log(f"{backend} pressure: {mem_info['free_gb']:.2f}GB free of {mem_info['total_gb']:.2f}GB", category="memory")
         
         # For non-MPS systems, also check system RAM separately
@@ -680,31 +679,13 @@ def manage_model_device(model: torch.nn.Module, target_device: torch.device, mod
         model_name: Name for logging (e.g., "VAE", "DiT")
         debug: Debug instance for logging
         reason: Optional custom reason for the movement
-        runner: Optional runner instance for BlockSwap detection
+        runner: Optional runner instance (unused, kept for API compatibility)
         
     Returns:
         bool: True if model was moved, False if already on target device
     """
     if model is None:
         return False
-    
-    # Check if this is a BlockSwap-enabled DiT model
-    is_blockswap_model = False
-    actual_model = model
-    if runner and model_name == "DiT":
-        # Import here to avoid circular dependency
-        from .blockswap import is_blockswap_enabled
-        # Check if BlockSwap config exists and is enabled
-        has_blockswap_config = (
-            hasattr(runner, '_dit_block_swap_config') and 
-            is_blockswap_enabled(runner._dit_block_swap_config)
-        )
-        
-        if has_blockswap_config:
-            is_blockswap_model = True
-            # Get the actual model (handle CompatibleDiT wrapper)
-            if hasattr(model, "dit_model"):
-                actual_model = model.dit_model
 
     # Get current device
     try:
@@ -718,154 +699,17 @@ def manage_model_device(model: torch.nn.Module, target_device: torch.device, mod
     target_device_upper = _device_str(target_device)
 
     # Compare normalized device types
-    if current_device_upper == target_device_upper and not is_blockswap_model:
+    if current_device_upper == target_device_upper:
         # Already on target device type, no movement needed
         if debug:
             debug.log(f"{model_name} already on {current_device_upper}, skipping movement", category="general")
         return False
-        
-    # Handle BlockSwap models specially
-    if is_blockswap_model:
-        return _handle_blockswap_model_movement(
-            runner, actual_model, current_device, target_device, target_type,
-            model_name, debug, reason
-        )
     
-    # Standard model movement (non-BlockSwap)
+    # Standard model movement
     return _standard_model_movement(
         model, current_device, target_device, target_type, model_name,
         debug, reason
     )
-
-
-def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module, 
-                                    current_device: torch.device, target_device: torch.device, 
-                                    target_type: str, model_name: str,
-                                    debug: Optional['Debug'] = None, reason: Optional[str] = None) -> bool:
-    """
-    Handle device movement for BlockSwap-enabled models.
-    
-    Args:
-        runner: Runner instance with BlockSwap configuration
-        model: Model to move (actual unwrapped model)
-        current_device: Current device of the model
-        target_device: Target device (torch.device object)
-        target_type: Target device type (cpu/cuda/mps)
-        model_name: Model name for logging
-        debug: Debug instance
-        reason: Movement reason
-        
-    Returns:
-        bool: True if model was moved
-    """
-    # Import here to avoid circular dependency
-    from .blockswap import set_blockswap_bypass
-
-    if target_type == "cpu":
-        # Moving to offload device (typically CPU)
-        # Check if any parameter is on GPU (for accurate logging)
-        actual_source_device = None
-        for param in model.parameters():
-            if param.device.type in ['cuda', 'mps']:
-                actual_source_device = param.device
-                break
-        
-        source_device_desc = _device_str(actual_source_device) if actual_source_device else _device_str(target_device)
-        
-        if debug:
-            debug.log(f"Moving {model_name} from {source_device_desc} to {_device_str(target_device)} ({reason or 'model caching'})", category="general")
-        
-        # Enable bypass to allow movement
-        set_blockswap_bypass(runner=runner, bypass=True, debug=debug)
-        
-        # Start timer
-        timer_name = f"{model_name.lower()}_to_{target_type}"
-        if debug:
-            debug.start_timer(timer_name)
-        
-        # Move entire model to target offload device
-        model.to(target_device)
-        model.zero_grad(set_to_none=True)
-        
-        if debug:
-            debug.end_timer(timer_name, f"BlockSwap model offloaded to {_device_str(target_device)}")
-        
-        return True
-        
-    else:
-        # Moving to GPU (reload)
-        # Check if we're in bypass mode (coming from offload)
-        if not getattr(model, "_blockswap_bypass_protection", False):
-            # Not in bypass mode, blocks are already configured
-            if debug:
-                debug.log(f"{model_name} with BlockSwap active - blocks already distributed across devices, skipping movement", category="general")
-            return False
-        
-        # Get actual current device for accurate logging
-        actual_current_device = None
-        for param in model.parameters():
-            if param.device.type != 'meta':
-                actual_current_device = param.device
-                break
-        
-        current_device_desc = _device_str(actual_current_device) if actual_current_device else "OFFLOAD"
-        
-        if debug:
-            debug.log(f"Moving {model_name} from {current_device_desc} to {_device_str(target_device)} ({reason or 'inference requirement'})", category="general")
-        
-        timer_name = f"{model_name.lower()}_to_gpu"
-        if debug:
-            debug.start_timer(timer_name)
-        
-        # Restore blocks to their configured devices
-        if hasattr(model, "blocks") and hasattr(model, "blocks_to_swap"):
-            # Use configured offload_device from BlockSwap config
-            offload_device = model._block_swap_config.get("offload_device")
-            if not offload_device:
-                raise ValueError("BlockSwap config missing offload_device")
-            
-            # Move blocks according to BlockSwap configuration
-            for b, block in enumerate(model.blocks):
-                if b > model.blocks_to_swap:
-                    # This block should be on GPU
-                    block.to(target_device)
-                else:
-                    # This block stays on offload device (will be swapped during forward)
-                    block.to(offload_device)
-            
-            # Handle I/O components
-            if not model._block_swap_config.get("swap_io_components", False):
-                # I/O components should be on GPU if not offloaded
-                for name, module in model.named_children():
-                    if name != "blocks":
-                        module.to(target_device)
-            else:
-                # I/O components stay on offload device
-                for name, module in model.named_children():
-                    if name != "blocks":
-                        module.to(offload_device)
-            
-            if debug:
-                # Get actual configuration from runner
-                if hasattr(model, '_block_swap_config'):
-                    blocks_on_gpu = model._block_swap_config.get('total_blocks', 32) - model._block_swap_config.get('blocks_swapped', 16)
-                    total_blocks = model._block_swap_config.get('total_blocks', 32)
-                    main_device = model._block_swap_config.get('main_device', 'GPU')
-                    debug.log(f"BlockSwap blocks restored to configured devices ({blocks_on_gpu}/{total_blocks} blocks on {_device_str(main_device)})", category="success")
-                else:
-                    debug.log("BlockSwap blocks restored to configured devices", category="success")
-
-        
-        # Reactivate BlockSwap now that blocks are restored to their configured devices
-        runner._blockswap_active = True
-        
-        # Disable bypass, re-enable protection
-        set_blockswap_bypass(runner=runner, bypass=False, debug=debug)
-        
-        if debug:
-            debug.end_timer(timer_name, "BlockSwap model restored")
-        
-        return True
 
 
 def _standard_model_movement(model: torch.nn.Module, current_device: torch.device,
@@ -920,7 +764,7 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
                     module.memory = None
                     cleared_count += 1
         if cleared_count > 0 and debug:
-            debug.log(f"Cleared {cleared_count} VAE memory buffers", category="success")
+            debug.log(f"Cleared {cleared_count} codec memory buffers", category="success")
     
     # End timer
     if debug:
@@ -1022,7 +866,7 @@ def cleanup_dit(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
         return
     
     if debug:
-        debug.log("Cleaning up DiT components", category="cleanup")
+        debug.log("Cleaning up enhancement model", category="cleanup")
     
     # 1. Clear DiT-specific runtime caches first
     if hasattr(runner, 'dit'):
@@ -1053,7 +897,7 @@ def cleanup_dit(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
             # MPS: skip CPU movement before deletion (unified memory, just causes sync)
             if param_device.type == 'mps' and not cache_model:
                 if debug:
-                    debug.log("DiT on MPS - skipping CPU movement before deletion", category="cleanup")
+                    debug.log("Model on GPU - skipping CPU movement before deletion", category="cleanup")
             else:
                 offload_target = getattr(runner, '_dit_offload_device', None)
                 if offload_target is None or offload_target == 'none':
@@ -1062,28 +906,20 @@ def cleanup_dit(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
                 manage_model_device(model=runner.dit, target_device=offload_target, model_name="DiT", 
                                    debug=debug, reason=reason, runner=runner)
         elif param_device.type == 'meta' and debug:
-            debug.log("DiT on meta device - keeping structure for cache", category="cleanup")
+            debug.log("Model on meta device - keeping structure for cache", category="cleanup")
     except StopIteration:
         pass
     
-    # 3. Clean BlockSwap after model movement
-    if hasattr(runner, "_blockswap_active") and runner._blockswap_active:
-        # Import here to avoid circular dependency
-        from .blockswap import cleanup_blockswap
-        cleanup_blockswap(runner=runner, keep_state_for_cache=cache_model)
-    
-    # 4. Complete cleanup if not caching
+    # 3. Complete cleanup if not caching
     if not cache_model:
         release_model_memory(model=runner.dit, debug=debug)
         runner.dit = None
         if debug:
-            debug.log("DiT model deleted", category="cleanup")
+            debug.log("Enhancement model deleted", category="cleanup")
         
         # Clear DiT config attributes - not needed when model is not cached (will be recreated)
         if hasattr(runner, '_dit_compile_args'):
             delattr(runner, '_dit_compile_args')
-        if hasattr(runner, '_dit_block_swap_config'):
-            delattr(runner, '_dit_block_swap_config')
         if hasattr(runner, '_dit_attention_mode'):
             delattr(runner, '_dit_attention_mode')
     
@@ -1111,7 +947,7 @@ def cleanup_vae(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
         return
     
     if debug:
-        debug.log("Cleaning up VAE components", category="cleanup")
+        debug.log("Cleaning up codec components", category="cleanup")
     
     # 1. Clear VAE-specific temporary attributes
     if hasattr(runner, 'vae'):
@@ -1131,7 +967,7 @@ def cleanup_vae(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
             # MPS: skip CPU movement before deletion (unified memory, just causes sync)
             if param_device.type == 'mps' and not cache_model:
                 if debug:
-                    debug.log("VAE on MPS - skipping CPU movement before deletion", category="cleanup")
+                    debug.log("Codec on GPU - skipping CPU movement before deletion", category="cleanup")
             else:
                 offload_target = getattr(runner, '_vae_offload_device', None)
                 if offload_target is None or offload_target == 'none':
@@ -1140,7 +976,7 @@ def cleanup_vae(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
                 manage_model_device(model=runner.vae, target_device=offload_target, model_name="VAE", 
                                    debug=debug, reason=reason, runner=runner)
         elif param_device.type == 'meta' and debug:
-            debug.log("VAE on meta device - keeping structure for cache", category="cleanup")
+            debug.log("Codec on meta device - keeping structure for cache", category="cleanup")
     except StopIteration:
         pass
     
@@ -1149,7 +985,7 @@ def cleanup_vae(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
         release_model_memory(model=runner.vae, debug=debug)
         runner.vae = None
         if debug:
-            debug.log("VAE model deleted", category="cleanup")
+            debug.log("Codec model deleted", category="cleanup")
         
         # Clear VAE config attributes - not needed when model is not cached (will be recreated)
         if hasattr(runner, '_vae_compile_args'):

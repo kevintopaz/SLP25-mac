@@ -76,7 +76,7 @@ def _compute_dit_tile_params(
             tiles_info.append((y_start, x_start, tile_h, tile_w))
 
     if debug:
-        debug.log(f"DiT tiling: {len(tiles_info)} tiles, size=({tile_h}x{tile_w}), "
+        debug.log(f"Tiling: {len(tiles_info)} tiles, size=({tile_h}x{tile_w}), "
                  f"overlap=({overlap_h}x{overlap_w}), stride=({stride_h}x{stride_w}), full size=({H}x{W})",
                  category="dit", force=True, indent_level=1)
 
@@ -123,7 +123,7 @@ def encode_text_prompt(
     cache_key = "t5_xxl"
     if cache_key not in _text_encoder_cache:
         if debug:
-            debug.log("Loading T5-XXL text encoder...", category="text", force=True)
+            debug.log("Loading text encoder...", category="text", force=True)
         
         model_name = "google/t5-v1_1-xxl"
         tokenizer = T5Tokenizer.from_pretrained(model_name)
@@ -150,7 +150,7 @@ def encode_text_prompt(
         }
         
         if debug:
-            debug.log(f"T5-XXL loaded (dim: {t5_dim} → {target_dim})", category="text")
+            debug.log("Text encoder loaded", category="text")
     
     cache = _text_encoder_cache[cache_key]
     tokenizer = cache['tokenizer']
@@ -255,7 +255,7 @@ def encode_whole_video(
         Total number of input frames.
     """
     debug.log("", category="none", force=True)
-    debug.log("━━━━━━━━ Phase 1: VAE Encode (whole video) ━━━━━━━━", category="none", force=True)
+    debug.log("━━━━━━━━ Phase 1: Encoding video ━━━━━━━━", category="none", force=True)
     debug.start_timer("phase1_encode_whole")
 
     T_input = frame_count
@@ -289,7 +289,7 @@ def encode_whole_video(
         total_frames=T_input,
         padded_frames=T_padded,
     )
-    debug.log(f"Batch-transformed to memmap: {vpp.memmap}",
+    debug.log(f"Batch-transformed to disk cache: {vpp.memmap}",
               category="memory", force=True)
 
     import gc; gc.collect()
@@ -319,7 +319,7 @@ def encode_whole_video(
     latent = latents[0]
     debug.end_timer("vae_encode", "VAE encode")
     
-    debug.log(f"Encoded latent shape: {latent.shape}", category="vae", force=True)
+    debug.log(f"Encoded shape: {latent.shape}", category="vae", force=True)
     
     if ctx['tensor_offload_device'] is not None:
         latent = manage_tensor(
@@ -385,7 +385,7 @@ def upscale_latent_chunked(
         negative_prompt: Optional custom negative text prompt
     """
     debug.log("", category="none", force=True)
-    debug.log("━━━━━━━━ Phase 2: DiT Upscale (latent chunks) ━━━━━━━━", category="none", force=True)
+    debug.log("━━━━━━━━ Phase 2: Enhancing video ━━━━━━━━", category="none", force=True)
     debug.start_timer("phase2_upscale_chunked")
     
     if 'full_latent' not in ctx:
@@ -440,8 +440,7 @@ def upscale_latent_chunked(
     
     num_chunks = len(chunks)
     chunk_desc = ", ".join(f"[{s}:{e}]" for s, e in chunks)
-    debug.log(f"DiT temporal chunking: {num_chunks} chunks  {chunk_desc}  "
-              f"(chunk_size={chunk_size}, overlap={overlap}, T={T})",
+    debug.log(f"Temporal chunking: {num_chunks} chunks  {chunk_desc}",
               category="dit", force=True)
     
     accum_device = ctx.get('tensor_offload_device') or latent.device
@@ -455,6 +454,11 @@ def upscale_latent_chunked(
         
         set_seed(seed)
         
+        def _block_progress(blocks_done, blocks_total):
+            if progress_callback:
+                frac = chunk_idx + blocks_done / max(blocks_total, 1)
+                progress_callback(frac, num_chunks, chunk_len, "Phase 2: Upscaling")
+
         if progress_callback:
             progress_callback(chunk_idx, num_chunks, chunk_len, "Phase 2: Upscaling")
         
@@ -516,7 +520,8 @@ def upscale_latent_chunked(
                     if dit_tiles is not None:
                         upscaled = _tiled_dit_inference(
                             runner, chunk_latent, noises, conditions,
-                            ctx['text_embeds'], ctx, dit_tiles, dit_tile_overlap, debug
+                            ctx['text_embeds'], ctx, dit_tiles, dit_tile_overlap, debug,
+                            progress_callback=_block_progress,
                         )
                     else:
                         upscaled = runner.inference(
@@ -527,7 +532,8 @@ def upscale_latent_chunked(
                 if dit_tiles is not None:
                     upscaled = _tiled_dit_inference(
                         runner, chunk_latent, noises, conditions,
-                        ctx['text_embeds'], ctx, dit_tiles, dit_tile_overlap, debug
+                        ctx['text_embeds'], ctx, dit_tiles, dit_tile_overlap, debug,
+                        progress_callback=_block_progress,
                     )
                 else:
                     upscaled = runner.inference(
@@ -693,6 +699,7 @@ def _blend_tiles(tiles_info, tile_outputs, T, H, W, C, overlap_h, overlap_w,
 def _tiled_dit_block_first(
     runner, noises, conditions, text_embeds, ctx,
     tiles_info, T, H, W, C, overlap_h, overlap_w, debug,
+    progress_callback=None,
 ):
     """Block-first tiled DiT: load each block once, process all tiles through it.
 
@@ -741,12 +748,13 @@ def _tiled_dit_block_first(
     timesteps = runner.sampler.timesteps.timesteps
     t_final = timesteps[-1]
 
-    debug.log(f"Block-first tiled DiT: {num_tiles} tiles, timestep={t_final.item():.1f}",
+    debug.log(f"Tiled enhancement: {num_tiles} tiles",
              category="dit", indent_level=1)
 
     # -- Block-first forward --------------------------------------------------
     dit_outputs = dit_model.forward_tiles(
         tile_vids, tile_vid_shapes, txt_embed, txt_shape, t_final,
+        progress_callback=progress_callback,
     )
 
     # -- Sampler denoising per tile -------------------------------------------
@@ -765,7 +773,7 @@ def _tiled_dit_block_first(
 
     result = _blend_tiles(tiles_info, tile_results, T, H, W, C,
                           overlap_h, overlap_w, device, dtype, accum_device)
-    debug.log(f"Block-first tiled DiT: merged {num_tiles} tiles", category="dit", indent_level=1)
+    debug.log(f"Merged {num_tiles} tiles", category="dit", indent_level=1)
     return [result]
 
 
@@ -773,7 +781,8 @@ def _tiled_dit_inference(
     runner, latent: torch.Tensor, noises: List[torch.Tensor],
     conditions: List[torch.Tensor], text_embeds: Dict[str, Any],
     ctx: Dict[str, Any], dit_tiles: Tuple[int, int],
-    dit_tile_overlap: float, debug: 'Debug'
+    dit_tile_overlap: float, debug: 'Debug',
+    progress_callback=None,
 ) -> List[torch.Tensor]:
     """Tiled spatial DiT inference for a single temporal chunk with smooth blending."""
     T, H, W, C = latent.shape
@@ -804,6 +813,7 @@ def _tiled_dit_inference(
         return _tiled_dit_block_first(
             runner, noises, conditions, text_embeds, ctx,
             tiles_info, T, H, W, C, overlap_h, overlap_w, debug,
+            progress_callback=progress_callback,
         )
     
     # Tile-first fallback: process each tile independently through all blocks.
@@ -821,10 +831,12 @@ def _tiled_dit_inference(
         
         tile_outputs.append(tile_result[0])
         del tile_noises, tile_conditions, tile_result
+        if progress_callback is not None:
+            progress_callback(tile_idx + 1, num_tiles)
     
     result = _blend_tiles(tiles_info, tile_outputs, T, H, W, C,
                           overlap_h, overlap_w, device, dtype, accum_device)
-    debug.log(f"Tiled DiT: merged {num_tiles} tiles with cosine blending", category="dit", indent_level=1)
+    debug.log(f"Merged {num_tiles} tiles", category="dit", indent_level=1)
     return [result]
 
 
@@ -839,14 +851,14 @@ def decode_whole_latent(
     Phase 3: Decode entire latent to video at once.
     """
     debug.log("", category="none", force=True)
-    debug.log("━━━━━━━━ Phase 3: VAE Decode (whole latent) ━━━━━━━━", category="none", force=True)
+    debug.log("━━━━━━━━ Phase 3: Decoding video ━━━━━━━━", category="none", force=True)
     debug.start_timer("phase3_decode_whole")
     
     if 'upscaled_latent' not in ctx:
         raise ValueError("No upscaled_latent in context. Run upscale_latent_chunked first.")
     
     latent = ctx['upscaled_latent']
-    debug.log(f"Decoding latent shape: {latent.shape}", category="vae", force=True)
+    debug.log(f"Decoding shape: {latent.shape}", category="vae", force=True)
     
     manage_model_device(model=runner.vae, target_device=ctx['vae_device'],
                        model_name="VAE", debug=debug, runner=runner)
@@ -950,7 +962,7 @@ def postprocess_latent_output(
             ctx['transformed_video'] = tv
             del tv
             vpp.cleanup_memmap()
-            debug.log("Reloaded transformed_video from VPP memmap for color correction",
+            debug.log("Reloaded transformed video from disk cache for color correction",
                       category="memory", force=True)
 
     vpp = ctx.get('vpp')

@@ -105,16 +105,13 @@ def setup_generation_context(
         offload_str = ", ".join(offload_info) if offload_info else "none"
         
         debug.log(
-            f"Generation context initialized: "
-            f"DiT={str(dit_device)}, VAE={str(vae_device)}, "
-            f"Offload=[{offload_str}], "
-            f"LOCAL_RANK={os.environ['LOCAL_RANK']}",
+            f"Processing context initialized (device={str(dit_device)})",
             category="setup"
         )
         if ctx['compute_dtype'] == torch.float32:
             reason = "quality"
         elif not BFLOAT16_SUPPORTED:
-            reason = "compatibility (GPU lacks bfloat16 CUBLAS - 7B models unsupported, 3B may have artifacts)"
+            reason = "compatibility (GPU precision limitations detected)"
         else:
             reason = "performance"
         debug.log(f"Unified compute dtype: {ctx['compute_dtype']} across entire pipeline for maximum {reason}", category="precision")
@@ -132,7 +129,6 @@ def prepare_runner(
     vae_cache: bool = False,
     dit_id: Optional[int] = None,
     vae_id: Optional[int] = None,
-    block_swap_config: Optional[Dict[str, Any]] = None,
     encode_tiled: bool = False,
     encode_tile_size: Optional[Tuple[int, int]] = None,
     encode_tile_overlap: Optional[Tuple[int, int]] = None,
@@ -160,7 +156,6 @@ def prepare_runner(
         vae_cache=vae_cache,
         dit_id=dit_id,
         vae_id=vae_id,
-        block_swap_config=block_swap_config,
         encode_tiled=encode_tiled,
         encode_tile_size=encode_tile_size,
         encode_tile_overlap=encode_tile_overlap,
@@ -245,13 +240,13 @@ def ensure_precision_initialized(
 
         parts = []
         if dit_dtype is not None:
-            parts.append(f"DiT={dit_dtype}")
+            parts.append(f"enhancement={dit_dtype}")
         if vae_dtype is not None:
-            parts.append(f"VAE={vae_dtype}")
+            parts.append(f"codec={vae_dtype}")
         parts.append(f"compute={ctx['compute_dtype']}")
 
         if parts:
-            debug.log(f"Model precision: {', '.join(parts)}", category="precision")
+            debug.log(f"Compute precision: {', '.join(parts)}", category="precision")
             
     except Exception as e:
         debug.log(f"Could not log model dtypes: {e}", level="WARNING", category="precision", force=True)

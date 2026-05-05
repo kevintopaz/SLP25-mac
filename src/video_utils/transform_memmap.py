@@ -200,7 +200,7 @@ class TransformMemmap:
             size_mb = os.path.getsize(self.path) / 1e6
         except OSError:
             size_mb = 0.0
-        return (f"TransformMemmap(mode={self.mode!r}, shape={self.shape}, "
+        return (f"DiskCache(mode={self.mode!r}, shape={self.shape}, "
                 f"dtype={self.dtype.__name__}, size={size_mb:.1f}MB)")
 
     def cleanup(self) -> None:

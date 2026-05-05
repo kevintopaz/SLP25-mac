@@ -575,7 +575,7 @@ class VideoPrePostProcess:
             mm.mirror_pad(total_frames)
 
         mm.flush()
-        logger.info("Ingested %d frames to memmap[%s]: %s", total_frames, name, mm)
+        logger.info("Ingested %d frames to disk cache: %s", total_frames, mm)
         return mm
 
     def read_tile(

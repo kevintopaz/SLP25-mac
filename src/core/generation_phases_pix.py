@@ -145,6 +145,7 @@ def process_pix_chunk(
     prompt: Optional[str],
     negative_prompt: Optional[str],
     cfg_scale: float,
+    progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, float]]:
     """
     Run full encode -> DiT -> decode on a single pixel-space chunk.
@@ -189,7 +190,8 @@ def process_pix_chunk(
     # Phase 1 -- VAE Encode
     t_enc_start = time.time()
     ctx = encode_whole_video(
-        runner, ctx, reader_fn, frame_count, debug, resolution, max_resolution
+        runner, ctx, reader_fn, frame_count, debug, resolution, max_resolution,
+        progress_callback=progress_callback,
     )
     t_enc_end = time.time()
     vram_encode = getattr(runner, '_trt_vram_encode', None) or _peak_vram_gb()
@@ -215,6 +217,7 @@ def process_pix_chunk(
         prompt=prompt,
         negative_prompt=negative_prompt,
         cfg_scale=cfg_scale,
+        progress_callback=progress_callback,
         cache_model=True,
     )
     t_dit_end = time.time()
@@ -228,7 +231,7 @@ def process_pix_chunk(
     # Phase 3 -- VAE Decode
     # cache_model=True keeps runner.vae alive for subsequent chunks
     t_dec_start = time.time()
-    ctx = decode_whole_latent(runner, ctx, debug, cache_model=True)
+    ctx = decode_whole_latent(runner, ctx, debug, progress_callback=progress_callback, cache_model=True)
     t_dec_end = time.time()
     vram_decode = getattr(runner, '_trt_vram_decode', None) or _peak_vram_gb()
 
@@ -488,6 +491,7 @@ def process_video_pix_chunked(
     device: str = "cuda:0",
     output_callback: Optional[Callable[[torch.Tensor], None]] = None,
     shift_back: bool = True,
+    progress_fn: Optional[Callable[[float, str], None]] = None,
 ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
     """
     Complete pixel-space temporal chunking pipeline.
@@ -617,6 +621,48 @@ def process_video_pix_chunked(
     if any(s > 0 for s in extra_skip):
         logger.info("Shift-back extra_skip per chunk: %s", extra_skip)
 
+    # --- Progress helpers ---
+    # Maps per-phase callbacks to a global 0.0 – 0.92 range.
+    # Within each chunk: encode=10%, enhance=70%, decode=10%, post=10%.
+    _PROGRESS_CEIL = 0.95
+    _PHASE_WEIGHTS = (0.20, 0.20, 0.50, 0.10)  # encode, enhance, decode, post
+
+    def _make_chunk_progress(chunk_idx: int):
+        """Return a per-phase progress_callback for the given chunk."""
+        if progress_fn is None:
+            return None
+        band = _PROGRESS_CEIL / max(num_chunks, 1)
+        base = band * chunk_idx
+        w_enc, w_dit, _, _ = _PHASE_WEIGHTS
+
+        def _phase_cb(step, total, n_frames, message):
+            if "Encoding" in message:
+                frac = (step / max(total, 1)) * w_enc
+            elif "Upscaling" in message:
+                frac = w_enc + (step / max(total, 1)) * w_dit
+            elif "Decoding" in message:
+                frac = w_enc + w_dit + (step / max(total, 1)) * _PHASE_WEIGHTS[2]
+            else:
+                frac = w_enc + w_dit + _PHASE_WEIGHTS[2]
+            progress_fn(base + frac * band, message)
+        return _phase_cb
+
+    def _report_post(chunk_idx: int):
+        """Report post-processing progress for the given chunk."""
+        if progress_fn is None:
+            return
+        band = _PROGRESS_CEIL / max(num_chunks, 1)
+        base = band * chunk_idx
+        frac = sum(_PHASE_WEIGHTS[:3])
+        progress_fn(base + frac * band, "Post-processing")
+
+    def _report_chunk_done(chunk_idx: int):
+        """Report that a chunk is fully complete."""
+        if progress_fn is None:
+            return
+        band = _PROGRESS_CEIL / max(num_chunks, 1)
+        progress_fn(band * (chunk_idx + 1), "Processing")
+
     # --- Process each chunk through encode -> DiT -> decode ---
     t_pipeline_start = time.time()
     total_encode_time = 0.0
@@ -669,19 +715,32 @@ def process_video_pix_chunked(
             def _chunk_reader(start, count, _base=_ws):
                 return frames[_base + start : _base + start + count]
 
-            # Free reader buffer entries that won't be needed by any
-            # future chunk so decoded frames don't linger in RAM during
-            # the heavy encode/dit/decode phases.
+            # Tell the reader to preserve overlap frames needed by the
+            # next chunk.  Without this, batch reads inside VPP.ingest
+            # would trim buffer entries that fall between the current
+            # read head and the next chunk's start, making them
+            # unrecoverable.  On the last chunk, allow full trimming.
+            if hasattr(frames, '_trim_floor'):
+                if ci + 1 < num_chunks:
+                    _skip = getattr(frames, 'skip_frames', 0)
+                    frames._trim_floor = _skip + read_windows[ci + 1][0]
+                else:
+                    frames._trim_floor = 0
+
+            # Free reader buffer entries before the current chunk's start.
+            # With lazy reading (reader_fn batches), we can only free frames
+            # that precede ws — the current chunk still needs [ws, we).
+            # The reader's _trim_floor prevents batch reads from evicting
+            # overlap frames needed by the next chunk.
             if hasattr(frames, '_buffer') and isinstance(frames._buffer, dict):
-                next_start = read_windows[ci + 1][0] if ci + 1 < num_chunks else we
                 _skip = getattr(frames, 'skip_frames', 0)
                 _freed = 0
                 for k in list(frames._buffer):
-                    if k < _skip + next_start:
+                    if k < _skip + ws:
                         del frames._buffer[k]
                         _freed += 1
                 if _freed:
-                    logger.info("Freed %d reader buffer entries (< frame %d)", _freed, next_start)
+                    logger.info("Freed %d reader buffer entries (< frame %d)", _freed, ws)
 
             video_ended_early = chunk_len < (we - ws)
             if video_ended_early:
@@ -705,6 +764,7 @@ def process_video_pix_chunked(
                 latent_noise_scale, shared_noise,
                 dit_tiles, dit_tile_overlap,
                 prompt, negative_prompt, cfg_scale,
+                progress_callback=_make_chunk_progress(ci),
             )
             t1 = time.time()
             total_encode_time += chunk_timings["encode"]
@@ -720,6 +780,7 @@ def process_video_pix_chunked(
                 chunk_timings["encode"], chunk_timings["dit"], chunk_timings["decode"],
                 chunk_timings["vram_encode"], chunk_timings["vram_dit"], chunk_timings["vram_decode"],
             )
+            _report_post(ci)
             t_pp0 = time.time()
 
             # ── Streaming decode path ──
@@ -814,6 +875,7 @@ def process_video_pix_chunked(
 
             t_pp1 = time.time()
             total_post_time += t_pp1 - t_pp0
+            _report_chunk_done(ci)
 
             del decoded, transformed
             if not is_last:
@@ -871,6 +933,13 @@ def process_video_pix_chunked(
             def _chunk_reader(start, count, _base=_ws):
                 return frames[_base + start : _base + start + count]
 
+            if hasattr(frames, '_trim_floor'):
+                if ci + 1 < num_chunks:
+                    _skip = getattr(frames, 'skip_frames', 0)
+                    frames._trim_floor = _skip + read_windows[ci + 1][0]
+                else:
+                    frames._trim_floor = 0
+
             video_ended_early = chunk_len < (we - ws)
             if video_ended_early:
                 logger.warning(
@@ -891,6 +960,7 @@ def process_video_pix_chunked(
                 latent_noise_scale, shared_noise,
                 dit_tiles, dit_tile_overlap,
                 prompt, negative_prompt, cfg_scale,
+                progress_callback=_make_chunk_progress(ci),
             )
             t1 = time.time()
             total_encode_time += chunk_timings["encode"]
@@ -972,6 +1042,7 @@ def process_video_pix_chunked(
                 current_write_idx = write_end
 
             del decoded, transformed
+            _report_chunk_done(ci)
             if video_ended_early:
                 break
             if ci < num_chunks - 1:

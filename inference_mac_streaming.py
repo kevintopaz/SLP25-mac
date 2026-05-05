@@ -96,14 +96,14 @@ if os.environ.get("MLX_WAVELET", "1") == "1":
     try:
         from .src.utils.color_fix_mlx import wavelet_reconstruction_mlx
         _COLOR_OVERRIDES["wavelet"] = wavelet_reconstruction_mlx
-        logger.info("MLX wavelet override registered for ColorMatcher")
+        logger.info("Accelerated wavelet color correction enabled")
     except ImportError:
         try:
             from src.utils.color_fix_mlx import wavelet_reconstruction_mlx
             _COLOR_OVERRIDES["wavelet"] = wavelet_reconstruction_mlx
-            logger.info("MLX wavelet override registered for ColorMatcher")
+            logger.info("Accelerated wavelet color correction enabled")
         except Exception as _e:
-            logger.warning(f"Failed to load MLX wavelet: {_e}")
+            logger.warning(f"Failed to load accelerated wavelet: {_e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -505,6 +505,7 @@ class LazyVideoReader:
         self._buffer = {}
         self._decode_pos = 0
         self._exhausted = False
+        self._trim_floor = 0
         self._thread = _t.Thread(target=self._worker, daemon=True)
         self._thread.start()
         for _ in range(skip_frames):
@@ -591,8 +592,9 @@ class LazyVideoReader:
         self._decode_up_to(abs_end)
         abs_start = self.skip_frames + start
         frames = [self._buffer[i] for i in range(abs_start, abs_start + (end - start)) if i in self._buffer]
+        floor = self._trim_floor
         for k in list(self._buffer):
-            if k < abs_start:
+            if k < abs_start and (floor <= 0 or k < floor):
                 del self._buffer[k]
         if not frames:
             return np.empty((0, self._display_h, self._display_w, 3), dtype=np.uint8)
@@ -684,7 +686,7 @@ class MPSStreamingNaDiT(torch.nn.Module):
         self.need_txt_repeat = False  # 3B doesn't repeat text along temporal dim
         self.block_pool = self.stream_manager.block_pool
 
-        logger.info(f"Initialized streaming NaDiT 3B with {self.num_blocks} blocks")
+        logger.info("Enhancement model initialized")
 
     def _create_block_factory(self):
         config = self.config
@@ -764,19 +766,15 @@ class MPSStreamingNaDiT(torch.nn.Module):
         self.vid_in = _load(io_paths['vid_in'],
                             NaPatchIn(in_channels=config['vid_in_channels'],
                                       patch_size=patch_size, dim=vid_dim))
-        logger.info("Loaded vid_in")
-
         # vid_out
         self.vid_out = _load(io_paths['vid_out'],
                              NaPatchOut(out_channels=config['vid_out_channels'],
                                         patch_size=patch_size, dim=vid_dim))
-        logger.info("Loaded vid_out")
 
         # vid_out_norm
         norm_layer = get_norm_layer(config.get('vid_out_norm', 'fusedrms'))
         self.vid_out_norm = _load(io_paths['vid_out_norm'],
                                   norm_layer(dim=vid_dim, eps=norm_eps, elementwise_affine=True))
-        logger.info("Loaded vid_out_norm")
 
         # vid_out_ada (with corrected embedding handling)
         class FixedVidOutAda(tnn.Module):
@@ -796,21 +794,19 @@ class MPSStreamingNaDiT(torch.nn.Module):
                 return hid * (scaleA + self.out_scale) + (shiftA + self.out_shift)
 
         self.vid_out_ada = _load(io_paths['vid_out_ada'], FixedVidOutAda(vid_dim))
-        logger.info("Loaded vid_out_ada")
 
         # txt_in
         if txt_in_dim != txt_dim:
             self.txt_in = _load(io_paths['txt_in'], tnn.Linear(txt_in_dim, txt_dim))
         else:
             self.txt_in = tnn.Identity().to(device=device, dtype=dtype)
-        logger.info("Loaded txt_in")
 
         # emb_in
         self.emb_in = _load(io_paths['emb_in'],
                             TimeEmbedding(sinusoidal_dim=256,
                                           hidden_dim=max(vid_dim, txt_dim),
                                           output_dim=emb_dim))
-        logger.info("Loaded emb_in")
+        logger.info("Model components loaded")
 
         self.emb_scale = None
 
@@ -901,10 +897,8 @@ class VideoUpscaler:
             else:
                 vae_path = os.path.join(model_dir, "ema_vae_bf16.pth")
 
-        logger.info("Initializing Video Upscaler (Mac Streaming)...")
-        logger.info(f"  Split dir: {split_dir}")
-        logger.info(f"  Model dir: {model_dir}")
-        logger.info(f"  VAE path:  {vae_path}")
+        logger.info("Initializing Video Upscaler...")
+        logger.info(f"  Model directory: {model_dir}")
         logger.info(
             f"  System RAM: {_TOTAL_RAM_GB:.1f} GB  "
             f"-> enc tile {VAE_TILE_SIZE}, dec tile {VAE_DECODE_TILE_SIZE}"
@@ -964,12 +958,8 @@ class VideoUpscaler:
         # We leave ctx['text_embeds'] unset so it gets loaded on first DiT run
 
         # Initialize MLX VAE (replaces PyTorch VAE for much faster encode/decode)
-        logger.info("Initializing MLX Video VAE...")
+        logger.info("Initializing codec...")
         from .src.optimization.mlx_video_vae import MLXVideoVAE
-        logger.info(
-            "  MLX VAE cache_limit_gb=%s (Metal buffer pool cap)",
-            f"{self.vae_cache_limit_gb:.2f}" if self.vae_cache_limit_gb is not None else "None",
-        )
         self.mlx_vae = MLXVideoVAE(vae_path, cache_limit_gb=self.vae_cache_limit_gb)
 
         # ─── PyTorch VAE: skip materialization entirely ─────────────────
@@ -989,7 +979,7 @@ class VideoUpscaler:
             del self.runner.vae
             gc.collect()
         self.runner.vae = _VAEStub()
-        logger.info("Skipped PyTorch VAE materialization (~478 MB saved on MPS heap)")
+        logger.debug("Skipped redundant codec materialization")
 
         # ─── Create DiT ────────────────────────────────────────────────
         self.use_mlx_dit = use_mlx_dit
@@ -997,8 +987,7 @@ class VideoUpscaler:
             from .src.optimization.mlx_nadit import MLXNaDiT
             mlx_dtype = getattr(self, "mlx_dtype", "bf16")
             mlx_stream = bool(getattr(self, "mlx_stream", False))
-            logger.info(f"Creating MLX DiT (dtype={mlx_dtype}, "
-                        f"{'streaming' if mlx_stream else 'full-pool'})...")
+            logger.info("Loading enhancement model...")
             self.streaming_dit = MLXNaDiT(
                 split_dir=split_dir,
                 dtype=mlx_dtype,
@@ -1006,7 +995,7 @@ class VideoUpscaler:
                 log=lambda s: logger.info(s),
             )
         else:
-            logger.info("Creating streaming DiT from split blocks...")
+            logger.info("Loading enhancement model...")
             self.streaming_dit = MPSStreamingNaDiT(
                 split_dir=split_dir,
                 device=torch.device(device),
@@ -1069,7 +1058,7 @@ class VideoUpscaler:
                 gc.collect()
                 mx.clear_cache()
                 _dit_io_freed = True
-                logger.debug("Freed DiT IO weights for VAE encode")
+                logger.debug("Freed model weights for encode phase")
 
             torch.mps.empty_cache()
 
@@ -1098,14 +1087,14 @@ class VideoUpscaler:
                 latent_t = latent_t.to(dtype=torch.bfloat16)
                 latents.append(latent_t)
                 del latent_np, mean
-                debug.log(f"MLX Encode: latent {list(latent_t.shape)}", category="vae")
+                debug.log(f"Encode: intermediate {list(latent_t.shape)}", category="vae")
 
             # Full cleanup: free all encode-phase memory before DiT starts
             mlx_vae.encoder = None
             gc.collect()
             mx.clear_cache()
             torch.mps.empty_cache()
-            logger.debug("Freed VAE encoder weights + caches after encode")
+            logger.debug("Freed encoder weights after encode")
 
             # Restore DiT IO weights
             if _dit_io_freed and _dit is not None:
@@ -1113,7 +1102,7 @@ class VideoUpscaler:
                 del _dit._saved_io
                 mx.eval(*[v for v in _dit.io.__dict__.values()
                           if isinstance(v, mx.array)])
-                logger.debug("Restored DiT IO weights after VAE encode")
+                logger.debug("Restored model weights after encode")
             return latents
 
         @torch.no_grad()
@@ -1152,7 +1141,7 @@ class VideoUpscaler:
                 sample_t = sample_t.permute(3, 0, 1, 2)  # [C, T, H, W]
                 samples.append(sample_t)
                 del lat_np, frames_np
-                debug.log(f"MLX Decode: {list(sample_t.shape)}", category="vae")
+                debug.log(f"Decode: {list(sample_t.shape)}", category="vae")
 
             mlx_vae.decoder = None
             gc.collect()
@@ -1169,7 +1158,7 @@ class VideoUpscaler:
 
         runner.vae_encode = mlx_vae_encode
         runner.vae_decode = mlx_vae_decode
-        logger.info("Patched runner with MLX VAE encode/decode")
+        logger.info("Codec encode/decode ready")
 
     def __call__(self, input_path, output_path, model_parameters=None,
                  progress_func=None):
@@ -1237,9 +1226,6 @@ class VideoUpscaler:
         resolution = min(resolution_w, resolution_h)
         logger.info(f"Input: {input_w}x{input_h}, target: {output_width}x{output_height} -> {resolution_w}x{resolution_h}")
 
-        if progress_func:
-            progress_func(0.05, message="Processing video...")
-
         self.streaming_dit.stream_manager.prefetch_start(num_blocks=2)
 
         total_frames = reader.shape[0]
@@ -1264,14 +1250,10 @@ class VideoUpscaler:
                 writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             return _write_frame, writer.release
 
-        def _scaled_progress(frac, message=""):
-            progress_func(0.05 + frac * 0.85, message=message)
-
         vpp = self.ctx['vpp']
         vpp.open_writer(
             writer_factory=_ffmpeg_writer_factory,
             total_frames=total_frames,
-            progress_fn=_scaled_progress if progress_func else None,
         )
 
         t_start = time.time()
@@ -1280,8 +1262,7 @@ class VideoUpscaler:
         _orig_vae_encode = None
         _orig_vae_decode = None
         if chunking_mode == 'latent':
-            logger.info("Hybrid latent-chunk mode: chunk=%d, overlap=%d, fixed_wt=%d",
-                        HYBRID_CHUNK_SIZE, HYBRID_OVERLAP, HYBRID_FIXED_WT)
+            logger.info("Processing mode: chunked (chunk_size=%d)", HYBRID_CHUNK_SIZE)
             # Set fixed temporal window on DiT
             dit_model = self.runner.dit.dit_model if hasattr(self.runner.dit, 'dit_model') else self.runner.dit
             dit_model.fixed_wt = HYBRID_FIXED_WT
@@ -1442,6 +1423,10 @@ class VideoUpscaler:
         self.ctx['_dit_latent_chunk'] = DIT_LATENT_CHUNK
         self.ctx['_dit_latent_overlap'] = DIT_LATENT_OVERLAP
 
+        def _progress_adapter(frac: float, message: str = ""):
+            if progress_func:
+                progress_func(frac, message=message)
+
         try:
             _, timings = process_video_pix_chunked(
                 runner=self.runner, ctx=self.ctx, frames=reader,
@@ -1458,6 +1443,7 @@ class VideoUpscaler:
                 usm_threshold=USM_THRESHOLD,
                 device=self.device, output_callback=vpp.write_frames,
                 shift_back=_shift_back,
+                progress_fn=_progress_adapter,
             )
         finally:
             reader.close()
@@ -1472,7 +1458,7 @@ class VideoUpscaler:
         elapsed = time.time() - t_start
 
         if progress_func:
-            progress_func(0.92, message="Copying audio track...")
+            progress_func(0.95, message="Copying audio track...")
 
         # Align the muxed audio with the rendered frame range
         audio_start = (skip_frames / fps) if fps and skip_frames > 0 else 0.0
@@ -1487,12 +1473,12 @@ class VideoUpscaler:
         logger.info(f"Saved {vpp.frames_written} frames to {output_path}")
         logger.info(f"Total time: {elapsed:.1f}s")
         logger.info(f"Encode: {timings.get('encode', 0):.1f}s, "
-                    f"DiT: {timings.get('dit', 0):.1f}s, "
+                    f"Enhance: {timings.get('dit', 0):.1f}s, "
                     f"Decode: {timings.get('decode', 0):.1f}s, "
                     f"Post: {timings.get('post', 0):.1f}s")
 
         if progress_func:
-            progress_func(0.95, message="Done")
+            progress_func(0.99, message="Done")
         return output_path
 
     def cleanup(self):
@@ -1556,10 +1542,10 @@ def main():
     args = parse_arguments()
 
     if not torch.backends.mps.is_available():
-        logger.error("MPS not available. Requires Apple Silicon Mac.")
+        logger.error("GPU not available. Requires Apple Silicon Mac.")
         sys.exit(1)
 
-    logger.info("Apple Silicon MPS detected")
+    logger.info("GPU detected")
 
     output = args.output or str(Path(args.input).with_stem(Path(args.input).stem + "_upscaled"))
     os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
