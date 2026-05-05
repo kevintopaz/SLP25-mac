@@ -1034,9 +1034,8 @@ def _setup_vae_model(
                                             runner.config, debug, None)
         
         debug.log(
-            f"Codec downsample factors configured "
-            f"(spatial: {spatial_downsample_factor}x, "
-            f"temporal: {temporal_downsample_factor}x)",
+            f"Codec downsample factors: spatial {spatial_downsample_factor}x, "
+            f"temporal {temporal_downsample_factor}x",
             category="vae"
         )
 

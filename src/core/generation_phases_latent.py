@@ -216,7 +216,7 @@ def get_text_embeddings(
     
     if prompt is None:
         # Use pre-computed embeddings
-        debug.log("Using pre-computed text embeddings", category="text", force=True)
+        debug.log("Using pre-computed text embeddings", category="text")
         return load_text_embeddings(script_directory, device, dtype, debug)
     
     # Encode user prompts
@@ -290,7 +290,7 @@ def encode_whole_video(
         padded_frames=T_padded,
     )
     debug.log(f"Batch-transformed to disk cache: {vpp.memmap}",
-              category="memory", force=True)
+              category="memory")
 
     import gc; gc.collect()
 
@@ -319,7 +319,7 @@ def encode_whole_video(
     latent = latents[0]
     debug.end_timer("vae_encode", "VAE encode")
     
-    debug.log(f"Encoded shape: {latent.shape}", category="vae", force=True)
+    debug.log(f"Encoded shape: {latent.shape}", category="vae")
     
     if ctx['tensor_offload_device'] is not None:
         latent = manage_tensor(
@@ -343,7 +343,7 @@ def encode_whole_video(
         progress_callback(1, 1, ctx['total_frames'], "Phase 1: Encoding")
     
     debug.end_timer("phase1_encode_whole", "Phase 1: VAE encoding complete")
-    debug.log_memory_state("After Phase 1 (whole video encoding)", show_tensors=False)
+    debug.log_memory_state("After Phase 1 (whole video encoding)", show_tensors=False, force=True)
     
     return ctx
 
@@ -395,7 +395,7 @@ def upscale_latent_chunked(
     T, H, W, C = latent.shape
     
     debug.log(f"Latent shape: {latent.shape}, chunk_size={chunk_size}, overlap={overlap}",
-             category="dit", force=True)
+             category="dit")
     
     # Get text embeddings - from user prompt or pre-computed
     if ctx.get('text_embeds') is None:
@@ -404,7 +404,7 @@ def upscale_latent_chunked(
     runner.config.diffusion.cfg.scale = cfg_scale
     runner.config.diffusion.cfg.rescale = 0.0
     runner.config.diffusion.timesteps.sampling.steps = 1
-    debug.log(f"CFG scale: {cfg_scale}", category="dit", force=True)
+    debug.log(f"CFG scale: {cfg_scale}", category="dit")
     runner.configure_diffusion(device=ctx['dit_device'], dtype=ctx['compute_dtype'])
     
     if runner.dit and next(runner.dit.parameters()).device.type == 'meta':
@@ -441,7 +441,7 @@ def upscale_latent_chunked(
     num_chunks = len(chunks)
     chunk_desc = ", ".join(f"[{s}:{e}]" for s, e in chunks)
     debug.log(f"Temporal chunking: {num_chunks} chunks  {chunk_desc}",
-              category="dit", force=True)
+              category="dit")
     
     accum_device = ctx.get('tensor_offload_device') or latent.device
     result = torch.zeros((T, H, W, C), device=accum_device, dtype=latent.dtype)
@@ -450,7 +450,7 @@ def upscale_latent_chunked(
     for chunk_idx, (start, end) in enumerate(chunks):
         chunk_len = end - start
         debug.log(f"Chunk {chunk_idx + 1}/{num_chunks}: frames {start}-{end} ({chunk_len} frames)",
-                 category="dit", force=True)
+                 category="dit")
         
         set_seed(seed)
         
@@ -594,7 +594,7 @@ def upscale_latent_chunked(
     cleanup_text_embeddings(ctx, debug)
     
     debug.end_timer("phase2_upscale_chunked", "Phase 2: DiT upscaling complete")
-    debug.log_memory_state("After Phase 2 (latent chunked upscaling)", show_tensors=False)
+    debug.log_memory_state("After Phase 2 (latent chunked upscaling)", show_tensors=False, force=True)
     
     return ctx
 
@@ -858,7 +858,7 @@ def decode_whole_latent(
         raise ValueError("No upscaled_latent in context. Run upscale_latent_chunked first.")
     
     latent = ctx['upscaled_latent']
-    debug.log(f"Decoding shape: {latent.shape}", category="vae", force=True)
+    debug.log(f"Decoding shape: {latent.shape}", category="vae")
     
     manage_model_device(model=runner.vae, target_device=ctx['vae_device'],
                        model_name="VAE", debug=debug, runner=runner)
@@ -881,7 +881,7 @@ def decode_whole_latent(
     debug.end_timer("vae_decode", "VAE decode")
     
     # VAE decode output is (C, T, H, W), convert to (T, H, W, C)
-    debug.log(f"Decoded shape (CTHW): {sample.shape}", category="vae", force=True)
+    debug.log(f"Decoded shape (CTHW): {sample.shape}", category="vae")
     sample = sample.permute(1, 2, 3, 0)  # (C, T, H, W) -> (T, H, W, C)
     
     # Trim to original frame count (remove padding added for 4n+1 constraint)
@@ -897,7 +897,7 @@ def decode_whole_latent(
         current_h, current_w = sample.shape[1], sample.shape[2]
         if current_h != true_h or current_w != true_w:
             debug.log(f"Resize back: {current_w}x{current_h} → {true_w}x{true_h}",
-                      category="vae", force=True)
+                      category="vae")
             sample = vpp.resize_back(sample)
             if 'transformed_video' in ctx:
                 ctx['transformed_video'] = vpp.resize_back(ctx['transformed_video'])
@@ -913,7 +913,7 @@ def decode_whole_latent(
         progress_callback(1, 1, sample.shape[0], "Phase 3: Decoding")
     
     debug.end_timer("phase3_decode_whole", "Phase 3: VAE decoding complete")
-    debug.log_memory_state("After Phase 3 (whole latent decoding)", show_tensors=False)
+    debug.log_memory_state("After Phase 3 (whole latent decoding)", show_tensors=False, force=True)
     
     return ctx
 

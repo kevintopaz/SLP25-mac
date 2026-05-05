@@ -106,7 +106,7 @@ def setup_generation_context(
         
         debug.log(
             f"Processing context initialized (device={str(dit_device)})",
-            category="setup"
+            category="setup", force=True
         )
         if ctx['compute_dtype'] == torch.float32:
             reason = "quality"
@@ -114,7 +114,7 @@ def setup_generation_context(
             reason = "compatibility (GPU precision limitations detected)"
         else:
             reason = "performance"
-        debug.log(f"Unified compute dtype: {ctx['compute_dtype']} across entire pipeline for maximum {reason}", category="precision")
+        debug.log(f"Compute dtype: {ctx['compute_dtype']} ({reason})", category="precision")
     
     return ctx
 

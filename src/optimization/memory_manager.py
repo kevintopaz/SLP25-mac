@@ -408,8 +408,6 @@ def reset_vram_peak(device: Optional[torch.device] = None, debug: Optional['Debu
         device: Optional device to reset stats for. If None, uses cuda:0
         debug: Optional debug instance for logging
     """
-    if debug and debug.enabled:
-        debug.log("Resetting VRAM peak memory statistics", category="memory")
     try:
         if is_cuda_available():
             if device is None:
@@ -700,9 +698,6 @@ def manage_model_device(model: torch.nn.Module, target_device: torch.device, mod
 
     # Compare normalized device types
     if current_device_upper == target_device_upper:
-        # Already on target device type, no movement needed
-        if debug:
-            debug.log(f"{model_name} already on {current_device_upper}, skipping movement", category="general")
         return False
     
     # Standard model movement

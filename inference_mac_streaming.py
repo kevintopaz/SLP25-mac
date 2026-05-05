@@ -1193,8 +1193,8 @@ class VideoUpscaler:
         # --- Output encoding ---
         ffmpeg_encoding = model_parameters.get('ffmpeg_encoding', "") or ""
         ffmpeg_preproc_filters = model_parameters.get('ffmpeg_preproc_filters', "") or ""
-        use_10bit = model_parameters.get('output_bit_depth') is not None and \
-                    int(model_parameters['output_bit_depth']) >= 10
+        _requested_bit_depth = model_parameters.get('output_bit_depth')
+        output_bit_depth = int(_requested_bit_depth) if _requested_bit_depth is not None else None
 
         logger.info(f"Input video: {input_path}")
         logger.info(f"Output path: {output_path}")
@@ -1237,8 +1237,12 @@ class VideoUpscaler:
             self.ctx['vpp'] = VideoPrePostProcess(
                 resolution=resolution,
                 source_bit_depth=reader.bit_depth,
+                output_bit_depth=output_bit_depth,
                 color_overrides=self.ctx.get('color_overrides'),
             )
+
+        vpp = self.ctx['vpp']
+        use_10bit = vpp.output_bit_depth > 8
 
         def _ffmpeg_writer_factory(H, W):
             writer = FFMPEGVideoWriter(
@@ -1250,7 +1254,6 @@ class VideoUpscaler:
                 writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             return _write_frame, writer.release
 
-        vpp = self.ctx['vpp']
         vpp.open_writer(
             writer_factory=_ffmpeg_writer_factory,
             total_frames=total_frames,

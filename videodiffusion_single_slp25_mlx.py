@@ -64,7 +64,7 @@ class SLP25MLX:
             split_dir=split_dir,
             model_dir=model_store if os.path.isdir(model_store) else None,
             device="mps",
-            debug_enabled=True,
+            debug_enabled=False,
             use_mlx_dit=True,
             mlx_dtype="bf16",
             mlx_stream=True,
