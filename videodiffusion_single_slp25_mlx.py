@@ -51,16 +51,19 @@ logger = logging.getLogger(__name__)
 
 @MODEL.register_class()
 class SLP25MLX:
-    """MLX-accelerated video upscaler for macOS Apple Silicon."""
+    """MLX-accelerated video upscaler for macOS Apple Silicon.
+
+    The model is loaded fresh on every ``__call__`` and torn down
+    afterwards so that memory is fully reclaimed between runs.
+    """
 
     def __init__(self, gpu_id=0, **kwargs):
         model_store = os.environ.get("TOPAZ_MODEL_STORE", "./data")
         split_dir = os.path.join(model_store, "nadit_blocks_3b")
-
         if not os.path.isdir(split_dir):
             split_dir = os.path.join(script_dir, "nadit_blocks_3b")
 
-        self.upscaler = VideoUpscaler(
+        self._init_kwargs = dict(
             split_dir=split_dir,
             model_dir=model_store if os.path.isdir(model_store) else None,
             device="mps",
@@ -68,7 +71,7 @@ class SLP25MLX:
             mlx_dtype="bf16",
             mlx_stream=True,
         )
-        logger.info("Model initialized")
+        logger.info("SLP25MLX registered (model will be loaded on first run)")
 
     def __call__(self, input_path, output_path, model_parameters, progress_func):
         if not os.path.exists(input_path):
@@ -96,15 +99,19 @@ class SLP25MLX:
             start = int(model_parameters.get('start_idx', model_parameters.get('start_frame_idx', 0)))
             model_parameters['end_frame_idx'] = start + ifc
 
+        upscaler = VideoUpscaler(**self._init_kwargs)
         try:
-            self.upscaler(input_path, output_path, model_parameters,
-                          progress_func=progress_func)
+            upscaler(input_path, output_path, model_parameters,
+                     progress_func=progress_func)
         except FileNotFoundError as e:
             logger.error("Input file not found: %s", e)
             return 9  # MEDIA_READ_ERROR
         except Exception:
             logger.exception("SLP25MLX processing failed")
-            raise  # let neuroserver see the real error
+            raise
+        finally:
+            upscaler.cleanup()
+            del upscaler
 
         progress_func(1.0, message="Done", output_is_written=True)
         return 0
