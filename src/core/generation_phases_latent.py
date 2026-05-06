@@ -518,6 +518,9 @@ def upscale_latent_chunked(
         use_autocast = dit_dtype != ctx['compute_dtype'] and ctx['dit_device'].type != 'mps'
         
         debug.start_timer(f"dit_chunk_{chunk_idx}")
+        _dit = getattr(runner, 'dit', None)
+        if _dit is not None and progress_callback:
+            _dit._progress_callback = _block_progress
         with torch.no_grad():
             if use_autocast:
                 with torch.autocast(ctx['dit_device'].type, ctx['compute_dtype'], enabled=True):
@@ -544,6 +547,8 @@ def upscale_latent_chunked(
                         noises=noises, conditions=conditions,
                         **ctx['text_embeds']
                     )
+        if _dit is not None:
+            _dit._progress_callback = None
         debug.end_timer(f"dit_chunk_{chunk_idx}", f"DiT chunk {chunk_idx + 1}")
         
         upscaled_chunk = upscaled[0]

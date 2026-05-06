@@ -1120,252 +1120,18 @@ class MLXVideoVAE:
         frames: Union[np.ndarray, "torch.Tensor"],
         tile_size=480,
         tile_overlap=48,
-        progress_fn=None,
-    ):
-        """Encode video frames to latent using spatial tiling.
-
-        Args:
-            frames: numpy ``[T, H, W, 3]`` in [-1, 1] (float16/float32), **or**
-                a PyTorch **CPU** tensor with the same layout. When a tensor is
-                passed, each spatial tile is converted to NumPy only for that
-                tile (avoids a second full-frame NumPy copy of the whole video).
-            tile_size: int (square) or (tile_H, tile_W) tuple in pixels
-            tile_overlap: int (square) or (overlap_H, overlap_W) tuple in pixels
-
-        Returns:
-            latent: numpy array [1, T_lat, H_lat, W_lat, 16] float32 (mean only)
-        """
-        # Free decoder weights during encoding.
-        if getattr(self, 'decoder', None) is not None:
-            self.decoder = None
-            mx.clear_cache()
-
-        # Lazily reload encoder if it was freed during decode.
-        if getattr(self, 'encoder', None) is None:
-            logger.info("Reloading codec encoder...")
-            self.encoder = Encoder(in_ch=3, out_ch=32,
-                                   block_channels=(128, 256, 512, 512),
-                                   layers_per_block=2, groups=32,
-                                   temporal_down_num=2, kT=3)
-            _load_weights(self.encoder, self.vae_path, "encoder.", self.dtype)
-            mx.eval(self.encoder.parameters())
-
-        tile_H, tile_W = _as_hw(tile_size)
-        ov_H, ov_W = _as_hw(tile_overlap)
-
-        torch_frames = None
-        frames_np = None
-        try:
-            import torch
-
-            _torch_ok = isinstance(frames, torch.Tensor)
-        except ImportError:
-            _torch_ok = False
-
-        if _torch_ok:
-            torch_frames = frames.contiguous()
-            if torch_frames.dtype == torch.bfloat16:
-                torch_frames = torch_frames.to(torch.float16)
-            elif torch_frames.dtype not in (torch.float16, torch.float32):
-                torch_frames = torch_frames.float()
-            T, H, W, _ = torch_frames.shape
-        else:
-            frames_np = np.asarray(frames)
-            T, H, W, _ = frames_np.shape
-        lat_tile_H = tile_H // 8
-        lat_tile_W = tile_W // 8
-        lat_ov_H = ov_H // 8
-        lat_ov_W = ov_W // 8
-        lat_H, lat_W = H // 8, W // 8
-        T_lat = 1 if T == 1 else (T - 1) // 4 + 1
-
-        n_h = max(1, int(math.ceil((H - ov_H) / (tile_H - ov_H))))
-        n_w = max(1, int(math.ceil((W - ov_W) / (tile_W - ov_W))))
-
-        latent = mx.zeros((1, T_lat, lat_H, lat_W, 32), dtype=mx.float32)
-        lat_wt = mx.zeros((1, T_lat, lat_H, lat_W, 32), dtype=mx.float32)
-
-        t0 = time.perf_counter()
-        tc = 0
-        global _enc_mem_profiling
-        for ti in range(n_h):
-            for tj in range(n_w):
-                hs = min(ti * (tile_H - ov_H), H - tile_H)
-                ws = min(tj * (tile_W - ov_W), W - tile_W)
-                if torch_frames is not None:
-                    # One tile worth of host memory at a time (no full-frame np).
-                    tile_np = (
-                        torch_frames[:, hs : hs + tile_H, ws : ws + tile_W, :]
-                        .contiguous()
-                        .numpy()
-                    )
-                else:
-                    tile_np = frames_np[:, hs : hs + tile_H, ws : ws + tile_W, :]
-                tile_mx = mx.array(tile_np[np.newaxis]).astype(self.dtype)
-                del tile_np
-                prof = _MEM_PROFILE_FIRST_TILE and ti == 0 and tj == 0
-                if prof:
-                    _enc_mem_profiling = True
-                enc_out = self.encoder(tile_mx, low_mem=self.low_mem).astype(mx.float32)
-                if prof:
-                    _enc_mem_profiling = False
-                # Materialize the tile latent before blending. Otherwise the blend
-                # stays fused into the full encoder lazy graph until mx.eval below,
-                # which retains every encoder intermediate and can push peak VRAM
-                # far above what low_mem + per-frame convs were designed for.
-                mx.eval(enc_out)
-                del tile_mx
-                if prof:
-                    _mem_tile_dump("tile.after_encoder_mx_eval", enc_out, do_eval=False)
-
-                lh, lw = hs // 8, ws // 8
-                bw = _make_blend_weight(lat_tile_H, lat_tile_W,
-                                        (lat_ov_H, lat_ov_W), n_h, n_w, ti, tj)
-                bw5d = mx.array(bw[None, None, :, :, None])
-                if prof:
-                    mx.reset_peak_memory()
-                latent, lat_wt = _gpu_blend_paste(
-                    latent, lat_wt, enc_out, bw5d,
-                    slice(0, T_lat),
-                    slice(lh, lh + lat_tile_H),
-                    slice(lw, lw + lat_tile_W),
-                )
-                del enc_out, bw5d
-                mx.eval(latent, lat_wt)
-                if prof:
-                    _mem_tile_dump("tile.after_blend_paste_mx_eval", latent, lat_wt, do_eval=False)
-                tc += 1
-                total_tiles = n_h * n_w
-                logger.info(f"  Enc tile {tc}/{total_tiles}: {time.perf_counter()-t0:.1f}s")
-                if progress_fn is not None:
-                    progress_fn(tc, total_tiles)
-
-        if torch_frames is not None:
-            del torch_frames
-
-        latent = latent / mx.maximum(lat_wt, 1e-8)
-        mean = latent[:, :, :, :, :16]
-        mx.eval(mean)
-        mean_np = np.array(mean).astype(np.float32)
-        del latent, lat_wt
-        mx.clear_cache()
-        elapsed = time.perf_counter() - t0
-        logger.info(f"Encoded in {elapsed:.1f}s -> latent {mean_np.shape}")
-        return mean_np
-
-    def tiled_decode(self, latent_f32_np, tile_size=480, tile_overlap=48, num_frames=None, progress_fn=None):
-        """Decode latent (numpy [1, T_lat, H_lat, W_lat, 16] float32) to frames.
-
-        Args:
-            tile_size: int (square) or (tile_H, tile_W) tuple in pixels
-            tile_overlap: int (square) or (overlap_H, overlap_W) tuple in pixels
-        """
-        # Free encoder weights during decoding.
-        if getattr(self, 'encoder', None) is not None:
-            self.encoder = None
-            mx.clear_cache()
-
-        # Lazily reload decoder if it was freed during encode.
-        if getattr(self, 'decoder', None) is None:
-            logger.info("Reloading codec decoder...")
-            self.decoder = Decoder(in_ch=16, out_ch=3,
-                                   block_channels=(128, 256, 512, 512),
-                                   layers_per_block=2, groups=32,
-                                   temporal_up_num=2, kT=3)
-            _load_weights(self.decoder, self.vae_path, "decoder.", self.dtype)
-            mx.eval(self.decoder.parameters())
-
-        tile_H, tile_W = _as_hw(tile_size)
-        ov_H, ov_W = _as_hw(tile_overlap)
-        _, T_lat, lat_H, lat_W, _ = latent_f32_np.shape
-        lat_tile_H = tile_H // 8
-        lat_tile_W = tile_W // 8
-        lat_ov_H = ov_H // 8
-        lat_ov_W = ov_W // 8
-        pixel_H = lat_H * 8
-        pixel_W = lat_W * 8
-        T_out = 1 if T_lat == 1 else (T_lat - 1) * 4 + 1
-
-        n_h = max(1, int(math.ceil((lat_H - lat_ov_H) / (lat_tile_H - lat_ov_H))))
-        n_w = max(1, int(math.ceil((lat_W - lat_ov_W) / (lat_tile_W - lat_ov_W))))
-
-        # Precompute 2D total blend-weight map (~16 MB at 4K vs ~1.6 GB for a
-        # full 5D out_wt canvas).  Blend weights are purely spatial — identical
-        # across T and channels — so a [pixel_H, pixel_W] accumulator suffices.
-        total_wt = np.zeros((pixel_H, pixel_W), dtype=np.float32)
-        for ti in range(n_h):
-            for tj in range(n_w):
-                lh = min(ti * (lat_tile_H - lat_ov_H), lat_H - lat_tile_H)
-                lw = min(tj * (lat_tile_W - lat_ov_W), lat_W - lat_tile_W)
-                ph, pw = lh * 8, lw * 8
-                bw = _make_blend_weight(tile_H, tile_W,
-                                        (ov_H, ov_W), n_h, n_w, ti, tj)
-                clip_h = min(tile_H, pixel_H - ph)
-                clip_w = min(tile_W, pixel_W - pw)
-                total_wt[ph:ph+clip_h, pw:pw+clip_w] += bw[:clip_h, :clip_w]
-        total_wt = np.maximum(total_wt, 1e-4)
-
-        output = np.zeros((1, T_out, pixel_H, pixel_W, 3), dtype=np.float32)
-
-        t0 = time.perf_counter()
-        tc = 0
-        for ti in range(n_h):
-            for tj in range(n_w):
-                lh = min(ti * (lat_tile_H - lat_ov_H), lat_H - lat_tile_H)
-                lw = min(tj * (lat_tile_W - lat_ov_W), lat_W - lat_tile_W)
-                tile_z = mx.array(
-                    latent_f32_np[:, :, lh:lh+lat_tile_H, lw:lw+lat_tile_W, :]
-                ).astype(self.dtype)
-                tile_out = self.decoder(tile_z, low_mem=self.low_mem).astype(mx.float32)
-                mx.eval(tile_out)
-
-                ph, pw = lh * 8, lw * 8
-                clip_h = min(tile_H, pixel_H - ph)
-                clip_w = min(tile_W, pixel_W - pw)
-                bw = _make_blend_weight(tile_H, tile_W,
-                                        (ov_H, ov_W), n_h, n_w, ti, tj)
-                tile_np = np.asarray(tile_out)
-                del tile_out
-                norm_bw = bw[:clip_h, :clip_w] / total_wt[ph:ph+clip_h, pw:pw+clip_w]
-                bw5d = norm_bw[None, None, :, :, None]
-                output[:, :, ph:ph+clip_h, pw:pw+clip_w, :] += (
-                    tile_np[:, :, :clip_h, :clip_w, :] * bw5d
-                )
-                del tile_np
-                tc += 1
-                total_tiles = n_h * n_w
-                logger.info(f"  Dec tile {tc}/{total_tiles}: {time.perf_counter()-t0:.1f}s")
-                if progress_fn is not None:
-                    progress_fn(tc, total_tiles)
-
-        output_np = output.astype(np.float16)
-        del output, total_wt
-        mx.clear_cache()
-        elapsed = time.perf_counter() - t0
-        frames = output_np[0]
-        if num_frames is not None and frames.shape[0] > num_frames:
-            frames = frames[:num_frames]
-        logger.info(f"Decoded in {elapsed:.1f}s -> {frames.shape}")
-        return frames
-
-    # ── Streaming Encode / Decode ──────────────────────────────────────
-
-    def tiled_encode_streaming(
-        self,
-        frames: Union[np.ndarray, "torch.Tensor"],
-        tile_size=480,
-        tile_overlap=48,
         temporal_slice=11,
         input_layout='THWC',
         pixel_scale: float = 0.0,
+        progress_fn=None,
     ):
         """Encode frames using streaming temporal slices per spatial tile.
 
         Each spatial tile is processed through the encoder in small temporal
         chunks, maintaining causal conv caches for continuity.  The per-tile
         latent slices are concatenated and then blended spatially, producing
-        the same result as ``tiled_encode`` but with bounded peak memory
-        proportional to ``temporal_slice`` instead of the full video length.
+        bounded peak memory proportional to ``temporal_slice`` instead of
+        the full video length.
 
         Args:
             frames: numpy/memmap array or PyTorch CPU tensor.
@@ -1538,7 +1304,10 @@ class MLXVideoVAE:
                 mx.eval(latent, lat_wt)
                 mx.clear_cache()
                 tc += 1
-                logger.info(f"  Enc tile {tc}/{n_h*n_w}: {time.perf_counter()-t0:.1f}s")
+                total_tiles = n_h * n_w
+                logger.info(f"  Enc tile {tc}/{total_tiles}: {time.perf_counter()-t0:.1f}s")
+                if progress_fn is not None:
+                    progress_fn(tc, total_tiles)
 
         # Cleanup internal memmap (only if we created one)
         del frames_mm
@@ -1558,7 +1327,7 @@ class MLXVideoVAE:
         logger.info(f"Encoded in {elapsed:.1f}s -> {mean_np.shape}")
         return mean_np
 
-    def tiled_decode_streaming(
+    def tiled_decode(
         self,
         latent_f32_np,
         tile_size=480,
@@ -1566,6 +1335,7 @@ class MLXVideoVAE:
         temporal_slice=5,
         num_frames=None,
         tmp_dir=None,
+        progress_fn=None,
         tile_dtype="uint8",
         vpp=None,
     ):
@@ -1716,25 +1486,13 @@ class MLXVideoVAE:
                     info["vpp_name"] = tile_name
                 tile_infos.append(info)
                 tc += 1
-                logger.info(f"  Dec tile {tc}/{n_h*n_w}: {time.perf_counter()-t0:.1f}s")
+                total_tiles = n_h * n_w
+                logger.info(f"  Dec tile {tc}/{total_tiles}: {time.perf_counter()-t0:.1f}s")
+                if progress_fn is not None:
+                    progress_fn(tc, total_tiles)
 
         mx.clear_cache()
         elapsed = time.perf_counter() - t0
         logger.info(f"Decoded in {elapsed:.1f}s -> {len(tile_infos)} tile files")
         return tile_infos
 
-    def encode_torch(self, frames_torch, tile_size=480, tile_overlap=48):
-        """Bridge: PyTorch [T,H,W,C] [0,1] -> encode -> PyTorch latent [1,T_lat,H,W,16]."""
-        import torch
-        frames_np = (frames_torch.cpu().float().numpy() * 2.0 - 1.0).astype(np.float16)
-        latent_np = self.tiled_encode(frames_np, tile_size, tile_overlap)
-        latent_scaled = (latent_np * VAE_SCALING_FACTOR).astype(np.float16)
-        return torch.from_numpy(latent_scaled)
-
-    def decode_torch(self, latent_torch, tile_size=480, tile_overlap=48, num_frames=None):
-        """Bridge: PyTorch latent [1,T,H,W,16] -> decode -> PyTorch [T,H,W,C] [0,1]."""
-        import torch
-        latent_np = (latent_torch.cpu().float().numpy() / VAE_SCALING_FACTOR).astype(np.float32)
-        frames_np = self.tiled_decode(latent_np, tile_size, tile_overlap, num_frames)
-        frames_01 = np.clip((frames_np + 1.0) / 2.0, 0.0, 1.0).astype(np.float16)
-        return torch.from_numpy(frames_01)

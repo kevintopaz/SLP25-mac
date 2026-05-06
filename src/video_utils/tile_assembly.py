@@ -107,7 +107,7 @@ def assemble_tiles_from_disk(tile_infos, pixel_H, pixel_W, num_frames=None):
     Parameters
     ----------
     tile_infos : list[dict]
-        Tile metadata from ``tiled_decode_streaming``.
+        Tile metadata from ``tiled_decode``.
     pixel_H, pixel_W : int
         Full output resolution.
     num_frames : int, optional

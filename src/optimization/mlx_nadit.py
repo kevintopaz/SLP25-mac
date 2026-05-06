@@ -1336,6 +1336,7 @@ class MLXNaDiT(torch_nn.Module):
             vid_mx, txt_mx, ts, (T, H, W), txt_len,
             self.io, self.block_pool, self.cfg, self.num_blocks,
             fixed_wt=self.fixed_wt,
+            progress_callback=getattr(self, '_progress_callback', None),
         )
         mx.eval(out_mx)
 
@@ -1439,6 +1440,7 @@ def run_full_dit_streaming(
     vid_shape: Tuple[int, int, int], txt_len: int,
     io: IOWeights, block_pool: MLXBlockPool, cfg: NaDiTConfig, num_blocks: int,
     fixed_wt: Optional[int] = None,
+    progress_callback: Optional[Callable] = None,
 ) -> mx.array:
     """Same as ``run_full_dit`` but pulls each block from ``block_pool`` and
     overlaps the next-block prefetch with current-block compute.  Works in
@@ -1487,6 +1489,9 @@ def run_full_dit_streaming(
             block_pool.release_block(i)
             del block   # last reference to the BlockWeights → memory freed
             mx.clear_cache()  # force freed weights out of metal buffer cache
+
+        if progress_callback is not None:
+            progress_callback(i + 1, num_blocks)
 
         if log_mem:
             am = mx.get_active_memory() / 1024**3

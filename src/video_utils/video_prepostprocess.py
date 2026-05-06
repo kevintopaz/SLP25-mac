@@ -175,8 +175,10 @@ class ResizeDivisible:
 
         antialias = not (isinstance(image, torch.Tensor) and image.device.type == 'mps')
 
+        already_target = (height == true_h and width == true_w)
+
         if self.strategy == "pad":
-            resized = TVF.resize(image, (true_h, true_w), self.interpolation, antialias=antialias)
+            resized = image if already_target else TVF.resize(image, (true_h, true_w), self.interpolation, antialias=antialias)
             if self.needs_resize_back and isinstance(resized, torch.Tensor):
                 resized = self._apply_pad(resized)
             elif self.needs_resize_back and isinstance(resized, Image.Image):
@@ -186,6 +188,8 @@ class ResizeDivisible:
             return resized
 
         # strategy == "resize": single resize to padded dims
+        if already_target and not self.needs_resize_back:
+            return image
         return TVF.resize(image, (padded_h, padded_w), self.interpolation, antialias=antialias)
 
     # ------------------------------------------------------------------ #
@@ -590,7 +594,7 @@ class VideoPrePostProcess:
             mm.mirror_pad(total_frames)
 
         mm.flush()
-        logger.info("Ingested %d frames to disk cache: %s", total_frames, mm)
+        logger.debug("Ingested %d frames to disk cache: %s", total_frames, mm)
         return mm
 
     def read_tile(
