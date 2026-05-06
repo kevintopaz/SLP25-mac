@@ -59,9 +59,17 @@ class SLP25MLX:
 
     def __init__(self, gpu_id=0, **kwargs):
         model_store = os.environ.get("TOPAZ_MODEL_STORE", "./data")
-        split_dir = os.path.join(model_store, "nadit_blocks_3b")
-        if not os.path.isdir(split_dir):
-            split_dir = os.path.join(script_dir, "nadit_blocks_3b")
+
+        # Prefer the encrypted flat folder; fall back to plaintext split dir.
+        encryption_key = "522b6852486949eabefe9bad9aecff31" 
+        encrypted_dir = os.path.join(model_store, "slp25m")
+        if encryption_key and os.path.isdir(encrypted_dir):
+            split_dir = encrypted_dir
+        else:
+            encryption_key = None
+            split_dir = os.path.join(model_store, "nadit_blocks_3b")
+            if not os.path.isdir(split_dir):
+                split_dir = os.path.join(script_dir, "nadit_blocks_3b")
 
         self._init_kwargs = dict(
             split_dir=split_dir,
@@ -70,6 +78,7 @@ class SLP25MLX:
             debug_enabled=False,
             mlx_dtype="bf16",
             mlx_stream=True,
+            encryption_key=encryption_key,
         )
         logger.info("SLP25MLX registered (model will be loaded on first run)")
 

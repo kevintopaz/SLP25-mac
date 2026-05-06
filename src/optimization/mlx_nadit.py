@@ -471,12 +471,11 @@ def _t_to_mx(t, dtype=mx.bfloat16) -> mx.array:
 
 
 def load_io_weights(io_paths: dict, dtype=mx.bfloat16) -> IOWeights:
-    """Load IO component weights via native mx.load (no fp32 staging)."""
+    """Load IO component weights (transparently handles encrypted blobs)."""
+    from ..utils.crypto import mx_load
+
     def _load(path):
-        d = mx.load(path)
-        if dtype is not None:
-            return {k: v.astype(dtype) for k, v in d.items()}
-        return d
+        return mx_load(path, dtype=dtype)
 
     vid_in = _load(io_paths["vid_in"])
     vid_out = _load(io_paths["vid_out"])
@@ -499,13 +498,9 @@ def load_io_weights(io_paths: dict, dtype=mx.bfloat16) -> IOWeights:
 
 
 def load_block_weights(path: str, shared: bool, dtype=mx.bfloat16) -> BlockWeights:
-    """Load one block's weights (.vid/.txt for mm_layers, .all for shared).
-
-    Uses native mx.load - bf16 weights stay as bf16, no fp32 staging copy.
-    """
-    raw = mx.load(path)
-    if dtype is not None:
-        raw = {k: v.astype(dtype) for k, v in raw.items()}
+    """Load one block's weights (transparently handles encrypted blobs)."""
+    from ..utils.crypto import mx_load
+    raw = mx_load(path, dtype=dtype)
 
     def _branch(prefix: str) -> BranchWeights:
         return BranchWeights(
@@ -1219,8 +1214,11 @@ class MLXNaDiT(torch_nn.Module):
     unified memory.
 
     Args:
-        split_dir: directory containing ``block_manifest.json`` + per-block
-            safetensors (produced by the model split tool).
+        io_paths: ``{component_name: absolute_path}`` for the 6 IO weight
+            files (vid_in, vid_out, vid_out_norm, vid_out_ada, txt_in,
+            emb_in).  Caller resolves the paths.
+        block_paths: list of 32 absolute paths to per-block safetensors.
+            Caller resolves the paths.
         dtype: ``"bf16"`` (default), ``"fp16"`` (matches training precision),
             or ``"fp32"`` (bit-accurate, 2× memory).
         full_pool: True keeps all blocks resident; False streams.
@@ -1229,12 +1227,12 @@ class MLXNaDiT(torch_nn.Module):
         cache_limit_gb: MLX metal-buffer cache cap (returned to OS beyond this).
     """
 
-    def __init__(self, split_dir: str, dtype="bf16", num_blocks: Optional[int] = None,
+    def __init__(self, io_paths: dict, block_paths: list,
+                 dtype="bf16", num_blocks: Optional[int] = None,
                  mm_layers: int = 10, log: Optional[Callable[[str], None]] = None,
                  full_pool: bool = True, pool_size: int = 2,
                  cache_limit_gb: Optional[float] = None):
         super().__init__()
-        import json
         import torch
         # CPU stub parameter so pipeline ``.parameters().device.type`` reads
         # ``cpu`` (not ``meta``) and ``materialize_model`` skips this model.
@@ -1260,19 +1258,14 @@ class MLXNaDiT(torch_nn.Module):
         self.cfg = NaDiTConfig(mm_layers=mm_layers)
         self.dtype = _resolve_dtype(dtype)
         self.full_pool = full_pool
+        self.num_blocks = num_blocks if num_blocks is not None else len(block_paths)
         self.fixed_wt: Optional[int] = None  # set externally to override temporal window size
-
-        with open(os.path.join(split_dir, "block_manifest.json")) as f:
-            self.manifest = json.load(f)
-        self.num_blocks = num_blocks if num_blocks is not None else len(self.manifest["blocks"])
 
         # IO components are tiny; always resident.
         log("Loading model components")
-        self.io = load_io_weights(self.manifest["io_components"], dtype=self.dtype)
+        self.io = load_io_weights(io_paths, dtype=self.dtype)
         mx.eval(*[v for v in self.io.__dict__.values() if isinstance(v, mx.array)])
         log("Model components loaded")
-
-        block_paths = [self.manifest["blocks"][i] for i in range(self.num_blocks)]
         # Block pool — works in both full_pool and streaming modes.
         self.block_pool = MLXBlockPool(
             block_paths=block_paths,
