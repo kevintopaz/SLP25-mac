@@ -136,6 +136,23 @@ class ResizeDivisible:
         """Heuristic: [T, H, W, C] when last dim is a small channel count."""
         return tensor.ndim == 4 and tensor.shape[-1] <= 16 and tensor.shape[-2] > 16
 
+    @staticmethod
+    def _symmetric_reflect(tensor: torch.Tensor, pad_bottom: int, pad_right: int) -> torch.Tensor:
+        """Reflect padding that includes the boundary row/column."""
+        if pad_bottom > 0:
+            bottom = tensor[..., -pad_bottom:, :].flip(-2)
+            tensor = torch.cat([tensor, bottom], dim=-2)
+        if pad_right > 0:
+            right = tensor[..., -pad_right:].flip(-1)
+            tensor = torch.cat([tensor, right], dim=-1)
+        return tensor
+
+    def _apply_pad(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.pad_mode == "reflect":
+            return self._symmetric_reflect(tensor, self._pad_bottom, self._pad_right)
+        return F.pad(tensor, (0, self._pad_right, 0, self._pad_bottom),
+                     mode=self.pad_mode)
+
     # ------------------------------------------------------------------ #
     #  Forward                                                             #
     # ------------------------------------------------------------------ #
@@ -161,12 +178,10 @@ class ResizeDivisible:
         if self.strategy == "pad":
             resized = TVF.resize(image, (true_h, true_w), self.interpolation, antialias=antialias)
             if self.needs_resize_back and isinstance(resized, torch.Tensor):
-                resized = F.pad(resized, (0, self._pad_right, 0, self._pad_bottom),
-                                mode=self.pad_mode)
+                resized = self._apply_pad(resized)
             elif self.needs_resize_back and isinstance(resized, Image.Image):
                 t = TVF.to_tensor(resized)  # [C, H, W]
-                t = F.pad(t, (0, self._pad_right, 0, self._pad_bottom),
-                          mode=self.pad_mode)
+                t = self._apply_pad(t)
                 resized = TVF.to_pil_image(t)
             return resized
 

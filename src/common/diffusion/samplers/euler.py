@@ -39,29 +39,19 @@ class EulerSampler(Sampler):
         f: Callable[[SamplerModelArgs], torch.Tensor],
     ) -> torch.Tensor:
         timesteps = self.timesteps.timesteps
-        progress = self.get_progress_bar()
         i = 0
         
-        # Keep native dtype throughout sampling
-        # The DiT model already handles dtype internally via compatibility wrapper
         for t, s in zip(timesteps[:-1], timesteps[1:]):
             pred = f(SamplerModelArgs(x, t, i))
-            
-            # Next step
             x = self.step_to(pred, x, t, s)
-            
-            # Clean up temporary tensors
             del pred
-            
             i += 1
-            progress.update()
 
         if self.return_endpoint:
             t = timesteps[-1]
             pred = f(SamplerModelArgs(x, t, i))
             x = self.get_endpoint(pred, x, t)
             del pred
-            progress.update()
             
         return x
 

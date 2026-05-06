@@ -65,7 +65,6 @@ class SLP25MLX:
             model_dir=model_store if os.path.isdir(model_store) else None,
             device="mps",
             debug_enabled=False,
-            use_mlx_dit=True,
             mlx_dtype="bf16",
             mlx_stream=True,
         )
