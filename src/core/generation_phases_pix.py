@@ -593,7 +593,7 @@ def process_video_pix_chunked(
             if remainder != 0:
                 pad_needed = 4 - remainder
                 new_start = max(0, last_start - pad_needed)
-                logger.info(
+                logger.debug(
                     "Shift-back: last chunk [%d, %d) (%d frames) -> [%d, %d) (%d frames, 4n+1)",
                     last_start, last_end, last_len,
                     new_start, last_end, last_end - new_start,
@@ -617,12 +617,12 @@ def process_video_pix_chunked(
         _, in_h, in_w, _ = frames.shape
         dit_tiles = _compute_dit_tiles(in_h, in_w, resolution)
 
-    logger.info(
+    logger.debug(
         "Pixel-space chunking: %d chunk(s), batch_size=%d, temporal_overlap=%d, step=%d, dit_tiles=%s, streaming=%s",
         num_chunks, chunk_size, overlap, step, dit_tiles, streaming,
     )
     if any(s > 0 for s in extra_skip):
-        logger.info("Shift-back extra_skip per chunk: %s", extra_skip)
+        logger.debug("Shift-back extra_skip per chunk: %s", extra_skip)
 
     # --- Progress helpers ---
     # Maps per-phase callbacks to a global 0.0 – 0.92 range.
@@ -753,7 +753,7 @@ def process_video_pix_chunked(
                     ci + 1, num_chunks, chunk_len, we - ws, ws, we,
                 )
 
-            logger.info(
+            logger.debug(
                 "Chunk %d/%d: input frames [%d, %d) (%d frames)",
                 ci + 1, num_chunks, ws, we, chunk_len,
             )
@@ -824,7 +824,7 @@ def process_video_pix_chunked(
                 else:
                     skip = extra_skip[ci]
                     if skip > 0:
-                        logger.info(
+                        logger.debug(
                             "Shift-back: discarding %d leading decoded frames from chunk %d",
                             skip, ci + 1,
                         )
@@ -951,7 +951,7 @@ def process_video_pix_chunked(
                     ci + 1, num_chunks, chunk_len, we - ws, ws, we,
                 )
 
-            logger.info(
+            logger.debug(
                 "Chunk %d/%d: input frames [%d, %d) (%d frames)",
                 ci + 1, num_chunks, ws, we, chunk_len,
             )
@@ -984,7 +984,7 @@ def process_video_pix_chunked(
             # overlap with already-written content from the previous chunk.
             skip = extra_skip[ci]
             if skip > 0:
-                logger.info(
+                logger.debug(
                     "Shift-back: discarding %d leading decoded frames from chunk %d",
                     skip, ci + 1,
                 )

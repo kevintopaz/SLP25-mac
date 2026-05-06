@@ -1156,7 +1156,7 @@ class MLXVideoVAE:
             self.decoder = None
             mx.clear_cache()
         if getattr(self, 'encoder', None) is None:
-            logger.info("Reloading codec encoder...")
+            logger.debug("Reloading codec encoder...")
             self.encoder = Encoder(in_ch=3, out_ch=32,
                                    block_channels=(128, 256, 512, 512),
                                    layers_per_block=2, groups=32,
@@ -1236,7 +1236,7 @@ class MLXVideoVAE:
                 end = T  # absorb remainder into this slice
             t_slices.append((pos, end))
             pos = end
-        logger.info(
+        logger.debug(
             "Encoding: %d tiles (%dx%d), %d slices, tile=%dx%d, video=%dx%d, T=%d",
             n_h * n_w, n_h, n_w, len(t_slices),
             tile_H, tile_W, W, H, T,
@@ -1245,7 +1245,7 @@ class MLXVideoVAE:
             _active = mx.get_active_memory() / 1024**3
             _cache = mx.get_cache_memory() / 1024**3
             _peak = mx.get_peak_memory() / 1024**3
-            logger.info(
+            logger.debug(
                 "  GPU mem before encode tiles: active=%.2f GB, cache=%.2f GB, peak=%.2f GB",
                 _active, _cache, _peak,
             )
@@ -1305,7 +1305,7 @@ class MLXVideoVAE:
                 mx.clear_cache()
                 tc += 1
                 total_tiles = n_h * n_w
-                logger.info(f"  Enc tile {tc}/{total_tiles}: {time.perf_counter()-t0:.1f}s")
+                logger.debug(f"  Enc tile {tc}/{total_tiles}: {time.perf_counter()-t0:.1f}s")
                 if progress_fn is not None:
                     progress_fn(tc, total_tiles)
 
@@ -1324,7 +1324,7 @@ class MLXVideoVAE:
         del latent, lat_wt
         mx.clear_cache()
         elapsed = time.perf_counter() - t0
-        logger.info(f"Encoded in {elapsed:.1f}s -> {mean_np.shape}")
+        logger.debug(f"Encoded in {elapsed:.1f}s -> {mean_np.shape}")
         return mean_np
 
     def tiled_decode(
@@ -1371,7 +1371,7 @@ class MLXVideoVAE:
             self.encoder = None
             mx.clear_cache()
         if getattr(self, 'decoder', None) is None:
-            logger.info("Reloading codec decoder...")
+            logger.debug("Reloading codec decoder...")
             self.decoder = Decoder(in_ch=16, out_ch=3,
                                    block_channels=(128, 256, 512, 512),
                                    layers_per_block=2, groups=32,
@@ -1406,7 +1406,7 @@ class MLXVideoVAE:
 
         if vpp is None and tmp_dir is None:
             tmp_dir = tempfile.mkdtemp(prefix="vae_tiles_")
-        logger.info(
+        logger.debug(
             "Decoding: %d tiles, %d slices (slice=%d frames)",
             n_h * n_w, len(t_slices), temporal_slice,
         )
@@ -1487,12 +1487,12 @@ class MLXVideoVAE:
                 tile_infos.append(info)
                 tc += 1
                 total_tiles = n_h * n_w
-                logger.info(f"  Dec tile {tc}/{total_tiles}: {time.perf_counter()-t0:.1f}s")
+                logger.debug(f"  Dec tile {tc}/{total_tiles}: {time.perf_counter()-t0:.1f}s")
                 if progress_fn is not None:
                     progress_fn(tc, total_tiles)
 
         mx.clear_cache()
         elapsed = time.perf_counter() - t0
-        logger.info(f"Decoded in {elapsed:.1f}s -> {len(tile_infos)} tile files")
+        logger.debug(f"Decoded in {elapsed:.1f}s -> {len(tile_infos)} tile files")
         return tile_infos
 

@@ -148,7 +148,7 @@ def assemble_tiles_from_disk(tile_infos, pixel_H, pixel_W, num_frames=None):
         del tile_data
 
     elapsed = time.perf_counter() - t0
-    logger.info(f"Assembled tiles from disk in {elapsed:.1f}s -> {output.shape}")
+    logger.debug(f"Assembled tiles from disk in {elapsed:.1f}s -> {output.shape}")
     return output.astype(np.float16)
 
 
