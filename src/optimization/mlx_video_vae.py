@@ -1120,6 +1120,7 @@ class MLXVideoVAE:
         frames: Union[np.ndarray, "torch.Tensor"],
         tile_size=480,
         tile_overlap=48,
+        progress_fn=None,
     ):
         """Encode video frames to latent using spatial tiling.
 
@@ -1234,7 +1235,10 @@ class MLXVideoVAE:
                 if prof:
                     _mem_tile_dump("tile.after_blend_paste_mx_eval", latent, lat_wt, do_eval=False)
                 tc += 1
-                logger.info(f"  Enc tile {tc}/{n_h*n_w}: {time.perf_counter()-t0:.1f}s")
+                total_tiles = n_h * n_w
+                logger.info(f"  Enc tile {tc}/{total_tiles}: {time.perf_counter()-t0:.1f}s")
+                if progress_fn is not None:
+                    progress_fn(tc, total_tiles)
 
         if torch_frames is not None:
             del torch_frames
@@ -1249,7 +1253,7 @@ class MLXVideoVAE:
         logger.info(f"Encoded in {elapsed:.1f}s -> latent {mean_np.shape}")
         return mean_np
 
-    def tiled_decode(self, latent_f32_np, tile_size=480, tile_overlap=48, num_frames=None):
+    def tiled_decode(self, latent_f32_np, tile_size=480, tile_overlap=48, num_frames=None, progress_fn=None):
         """Decode latent (numpy [1, T_lat, H_lat, W_lat, 16] float32) to frames.
 
         Args:
@@ -1329,7 +1333,10 @@ class MLXVideoVAE:
                 )
                 del tile_np
                 tc += 1
-                logger.info(f"  Dec tile {tc}/{n_h*n_w}: {time.perf_counter()-t0:.1f}s")
+                total_tiles = n_h * n_w
+                logger.info(f"  Dec tile {tc}/{total_tiles}: {time.perf_counter()-t0:.1f}s")
+                if progress_fn is not None:
+                    progress_fn(tc, total_tiles)
 
         output_np = output.astype(np.float16)
         del output, total_wt

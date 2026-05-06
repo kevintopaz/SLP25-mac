@@ -310,12 +310,16 @@ def encode_whole_video(
 
     if progress_callback:
         progress_callback(0, 1, ctx['total_frames'], "Phase 1: Encoding")
+        def _enc_progress(done, total):
+            progress_callback(done / max(total, 1), 1, ctx['total_frames'], "Phase 1: Encoding")
+        runner._vae_progress = _enc_progress
     
     debug.start_timer("vae_encode")
     encode_input = [video_transformed]
     del video_transformed
     latents = runner.vae_encode(encode_input)
     del encode_input
+    runner._vae_progress = None
     latent = latents[0]
     debug.end_timer("vae_encode", "VAE encode")
     
@@ -874,9 +878,13 @@ def decode_whole_latent(
     
     if progress_callback:
         progress_callback(0, 1, latent.shape[0], "Phase 3: Decoding")
+        def _dec_progress(done, total):
+            progress_callback(done / max(total, 1), 1, latent.shape[0], "Phase 3: Decoding")
+        runner._vae_progress = _dec_progress
     
     debug.start_timer("vae_decode")
     samples = runner.vae_decode([latent])
+    runner._vae_progress = None
     sample = samples[0]
     debug.end_timer("vae_decode", "VAE decode")
     
