@@ -223,7 +223,7 @@ def wavelet_reconstruction(content_feat: Tensor, style_feat: Tensor, debug: Opti
                 align_corners=False
             )
             if debug is not None:
-                debug.log(f"Style resized to: {style_feat.shape}", category="precision", force=True)
+                debug.log(f"Style resized to: {style_feat.shape}", category="precision")
     
     # Decompose both features into frequency components
     content_high_freq, content_low_freq = wavelet_decomposition(content_feat)
@@ -235,7 +235,7 @@ def wavelet_reconstruction(content_feat: Tensor, style_feat: Tensor, debug: Opti
     # Safety check (should not happen after resize)
     if content_high_freq.shape != style_low_freq.shape:
         if debug is not None:
-            debug.log(f"Final dimension adjustment needed", level="WARNING", category="precision", force=True)
+            debug.log(f"Final dimension adjustment needed", level="WARNING", category="precision")
         style_low_freq = safe_interpolate_operation(
             style_low_freq,
             size=content_high_freq.shape[-2:],
@@ -458,7 +458,6 @@ def lab_reinhard_transfer(
     frame_pairs = [(b, content_np[b], style_np[b]) for b in range(content_np.shape[0])]
     max_workers = min(32, content_np.shape[0])
     
-    print(f"Processing {len(frame_pairs)} frames in parallel using {max_workers} cores...", flush=True)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         raw_results = list(executor.map(_reinhard_single_frame, frame_pairs))
     

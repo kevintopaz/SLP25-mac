@@ -718,7 +718,7 @@ class CompatibleDiT(torch.nn.Module):
         # Apply to ALL model types (FP8, FP16, GGUF) when dtype differs from compute_dtype
         if not skip_conversion and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
             if self.model_dtype != self.compute_dtype:
-                self.debug.log(f"Converting NaDiT parameters/buffers to {self.compute_dtype} for MPS backend", category="setup", force=True)
+                self.debug.log(f"Converting model parameters to {self.compute_dtype}", category="setup")
                 self.debug.start_timer("_force_nadit_precision")
                 self._force_nadit_precision(target_dtype=self.compute_dtype)
                 self.debug.end_timer("_force_nadit_precision", "NaDiT parameters/buffers conversion")

@@ -1253,7 +1253,6 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
 
     def slicing_encode(self, x: torch.Tensor) -> torch.Tensor:
         sp_size = get_sequence_parallel_world_size()
-        print("debug encode slicing: ", self.use_slicing, (x.shape[2] - 1), self.slicing_sample_min_size * sp_size)
         if self.use_slicing and (x.shape[2] - 1) > self.slicing_sample_min_size * sp_size:
             x_slices = x[:, :, 1:].split(split_size=self.slicing_sample_min_size * sp_size, dim=2)
             encoded_slices = [
@@ -1278,7 +1277,6 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
 
     def slicing_decode(self, z: torch.Tensor) -> torch.Tensor:
         sp_size = get_sequence_parallel_world_size()
-        print("debug decode slicing: ", self.use_slicing, (z.shape[2] - 1), self.slicing_latent_min_size * sp_size)
         if self.use_slicing and (z.shape[2] - 1) > self.slicing_latent_min_size * sp_size:
             z_slices = z[:, :, 1:].split(split_size=self.slicing_latent_min_size * sp_size, dim=2)
             decoded_slices = [

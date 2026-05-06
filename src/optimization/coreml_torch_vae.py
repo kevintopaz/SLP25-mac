@@ -396,9 +396,11 @@ def load_decoder_weights(decoder: Decoder, vae_path: str,
     remapped = _remap_keys_for_torch(raw)
     missing, unexpected = decoder.load_state_dict(remapped, strict=False)
     if missing:
-        print(f"[load_decoder] missing keys: {len(missing)}; first few: {missing[:5]}")
+        import warnings
+        warnings.warn(f"load_decoder: {len(missing)} missing keys; first few: {missing[:5]}")
     if unexpected:
-        print(f"[load_decoder] unexpected keys: {len(unexpected)}; first few: {unexpected[:5]}")
+        import warnings
+        warnings.warn(f"load_decoder: {len(unexpected)} unexpected keys; first few: {unexpected[:5]}")
 
 
 def load_encoder_weights(encoder: Encoder, vae_path: str,
@@ -412,6 +414,8 @@ def load_encoder_weights(encoder: Encoder, vae_path: str,
     remapped = _remap_keys_for_torch(raw)
     missing, unexpected = encoder.load_state_dict(remapped, strict=False)
     if missing:
-        print(f"[load_encoder] missing keys: {len(missing)}; first few: {missing[:5]}")
+        import warnings
+        warnings.warn(f"load_encoder: {len(missing)} missing keys; first few: {missing[:5]}")
     if unexpected:
-        print(f"[load_encoder] unexpected keys: {len(unexpected)}; first few: {unexpected[:5]}")
+        import warnings
+        warnings.warn(f"load_encoder: {len(unexpected)} unexpected keys; first few: {unexpected[:5]}")

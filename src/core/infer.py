@@ -221,7 +221,6 @@ class VideoDiffusionInfer():
             if isinstance(shift, ListConfig):
                 shift = torch.tensor(shift, device=device, dtype=dtype)
 
-            print(f"Latents shape: {len(latents)}, {latents[0].shape}")
             # Group samples of the same shape to batches if enabled.
             if self.config.vae.grouping:
                 latents, indices = na.pack(latents)

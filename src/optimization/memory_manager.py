@@ -129,12 +129,6 @@ def get_basic_vram_info(device: Optional[torch.device] = None) -> Dict[str, Any]
         return {"error": f"Failed to get memory info: {str(e)}"}
 
 
-# Initial VRAM check at module load
-vram_info = get_basic_vram_info(device=None)
-if "error" not in vram_info:
-    print(f"📊 Initial GPU memory: {vram_info['free_gb']:.2f}GB free / {vram_info['total_gb']:.2f}GB total")
-else:
-    print(f"⚠️ Memory check failed: {vram_info['error']} - No available backend!")
 
 
 def get_vram_usage(device: Optional[torch.device] = None, debug: Optional['Debug'] = None) -> Tuple[float, float, float, float]:
