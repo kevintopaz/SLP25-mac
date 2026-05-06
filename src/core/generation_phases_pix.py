@@ -581,18 +581,21 @@ def process_video_pix_chunked(
                 break
             read_windows.append((start, end))
 
-        # Shift-back: if the last chunk is shorter than chunk_size, move its
-        # start backwards so it always processes exactly chunk_size frames.
-        # The extra overlap with the previous chunk is handled by discarding
-        # redundant leading output frames, then blending the standard overlap.
-        # Disabled for hybrid/latent mode where mirror-padding handles 4n+1.
-        if shift_back and len(read_windows) > 1:
+        # Shift-back: if the last chunk's frame count doesn't satisfy 4n+1
+        # (required by the temporal VAE), shift its start backwards by the
+        # minimum amount needed.  The extra overlap with the previous chunk
+        # is handled by discarding redundant leading output frames, then
+        # blending the standard overlap.
+        if len(read_windows) > 1:
             last_start, last_end = read_windows[-1]
-            if (last_end - last_start) < chunk_size:
-                new_start = max(0, last_end - chunk_size)
+            last_len = last_end - last_start
+            remainder = (last_len - 1) % 4
+            if remainder != 0:
+                pad_needed = 4 - remainder
+                new_start = max(0, last_start - pad_needed)
                 logger.info(
-                    "Shift-back: last chunk [%d, %d) (%d frames) -> [%d, %d) (%d frames)",
-                    last_start, last_end, last_end - last_start,
+                    "Shift-back: last chunk [%d, %d) (%d frames) -> [%d, %d) (%d frames, 4n+1)",
+                    last_start, last_end, last_len,
                     new_start, last_end, last_end - new_start,
                 )
                 read_windows[-1] = (new_start, last_end)
