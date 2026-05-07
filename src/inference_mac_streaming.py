@@ -1328,6 +1328,10 @@ class VideoUpscaler:
 
     def cleanup(self):
         """Release all model state so memory is fully reclaimed."""
+        vpp = self.ctx.get('vpp') if hasattr(self, 'ctx') else None
+        if vpp is not None:
+            vpp.cleanup()
+            self.ctx.pop('vpp', None)
         if hasattr(self, 'mlx_vae') and self.mlx_vae is not None:
             self.mlx_vae.encoder = None
             self.mlx_vae.decoder = None
