@@ -175,7 +175,7 @@ PARAMETER_SCHEMA = {
                              "choices": ("resize", "pad"),
                              "sub_options": {
                                  "pad": {
-                                     "pad_mode": {"type": str, "default": "constant",
+                                     "pad_mode": {"type": str, "default": "reflect",
                                                   "choices": ("replicate", "reflect",
                                                               "constant", "circular")},
                                  },
@@ -976,12 +976,14 @@ class VideoUpscaler:
                 _, T_lat, lat_H, lat_W, _ = lat_np.shape
                 pixel_H, pixel_W = lat_H * 8, lat_W * 8
                 _vtb = self.ctx.get('_vae_tile_blend', 'cosine')
+                _tdtype = self.ctx.get('_tile_dtype', 'uint8')
                 tile_infos = mlx_vae.tiled_decode(
                     lat_np,
                     tile_size=VAE_DECODE_TILE_SIZE,
                     tile_overlap=VAE_DECODE_TILE_OVERLAP,
                     temporal_slice=999,
                     progress_fn=getattr(runner, '_vae_progress', None),
+                    tile_dtype=_tdtype,
                     blend_mode=_vtb,
                 )
                 del lat_np
@@ -1097,6 +1099,7 @@ class VideoUpscaler:
 
         vpp = self.ctx['vpp']
         use_10bit = vpp.output_bit_depth > 8
+        self.ctx['_tile_dtype'] = "uint16" if use_10bit else "uint8"
 
         def _ffmpeg_writer_factory(H, W):
             writer = FFMPEGVideoWriter(
@@ -1249,6 +1252,7 @@ class VideoUpscaler:
                         temporal_slice=HYBRID_TEMPORAL_DECODE_SLICE,
                         vpp=self.ctx.get('vpp'),
                         progress_fn=getattr(runner, '_vae_progress', None),
+                        tile_dtype=self.ctx.get('_tile_dtype', 'uint8'),
                         blend_mode=vae_tile_blend,
                     )
                     del lat_np
