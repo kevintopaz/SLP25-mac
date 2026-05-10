@@ -1124,6 +1124,7 @@ class MLXVideoVAE:
         input_layout='THWC',
         pixel_scale: float = 0.0,
         progress_fn=None,
+        blend_mode: str = "cosine",
     ):
         """Encode frames using streaming temporal slices per spatial tile.
 
@@ -1292,7 +1293,8 @@ class MLXVideoVAE:
 
                 lh, lw = hs // 8, ws // 8
                 bw = _make_blend_weight(lat_tile_H, lat_tile_W,
-                                        (lat_ov_H, lat_ov_W), n_h, n_w, ti, tj)
+                                        (lat_ov_H, lat_ov_W), n_h, n_w, ti, tj,
+                                        blend_mode=blend_mode)
                 bw5d = mx.array(bw[None, None, :, :, None])
                 latent, lat_wt = _gpu_blend_paste(
                     latent, lat_wt, enc_full, bw5d,
@@ -1338,6 +1340,7 @@ class MLXVideoVAE:
         progress_fn=None,
         tile_dtype="uint8",
         vpp=None,
+        blend_mode: str = "cosine",
     ):
         """Decode latent using streaming temporal slices, saving tiles to disk.
 

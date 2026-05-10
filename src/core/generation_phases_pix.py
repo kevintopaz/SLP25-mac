@@ -64,25 +64,33 @@ def _reset_ctx(ctx: Dict[str, Any]) -> None:
 
 from ..video_utils import Blend
 
-_blender = Blend(mode="linear")
+_blender_cache: Dict[str, Blend] = {}
+
+
+def _get_blender(mode: str = "hann") -> Blend:
+    if mode not in _blender_cache:
+        _blender_cache[mode] = Blend(mode=mode)
+    return _blender_cache[mode]
 
 
 def _blend_overlapping_frames(
     prev_tail: torch.Tensor,
     cur_head: torch.Tensor,
     overlap: int,
+    mode: str = "hann",
 ) -> torch.Tensor:
     """Blend two overlapping frame sequences ``[overlap, H, W, C]``."""
-    return _blender.temporal_thwc(prev_tail, cur_head, overlap)
+    return _get_blender(mode).temporal_thwc(prev_tail, cur_head, overlap)
 
 
 def _blend_overlapping_transformed(
     prev_tail: torch.Tensor,
     cur_head: torch.Tensor,
     overlap: int,
+    mode: str = "hann",
 ) -> torch.Tensor:
     """Blend overlapping transformed frames ``[C, T, H, W]``."""
-    return _blender.temporal_cthw(prev_tail, cur_head, overlap)
+    return _get_blender(mode).temporal_cthw(prev_tail, cur_head, overlap)
 
 
 def _compute_dit_tiles(
@@ -328,6 +336,8 @@ def _streaming_postprocess_chunk(
     overlap_trans: Optional[torch.Tensor],
     pp_func,
     debug,
+    blend_mode: str = "hann",
+    vae_tile_blend: str = "cosine",
 ):
     """Streaming assembly + post-process for a single decode chunk.
 
@@ -357,6 +367,7 @@ def _streaming_postprocess_chunk(
         count = min(count, T_pix - start)
         dec_np = assemble_tiles_from_disk_range(
             tile_infos, pixel_H, pixel_W, start, count,
+            blend_mode=vae_tile_blend,
         )
         dec = torch.from_numpy(dec_np)  # [count, H, W, 3] fp16
         if _vpp is not None and _vpp.needs_resize_back:
@@ -418,12 +429,12 @@ def _streaming_postprocess_chunk(
             cur_head_dec = _read_decoded_range(skip, actual_overlap)
             cur_head_trans = _read_transform_range(skip, actual_overlap)
             blended_dec = _blend_overlapping_frames(
-                overlap_dec, cur_head_dec, actual_overlap,
+                overlap_dec, cur_head_dec, actual_overlap, mode=blend_mode,
             )
             blended_trans = None
             if overlap_trans is not None and cur_head_trans is not None:
                 blended_trans = _blend_overlapping_transformed(
-                    overlap_trans, cur_head_trans, actual_overlap,
+                    overlap_trans, cur_head_trans, actual_overlap, mode=blend_mode,
                 )
             debug.log(
                 f"Blended {actual_overlap} overlapping frames",
@@ -795,6 +806,8 @@ def process_video_pix_chunked(
                     decoded, ci, num_chunks, is_last, overlap,
                     extra_skip[ci], overlap_dec, overlap_trans,
                     _pp, debug,
+                    blend_mode=ctx.get('_temporal_blend', 'hann'),
+                    vae_tile_blend=ctx.get('_vae_tile_blend', 'cosine'),
                 )
                 # _streaming_postprocess_chunk handles blending, _pp calls,
                 # and returns new overlap buffers.
@@ -836,14 +849,15 @@ def process_video_pix_chunked(
                     if overlap_dec is not None:
                         actual_overlap = min(actual_overlap, overlap_dec.shape[0])
 
+                    _tb = ctx.get('_temporal_blend', 'hann')
                     if actual_overlap > 0 and overlap_dec is not None:
                         blended_dec = _blend_overlapping_frames(
-                            overlap_dec, decoded[:actual_overlap], actual_overlap,
+                            overlap_dec, decoded[:actual_overlap], actual_overlap, mode=_tb,
                         )
                         blended_trans = None
                         if overlap_trans is not None and transformed is not None:
                             blended_trans_raw = _blend_overlapping_transformed(
-                                overlap_trans, transformed[:, :actual_overlap], actual_overlap,
+                                overlap_trans, transformed[:, :actual_overlap], actual_overlap, mode=_tb,
                             )
                             blended_trans = blended_trans_raw
                         debug.log(
@@ -1014,16 +1028,17 @@ def process_video_pix_chunked(
             else:
                 actual_overlap = min(overlap, decoded_frames, current_write_idx)
 
+                _tb = ctx.get('_temporal_blend', 'hann')
                 if actual_overlap > 0:
                     prev_tail = final_video[current_write_idx - actual_overlap:current_write_idx]
                     cur_head = decoded[:actual_overlap]
-                    blended = _blend_overlapping_frames(prev_tail, cur_head, actual_overlap)
+                    blended = _blend_overlapping_frames(prev_tail, cur_head, actual_overlap, mode=_tb)
                     final_video[current_write_idx - actual_overlap:current_write_idx] = blended
 
                     if final_transformed is not None and transformed is not None:
                         prev_tail_t = final_transformed[:, current_write_idx - actual_overlap:current_write_idx]
                         cur_head_t = transformed[:, :actual_overlap]
-                        blended_t = _blend_overlapping_transformed(prev_tail_t, cur_head_t, actual_overlap)
+                        blended_t = _blend_overlapping_transformed(prev_tail_t, cur_head_t, actual_overlap, mode=_tb)
                         final_transformed[:, current_write_idx - actual_overlap:current_write_idx] = blended_t
                         del prev_tail_t, cur_head_t, blended_t
 

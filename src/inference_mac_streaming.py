@@ -138,7 +138,7 @@ _CHUNK_DEFAULTS = {
     "pixel":  {"chunk_size": 33,  "chunk_overlap": 8},
     "latent": {"chunk_size": 121, "chunk_overlap": 21},
 }
-HYBRID_FIXED_WT = 3           # temporal attention window size for full-latent DiT
+HYBRID_FIXED_WT = 9           # temporal attention window size for full-latent DiT
 DIT_LATENT_CHUNK = 0          # latent frames per DiT temporal chunk (0 = all at once)
 DIT_LATENT_OVERLAP = 0        # overlap in latent frames between DiT chunks
 HYBRID_TEMPORAL_ENCODE_SLICE = 5   # pixel frames per streaming encode slice
@@ -175,11 +175,17 @@ PARAMETER_SCHEMA = {
                              "choices": ("resize", "pad"),
                              "sub_options": {
                                  "pad": {
-                                     "pad_mode": {"type": str, "default": "reflect",
+                                     "pad_mode": {"type": str, "default": "constant",
                                                   "choices": ("replicate", "reflect",
                                                               "constant", "circular")},
                                  },
                              }},
+        "vae_tile_blend":   {"type": str, "default": "cosine",
+                             "choices": ("cosine", "linear")},
+        "temporal_blend":   {"type": str, "default": "hann",
+                             "choices": ("hann", "cosine", "linear")},
+        "latent_temporal_blend": {"type": str, "default": "cosine",
+                                  "choices": ("cosine", "linear")},
     },
     "encoding": {
         "ffmpeg_encoding":        {"type": str, "default": ""},
@@ -255,9 +261,9 @@ if "MLX_DIT_TILE_FIRST" not in os.environ:
     os.environ["MLX_DIT_TILE_FIRST"] = "1" if _TOTAL_RAM_GB < 24 else "0"
 
 VAE_ENCODE_TILE_SIZE = (640, 640) 
-VAE_ENCODE_TILE_OVERLAP = (64, 64) 
+VAE_ENCODE_TILE_OVERLAP = (80, 80) 
 VAE_DECODE_TILE_SIZE = (480, 480) 
-VAE_DECODE_TILE_OVERLAP = (48, 48) 
+VAE_DECODE_TILE_OVERLAP = (60, 60) 
 
 def _auto_mlx_cache_gb() -> float:
     if _TOTAL_RAM_GB <= 16:
@@ -904,12 +910,14 @@ class VideoUpscaler:
                 samples[i] = None
                 del sample
 
+                _vtb = self.ctx.get('_vae_tile_blend', 'cosine')
                 latent_np = mlx_vae.tiled_encode(
                     frames_torch,
                     tile_size=VAE_ENCODE_TILE_SIZE,
                     tile_overlap=VAE_ENCODE_TILE_OVERLAP,
                     temporal_slice=frames_torch.shape[0],
                     progress_fn=getattr(runner, '_vae_progress', None),
+                    blend_mode=_vtb,
                 )
                 del frames_torch
                 # latent_np: [1, T_lat, H_lat, W_lat, 32] (mean+logvar)
@@ -967,12 +975,14 @@ class VideoUpscaler:
 
                 _, T_lat, lat_H, lat_W, _ = lat_np.shape
                 pixel_H, pixel_W = lat_H * 8, lat_W * 8
+                _vtb = self.ctx.get('_vae_tile_blend', 'cosine')
                 tile_infos = mlx_vae.tiled_decode(
                     lat_np,
                     tile_size=VAE_DECODE_TILE_SIZE,
                     tile_overlap=VAE_DECODE_TILE_OVERLAP,
                     temporal_slice=999,
                     progress_fn=getattr(runner, '_vae_progress', None),
+                    blend_mode=_vtb,
                 )
                 del lat_np
                 from .video_utils.tile_assembly import (
@@ -980,6 +990,7 @@ class VideoUpscaler:
                 )
                 frames_np = assemble_tiles_from_disk(
                     tile_infos, pixel_H, pixel_W,
+                    blend_mode=_vtb,
                 )
                 cleanup_tile_files(tile_infos)
                 sample_t = torch.from_numpy(frames_np)
@@ -1029,6 +1040,9 @@ class VideoUpscaler:
         color_correction  = params['color_correction']
         resize_strategy   = params['resize_strategy']
         pad_mode          = params.get('pad_mode', 'constant')
+        vae_tile_blend    = params['vae_tile_blend']
+        temporal_blend    = params['temporal_blend']
+        latent_temporal_blend = params['latent_temporal_blend']
 
         ffmpeg_encoding        = params['ffmpeg_encoding']
         ffmpeg_preproc_filters = params['ffmpeg_preproc_filters']
@@ -1038,7 +1052,6 @@ class VideoUpscaler:
         logger.info(f"Input video: {input_path}")
         logger.info(f"Output path: {output_path}")
         logger.info(f"Resolution: {output_width}x{output_height}")
-        logger.info(f"color_correction={color_correction}")
         if skip_frames or load_cap:
             logger.info(f"Frame range: start={skip_frames}, load_cap={load_cap}")
         if ffmpeg_encoding:
@@ -1158,6 +1171,7 @@ class VideoUpscaler:
                         input_layout=_input_mm.layout,
                         pixel_scale=_input_mm.scale,
                         progress_fn=getattr(runner, '_vae_progress', None),
+                        blend_mode=vae_tile_blend,
                     )
                     del _input_mm
                 else:
@@ -1173,6 +1187,7 @@ class VideoUpscaler:
                         tile_overlap=VAE_ENCODE_TILE_OVERLAP,
                         temporal_slice=HYBRID_TEMPORAL_ENCODE_SLICE,
                         progress_fn=getattr(runner, '_vae_progress', None),
+                        blend_mode=vae_tile_blend,
                     )
                     del frames_torch
 
@@ -1234,6 +1249,7 @@ class VideoUpscaler:
                         temporal_slice=HYBRID_TEMPORAL_DECODE_SLICE,
                         vpp=self.ctx.get('vpp'),
                         progress_fn=getattr(runner, '_vae_progress', None),
+                        blend_mode=vae_tile_blend,
                     )
                     del lat_np
 
@@ -1267,6 +1283,9 @@ class VideoUpscaler:
 
         self.ctx['_dit_latent_chunk'] = DIT_LATENT_CHUNK
         self.ctx['_dit_latent_overlap'] = DIT_LATENT_OVERLAP
+        self.ctx['_vae_tile_blend'] = vae_tile_blend
+        self.ctx['_temporal_blend'] = temporal_blend
+        self.ctx['_latent_temporal_blend'] = latent_temporal_blend
 
         def _progress_adapter(frac: float, message: str = ""):
             if progress_func:

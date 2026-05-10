@@ -79,7 +79,7 @@ class ResizeDivisible:
         max_resolution: int = 0,
         downsample_only: bool = False,
         factor: int = 16,
-        interpolation: InterpolationMode = InterpolationMode.BILINEAR,
+        interpolation: InterpolationMode = InterpolationMode.BICUBIC,
         strategy: Literal["resize", "pad"] = "resize",
         pad_mode: str = "replicate",
     ):

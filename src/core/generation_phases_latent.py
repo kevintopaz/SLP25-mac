@@ -570,16 +570,23 @@ def upscale_latent_chunked(
             actual_ov_end = 0
 
         temporal_weight = torch.ones(chunk_len, device=accum_device, dtype=latent.dtype)
-        
+        _ltb = ctx.get('_latent_temporal_blend', 'cosine')
+
         if actual_ov_start > 0:
             ramp_len = min(actual_ov_start, chunk_len)
-            t = torch.linspace(0, 1, ramp_len, device=accum_device, dtype=latent.dtype)
-            temporal_weight[:ramp_len] = t
-        
+            t = torch.linspace(0, math.pi / 2, ramp_len, device=accum_device, dtype=latent.dtype)
+            if _ltb == "cosine":
+                temporal_weight[:ramp_len] = torch.sin(t)
+            else:
+                temporal_weight[:ramp_len] = torch.linspace(0, 1, ramp_len, device=accum_device, dtype=latent.dtype)
+
         if actual_ov_end > 0:
             ramp_len = min(actual_ov_end, chunk_len)
-            t = torch.linspace(1, 0, ramp_len, device=accum_device, dtype=latent.dtype)
-            temporal_weight[-ramp_len:] = temporal_weight[-ramp_len:] * t
+            if _ltb == "cosine":
+                t = torch.linspace(0, math.pi / 2, ramp_len, device=accum_device, dtype=latent.dtype)
+                temporal_weight[-ramp_len:] = temporal_weight[-ramp_len:] * torch.cos(t)
+            else:
+                temporal_weight[-ramp_len:] = temporal_weight[-ramp_len:] * torch.linspace(1, 0, ramp_len, device=accum_device, dtype=latent.dtype)
         
         temporal_weight = temporal_weight.view(-1, 1, 1, 1)
         

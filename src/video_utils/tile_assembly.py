@@ -17,8 +17,22 @@ logger = logging.getLogger(__name__)
 
 # ── Blend weights ────────────────────────────────────────────────────────────
 
-def make_blend_weight(tile_h, tile_w, overlap, n_h, n_w, ti, tj):
-    """Bilinear ramp at tile borders for spatial blending.
+def _ramp(n, mode="cosine"):
+    """1-D ramp from 0 to 1 with *n* steps.
+
+    ``"cosine"``  — raised-cosine (Hann): 0.5 - 0.5*cos(t*π), zero derivative
+                    at both ends → seamless tile blending.
+    ``"linear"``  — simple ``linspace(0, 1)``.
+    """
+    t = np.linspace(0, 1, n, dtype=np.float32)
+    if mode == "cosine":
+        return (0.5 - 0.5 * np.cos(t * np.pi)).astype(np.float32)
+    return t
+
+
+def make_blend_weight(tile_h, tile_w, overlap, n_h, n_w, ti, tj,
+                      blend_mode="cosine"):
+    """Separable ramp at tile borders for spatial blending.
 
     Parameters
     ----------
@@ -30,6 +44,8 @@ def make_blend_weight(tile_h, tile_w, overlap, n_h, n_w, ti, tj):
         Grid dimensions (number of tiles vertically / horizontally).
     ti, tj : int
         Row / column index of this tile in the grid.
+    blend_mode : ``"cosine"`` (default) or ``"linear"``
+        Ramp curve used in the overlap region.
 
     Returns
     -------
@@ -42,13 +58,13 @@ def make_blend_weight(tile_h, tile_w, overlap, n_h, n_w, ti, tj):
         ov_h = ov_w = int(overlap)
     bw = np.ones((tile_h, tile_w), dtype=np.float32)
     if ti > 0:
-        bw[:ov_h, :] *= np.linspace(0, 1, ov_h)[:, None]
+        bw[:ov_h, :] *= _ramp(ov_h, blend_mode)[:, None]
     if ti < n_h - 1:
-        bw[-ov_h:, :] *= np.linspace(1, 0, ov_h)[:, None]
+        bw[-ov_h:, :] *= _ramp(ov_h, blend_mode)[::-1, None]
     if tj > 0:
-        bw[:, :ov_w] *= np.linspace(0, 1, ov_w)[None, :]
+        bw[:, :ov_w] *= _ramp(ov_w, blend_mode)[None, :]
     if tj < n_w - 1:
-        bw[:, -ov_w:] *= np.linspace(1, 0, ov_w)[None, :]
+        bw[:, -ov_w:] *= _ramp(ov_w, blend_mode)[None, ::-1]
     return bw
 
 
@@ -83,7 +99,7 @@ def read_tile_as_fp16(info, frame_start, frame_count):
 
 # ── Assembly ─────────────────────────────────────────────────────────────────
 
-def _compute_total_weight(tile_infos, pixel_H, pixel_W):
+def _compute_total_weight(tile_infos, pixel_H, pixel_W, blend_mode="cosine"):
     """Pre-compute the normalisation weight map across all tiles."""
     info0 = tile_infos[0]
     tile_H, tile_W = info0["tile_H"], info0["tile_W"]
@@ -93,7 +109,8 @@ def _compute_total_weight(tile_infos, pixel_H, pixel_W):
     total_wt = np.zeros((pixel_H, pixel_W), dtype=np.float32)
     for info in tile_infos:
         bw = make_blend_weight(tile_H, tile_W, (ov_H, ov_W),
-                               n_h, n_w, info["ti"], info["tj"])
+                               n_h, n_w, info["ti"], info["tj"],
+                               blend_mode=blend_mode)
         ph, pw = info["pixel_h"], info["pixel_w"]
         clip_h = min(tile_H, pixel_H - ph)
         clip_w = min(tile_W, pixel_W - pw)
@@ -101,7 +118,8 @@ def _compute_total_weight(tile_infos, pixel_H, pixel_W):
     return np.maximum(total_wt, 1e-4), tile_H, tile_W, ov_H, ov_W, n_h, n_w
 
 
-def assemble_tiles_from_disk(tile_infos, pixel_H, pixel_W, num_frames=None):
+def assemble_tiles_from_disk(tile_infos, pixel_H, pixel_W, num_frames=None,
+                             blend_mode="cosine"):
     """Blend decoded pixel tiles from memmap files into a single output.
 
     Parameters
@@ -112,6 +130,8 @@ def assemble_tiles_from_disk(tile_infos, pixel_H, pixel_W, num_frames=None):
         Full output resolution.
     num_frames : int, optional
         Cap on output pixel frames.
+    blend_mode : str
+        ``"cosine"`` (default) or ``"linear"``.
 
     Returns
     -------
@@ -127,7 +147,7 @@ def assemble_tiles_from_disk(tile_infos, pixel_H, pixel_W, num_frames=None):
         T_pix = min(T_pix, num_frames)
 
     total_wt, tile_H, tile_W, ov_H, ov_W, n_h, n_w = \
-        _compute_total_weight(tile_infos, pixel_H, pixel_W)
+        _compute_total_weight(tile_infos, pixel_H, pixel_W, blend_mode)
 
     output = np.zeros((T_pix, pixel_H, pixel_W, 3), dtype=np.float32)
 
@@ -138,7 +158,8 @@ def assemble_tiles_from_disk(tile_infos, pixel_H, pixel_W, num_frames=None):
         clip_h = min(tile_H, pixel_H - ph)
         clip_w = min(tile_W, pixel_W - pw)
         bw = make_blend_weight(tile_H, tile_W, (ov_H, ov_W),
-                               n_h, n_w, info["ti"], info["tj"])
+                               n_h, n_w, info["ti"], info["tj"],
+                               blend_mode=blend_mode)
         bw = bw[:clip_h, :clip_w]
         norm_bw = bw / total_wt[ph:ph + clip_h, pw:pw + clip_w]
         bw4d = norm_bw[None, :, :, None]
@@ -153,7 +174,8 @@ def assemble_tiles_from_disk(tile_infos, pixel_H, pixel_W, num_frames=None):
 
 
 def assemble_tiles_from_disk_range(tile_infos, pixel_H, pixel_W,
-                                   frame_start, frame_count):
+                                   frame_start, frame_count,
+                                   blend_mode="cosine"):
     """Blend a temporal sub-range of decoded pixel tiles from memmap files.
 
     Same spatial blending as ``assemble_tiles_from_disk`` but only reads
@@ -169,7 +191,7 @@ def assemble_tiles_from_disk_range(tile_infos, pixel_H, pixel_W,
         raise ValueError("No tile_infos provided")
 
     total_wt, tile_H, tile_W, ov_H, ov_W, n_h, n_w = \
-        _compute_total_weight(tile_infos, pixel_H, pixel_W)
+        _compute_total_weight(tile_infos, pixel_H, pixel_W, blend_mode)
 
     output = np.zeros((frame_count, pixel_H, pixel_W, 3), dtype=np.float32)
 
@@ -180,7 +202,8 @@ def assemble_tiles_from_disk_range(tile_infos, pixel_H, pixel_W,
         clip_h = min(tile_H, pixel_H - ph)
         clip_w = min(tile_W, pixel_W - pw)
         bw = make_blend_weight(tile_H, tile_W, (ov_H, ov_W),
-                               n_h, n_w, info["ti"], info["tj"])
+                               n_h, n_w, info["ti"], info["tj"],
+                               blend_mode=blend_mode)
         bw = bw[:clip_h, :clip_w]
         norm_bw = bw / total_wt[ph:ph + clip_h, pw:pw + clip_w]
         bw4d = norm_bw[None, :, :, None]
