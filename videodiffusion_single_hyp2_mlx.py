@@ -1,0 +1,132 @@
+"""
+Neuroserver integration for the MLX-based Mac streaming HDR video upscaler.
+
+Registered class: Hyp2MLX
+Serve name:      "hyp-2"  (macOS/Apple dispatch via local_models.py)
+
+This is the HDR variant: input frames are converted to PQ BT.2020 via
+``srgb_to_pq`` before the model, the pipeline runs at a 1.33x supersampled
+box and is then INTER_AREA-downscaled to the user-requested resolution,
+and output is written via ``HDRVideoWriter`` (HDR10 ProRes by default,
+or an EXR sequence when ``output_codec='exr'``).
+
+Supported model_parameters (from Hyp2Filter / SLFilter / VideoFilter):
+    output_width, output_height     – target resolution (default 1920x1080)
+    start_idx, end_idx              – frame range (inclusive, 0-based)
+    start_frame_idx, end_frame_idx  – alias for start_idx/end_idx
+    input_frame_count               – max frames to process
+    color_correction                – "none" (default for HDR; "wavelet"/"lab_reinhard" also accepted)
+    resolution                      – target short-side px (overrides w/h)
+    cfg_scale                       – classifier-free guidance scale
+    seed                            – RNG seed
+    latent_noise_scale              – noise scale for latent space
+    shared_noise                    – share noise across frames
+    chunk_size, overlap             – temporal chunking
+    dit_tile_overlap                – spatial overlap for DiT tiles
+    output_bit_depth                – overridden to 16 internally for HDR
+    output_codec                    – "prores" (default, HDR10 ProRes) | "exr"
+    ffmpeg_encoding                 – (reserved for future use)
+    ffmpeg_preproc_filters          – (reserved for future use)
+    creativity                      – "low" | "middle" | "high" (SLFilter)
+    is_optimized_mode               – optimised path flag (SLFilter)
+    enable_clc                      – colour-level correction (SLFilter)
+
+Usage (smoke-test):
+    python local_model_service.py \\
+      --once \\
+      --input-path input.mp4 \\
+      --output-path output.mov \\
+      --filters '[{"model": "hyp-2", "output_width": 1920, "output_height": 1080}]' \\
+      --device 0
+"""
+
+import os
+import sys
+import logging
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+matrix_root = os.path.abspath(os.path.join(script_dir, '..'))
+if matrix_root not in sys.path:
+    sys.path.insert(0, matrix_root)
+
+from utils.register.registry_class import MODEL
+from .src.inference_mac_streaming_hyp2 import VideoUpscaler
+
+logger = logging.getLogger(__name__)
+
+
+@MODEL.register_class()
+class Hyp2MLX:
+    """MLX-accelerated HDR video upscaler for macOS Apple Silicon.
+
+    The model is loaded fresh on every ``__call__`` and torn down
+    afterwards so that memory is fully reclaimed between runs.
+    """
+
+    def __init__(self, gpu_id=0, **kwargs):
+        model_store = os.environ.get("TOPAZ_MODEL_STORE", "./data")
+
+        # Prefer the encrypted flat folder; fall back to plaintext split dir.
+        encryption_key = "522b6852486949eabefe9bad9aecff31"
+        encrypted_dir = os.path.join(model_store, "hyp-2")
+        if encryption_key and os.path.isdir(encrypted_dir):
+            split_dir = encrypted_dir
+        else:
+            encryption_key = None
+            split_dir = os.path.join(model_store, "nadit_blocks_3b")
+            if not os.path.isdir(split_dir):
+                split_dir = os.path.join(script_dir, "nadit_blocks_3b")
+
+        self._init_kwargs = dict(
+            split_dir=split_dir,
+            model_dir=model_store if os.path.isdir(model_store) else None,
+            device="mps",
+            debug_enabled=False,
+            mlx_dtype="bf16",
+            mlx_stream=True,
+            encryption_key=encryption_key,
+        )
+        logger.info("Hyp2MLX registered (model will be loaded on first run)")
+
+    def __call__(self, input_path, output_path, model_parameters, progress_func):
+        if not os.path.exists(input_path):
+            return 9  # MEDIA_READ_ERROR
+
+        progress_func(0.0, message="Starting enhancement...")
+
+        # If "resolution" shorthand is provided (short-side target), derive
+        # output_width / output_height so VideoUpscaler picks them up.
+        if 'resolution' in model_parameters:
+            res = int(model_parameters['resolution'])
+            iw = int(model_parameters.get('input_width', 0))
+            ih = int(model_parameters.get('input_height', 0))
+            if iw > 0 and ih > 0:
+                if iw >= ih:
+                    model_parameters.setdefault('output_height', res)
+                    model_parameters.setdefault('output_width', int(res * iw / ih))
+                else:
+                    model_parameters.setdefault('output_width', res)
+                    model_parameters.setdefault('output_height', int(res * ih / iw))
+
+        # Honour input_frame_count as an upper bound on frames processed.
+        if 'input_frame_count' in model_parameters and 'end_idx' not in model_parameters and 'end_frame_idx' not in model_parameters:
+            ifc = int(model_parameters['input_frame_count'])
+            start = int(model_parameters.get('start_idx', model_parameters.get('start_frame_idx', 0)))
+            model_parameters['end_frame_idx'] = start + ifc
+
+        upscaler = VideoUpscaler(**self._init_kwargs)
+        try:
+            upscaler(input_path, output_path, model_parameters,
+                     progress_func=progress_func)
+        except FileNotFoundError as e:
+            logger.error("Input file not found: %s", e)
+            return 9  # MEDIA_READ_ERROR
+        except Exception:
+            logger.exception("Hyp2MLX processing failed")
+            raise
+        finally:
+            upscaler.cleanup()
+            del upscaler
+
+        progress_func(1.0, message="Done", output_is_written=True)
+        return 0
