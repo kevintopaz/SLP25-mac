@@ -16,3 +16,4 @@ av
 tensorrt_cu12==10.16.0.72
 tensorrt_cu12_bindings==10.16.0.72
 tensorrt_cu12_libs==10.16.0.72
+OpenImageIO
