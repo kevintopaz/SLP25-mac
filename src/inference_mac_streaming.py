@@ -78,7 +78,7 @@ _COLOR_OVERRIDES: dict = {}
 if os.environ.get("MLX_WAVELET", "1") == "1":
     from .utils.color_fix_mlx import wavelet_reconstruction_mlx
     _COLOR_OVERRIDES["wavelet"] = wavelet_reconstruction_mlx
-    logger.info("Accelerated wavelet color correction enabled")
+    logger.info("Accelerated post processing correction enabled")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
