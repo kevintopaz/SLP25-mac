@@ -184,6 +184,19 @@ class NaDiT(nn.Module):
             dim=vid_dim,
         )
 
+    @property
+    def fixed_wt(self):
+        """Temporal attention window override (latent frames) for all windowed
+        attention layers; None = computed from each layer's window setting."""
+        return self.__dict__.get("_fixed_wt")
+
+    @fixed_wt.setter
+    def fixed_wt(self, value):
+        self.__dict__["_fixed_wt"] = value
+        for m in self.modules():
+            if m is not self and hasattr(m, "window_op") and hasattr(m, "fixed_wt"):
+                m.fixed_wt = value
+
     def set_gradient_checkpointing(self, enable: bool):
         self.gradient_checkpointing = enable
 

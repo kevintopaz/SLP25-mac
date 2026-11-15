@@ -283,7 +283,12 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
 def _find_ffmpeg():
     found = shutil.which('ffmpeg')
-    return found or 'ffmpeg'
+    if found:
+        return found
+    for p in ('/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg'):
+        if os.path.isfile(p):
+            return p
+    return 'ffmpeg'
 
 
 def _find_ffprobe():
@@ -847,13 +852,21 @@ class VideoUpscaler:
             io_paths = manifest["io_components"]
             block_paths = list(manifest["blocks"])
 
-        self.streaming_dit = MLXNaDiT(
-            io_paths=io_paths,
-            block_paths=block_paths,
-            dtype=self.mlx_dtype,
-            full_pool=not self.mlx_stream,
-            log=lambda s: logger.info(s),
-        )
+        if os.environ.get("NEURO_DIT", "0") == "1":
+            # Experimental: the unchanged PyTorch NaDiT run on MLX by neuroplatform.
+            # Plain (unencrypted) split checkpoints only; pixel chunking only.
+            if nmap:
+                raise NotImplementedError("NEURO_DIT=1 does not support encrypted model files yet")
+            from .neuroplatform_dit import create_neuroplatform_dit
+            self.streaming_dit = create_neuroplatform_dit(split_dir)
+        else:
+            self.streaming_dit = MLXNaDiT(
+                io_paths=io_paths,
+                block_paths=block_paths,
+                dtype=self.mlx_dtype,
+                full_pool=not self.mlx_stream,
+                log=lambda s: logger.info(s),
+            )
 
         if hasattr(self.runner, 'dit') and self.runner.dit is not None:
             del self.runner.dit
@@ -1080,7 +1093,8 @@ class VideoUpscaler:
         resolution = min(resolution_w, resolution_h)
         logger.debug(f"Input: {input_w}x{input_h}, target: {output_width}x{output_height} -> {resolution_w}x{resolution_h}")
 
-        self.streaming_dit.stream_manager.prefetch_start(num_blocks=2)
+        if hasattr(self.streaming_dit, "stream_manager"):   # MLXNaDiT only; neuroplatform streams itself
+            self.streaming_dit.stream_manager.prefetch_start(num_blocks=2)
 
         total_frames = reader.shape[0]
 

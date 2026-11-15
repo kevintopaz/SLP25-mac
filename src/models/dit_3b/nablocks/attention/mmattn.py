@@ -157,6 +157,8 @@ class NaSwinAttention(NaMMAttention):
         assert all(map(lambda v: isinstance(v, int) and v >= 0, self.window))
 
         self.window_op = get_window_op(window_method)
+        # Optional temporal window override (latent frames); None = computed from window.
+        self.fixed_wt = None
 
     def forward(
         self,
@@ -185,11 +187,11 @@ class NaSwinAttention(NaMMAttention):
         )
 
         # re-org the input seq for window attn
-        cache_win = cache.namespace(f"{self.window_method}_{self.window}_sd3")
+        cache_win = cache.namespace(f"{self.window_method}_{self.window}_{self.fixed_wt}_sd3")
 
         def make_window(x: torch.Tensor):
             t, h, w, _ = x.shape
-            window_slices = self.window_op((t, h, w), self.window)
+            window_slices = self.window_op((t, h, w), self.window, fixed_wt=self.fixed_wt)
             return [x[st, sh, sw] for (st, sh, sw) in window_slices]
 
         window_partition, window_reverse, window_shape, window_count = cache_win(

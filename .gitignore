@@ -29,3 +29,6 @@ TILE_VAE*
 
 #Ignore cursor AI rules
 .cursor/rules/codacy.mdc
+
+# Separate git repo for the platform layer
+neuroplatform/

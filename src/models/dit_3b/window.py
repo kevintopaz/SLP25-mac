@@ -13,7 +13,7 @@
 # // limitations under the License.
 
 from math import ceil
-from typing import Tuple
+from typing import Optional, Tuple
 import math
 
 def get_window_op(name: str):
@@ -25,14 +25,17 @@ def get_window_op(name: str):
 
 
 # -------------------------------- Windowing -------------------------------- #
-def make_720Pwindows_bysize(size: Tuple[int, int, int], num_windows: Tuple[int, int, int]):
+def make_720Pwindows_bysize(size: Tuple[int, int, int], num_windows: Tuple[int, int, int],
+                            fixed_wt: Optional[int] = None):
+    """fixed_wt: if set, overrides the temporal window size (in latent frames), so
+    long latent sequences keep small temporal windows (used by latent chunking)."""
     t, h, w = size
     resized_nt, resized_nh, resized_nw = num_windows
     #cal windows under 720p
     scale = math.sqrt((45 * 80) / (h * w))
     resized_h, resized_w = round(h * scale), round(w * scale)
     wh, ww = ceil(resized_h / resized_nh), ceil(resized_w / resized_nw)  # window size.
-    wt = ceil(min(t, 30) / resized_nt)  # window size.
+    wt = fixed_wt if fixed_wt is not None else ceil(min(t, 30) / resized_nt)  # window size.
     nt, nh, nw = ceil(t / wt), ceil(h / wh), ceil(w / ww)  # window size.
     return [
         (
@@ -48,14 +51,16 @@ def make_720Pwindows_bysize(size: Tuple[int, int, int], num_windows: Tuple[int, 
         if min((it + 1) * wt, t) > it * wt
     ]
 
-def make_shifted_720Pwindows_bysize(size: Tuple[int, int, int], num_windows: Tuple[int, int, int]):
+def make_shifted_720Pwindows_bysize(size: Tuple[int, int, int], num_windows: Tuple[int, int, int],
+                                    fixed_wt: Optional[int] = None):
+    """Shifted variant of make_720Pwindows_bysize; fixed_wt as there."""
     t, h, w = size
     resized_nt, resized_nh, resized_nw = num_windows
     #cal windows under 720p
     scale = math.sqrt((45 * 80) / (h * w))
     resized_h, resized_w = round(h * scale), round(w * scale)
     wh, ww = ceil(resized_h / resized_nh), ceil(resized_w / resized_nw)  # window size.
-    wt = ceil(min(t, 30) / resized_nt)  # window size.
+    wt = fixed_wt if fixed_wt is not None else ceil(min(t, 30) / resized_nt)  # window size.
     
     st, sh, sw = (  # shift size.
         0.5 if wt < t else 0,
