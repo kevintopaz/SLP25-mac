@@ -59,12 +59,7 @@ def setup_generation_context(
     vae_device = _normalize_device(vae_device)
     dit_offload_device = _normalize_device(dit_offload_device) if dit_offload_device is not None else None
     vae_offload_device = _normalize_device(vae_offload_device) if vae_offload_device is not None else None
-    # MPS unified memory: CPU offload causes sync overhead with no memory benefit
-    is_mps = dit_device.type == 'mps' or vae_device.type == 'mps'
-    if is_mps and tensor_offload_device is not None and str(tensor_offload_device) == 'cpu':
-        tensor_offload_device = None
-    else:
-        tensor_offload_device = _normalize_device(tensor_offload_device) if tensor_offload_device is not None else None
+    tensor_offload_device = _normalize_device(tensor_offload_device) if tensor_offload_device is not None else None
     
     os.environ.setdefault("LOCAL_RANK", "0")
     
@@ -215,12 +210,7 @@ def ensure_precision_initialized(
         dit_dtype = None
         vae_dtype = None
 
-        mlx_dit_dtype = getattr(runner, '_mlx_dit_dtype', None)
-        mlx_vae_dtype = getattr(runner, '_mlx_vae_dtype', None)
-
-        if mlx_dit_dtype is not None:
-            dit_dtype = f"mlx.{mlx_dit_dtype}"
-        elif runner.dit is not None:
+        if runner.dit is not None:
             try:
                 p = next(runner.dit.parameters())
                 if p.device.type != 'meta':
@@ -228,9 +218,7 @@ def ensure_precision_initialized(
             except StopIteration:
                 pass
 
-        if mlx_vae_dtype is not None:
-            vae_dtype = f"mlx.{mlx_vae_dtype}"
-        elif runner.vae is not None:
+        if runner.vae is not None:
             try:
                 p = next(runner.vae.parameters())
                 if p.device.type != 'meta':

@@ -20,6 +20,7 @@ Compared to generation_phases_latent.py (latent-domain chunking):
     Pixel:   Chunk pixels  -> (Encode -> DiT -> Decode) per chunk -> Blend pixels -> Postprocess
 """
 
+import os
 import time
 import logging
 import math
@@ -78,9 +79,10 @@ def _blend_overlapping_frames(
     cur_head: torch.Tensor,
     overlap: int,
     mode: str = "hann",
+    frames: Optional[slice] = None,
 ) -> torch.Tensor:
-    """Blend two overlapping frame sequences ``[overlap, H, W, C]``."""
-    return _get_blender(mode).temporal_thwc(prev_tail, cur_head, overlap)
+    """Blend two overlapping frame sequences ``[overlap, H, W, C]`` (or the *frames* of them)."""
+    return _get_blender(mode).temporal_thwc(prev_tail, cur_head, overlap, frames=frames)
 
 
 def _blend_overlapping_transformed(
@@ -88,9 +90,10 @@ def _blend_overlapping_transformed(
     cur_head: torch.Tensor,
     overlap: int,
     mode: str = "hann",
+    frames: Optional[slice] = None,
 ) -> torch.Tensor:
-    """Blend overlapping transformed frames ``[C, T, H, W]``."""
-    return _get_blender(mode).temporal_cthw(prev_tail, cur_head, overlap)
+    """Blend overlapping transformed frames ``[C, T, H, W]`` (or the *frames* of them)."""
+    return _get_blender(mode).temporal_cthw(prev_tail, cur_head, overlap, frames=frames)
 
 
 def _compute_dit_tiles(
@@ -188,8 +191,6 @@ def process_pix_chunk(
     _reset_ctx(ctx)
 
     def _peak_vram_gb():
-        if torch.backends.mps.is_available():
-            return torch.mps.driver_allocated_memory() / (1024 ** 3) if hasattr(torch.mps, 'driver_allocated_memory') else 0.0
         if torch.cuda.is_available():
             free, total = torch.cuda.mem_get_info()
             return (total - free) / (1024 ** 3)
@@ -204,10 +205,7 @@ def process_pix_chunk(
     t_enc_end = time.time()
     vram_encode = getattr(runner, '_trt_vram_encode', None) or _peak_vram_gb()
 
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    elif torch.backends.mps.is_available():
-        torch.mps.empty_cache()
+    torch.cuda.empty_cache()
 
     # Phase 2 -- DiT Upscale
     # cache_model=True keeps runner.dit alive for subsequent chunks
@@ -231,10 +229,7 @@ def process_pix_chunk(
     t_dit_end = time.time()
     vram_dit = _peak_vram_gb()
 
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    elif torch.backends.mps.is_available():
-        torch.mps.empty_cache()
+    torch.cuda.empty_cache()
 
     # Phase 3 -- VAE Decode
     # cache_model=True keeps runner.vae alive for subsequent chunks
@@ -263,7 +258,7 @@ def process_pix_chunk(
 
     # ── Legacy path: materialise full tensors ──
     decoded = ctx['decoded_video']
-    if decoded.is_cuda or (hasattr(decoded, 'is_mps') and decoded.is_mps):
+    if decoded.is_cuda:
         decoded = decoded.cpu()
 
     _vpp = ctx.get('vpp')
@@ -325,6 +320,29 @@ def _postprocess_frames_inline(
 _STREAM_PP_BATCH = 4  # frames per streaming post-process batch
 
 
+def _detach_chunk_memmaps(decode_meta: dict) -> None:
+    """Give a chunk's post-processing its own view of the VPP: the chunk's reference
+    ("input") and tile memmaps move out of the shared registry into a shallow copy, so
+    the next chunk can ingest and decode (same names) while this one is post-processed;
+    the copy's cleanup deletes exactly this chunk's files."""
+    import copy
+    vpp = decode_meta.get('vpp')
+    if vpp is None:
+        return
+    own = copy.copy(vpp)
+    own._memmaps = {}
+    own._writer = None      # the output writer stays the pipeline's: the copy's cleanup (also run by
+                            # its __del__) must only delete this chunk's memmaps, never close the writer
+    if vpp._memmaps.get("input") is not None:
+        own._memmaps["input"] = vpp._memmaps.pop("input")
+    for info in decode_meta.get('tile_infos', []):
+        name = info.get("vpp_name")
+        mm = vpp._memmaps.get(name) if name else None
+        if mm is not None and getattr(mm, "path", None) == info.get("path"):
+            own._memmaps[name] = vpp._memmaps.pop(name)
+    decode_meta['vpp'] = own
+
+
 def _streaming_postprocess_chunk(
     decode_meta: dict,
     ci: int,
@@ -352,7 +370,7 @@ def _streaming_postprocess_chunk(
     """
     import numpy as np
     from ..video_utils.tile_assembly import (
-        assemble_tiles_from_disk_range, cleanup_tile_files,
+        assemble_tiles_from_disk_range, assemble_tiles_from_disk_range_gpu, cleanup_tile_files,
     )
 
     tile_infos = decode_meta['tile_infos']
@@ -362,9 +380,19 @@ def _streaming_postprocess_chunk(
     _vpp = decode_meta.get('vpp')
     _has_transform_ref = (_vpp is not None and _vpp.get_memmap("input") is not None)
 
+    _gpu_assembly = torch.cuda.is_available() and os.environ.get("POSTPROCESS_ON_GPU", "1") == "1"
+
     def _read_decoded_range(start, count):
         """Assemble spatial tiles for frames [start : start+count]."""
         count = min(count, T_pix - start)
+        if _gpu_assembly:                       # same blending on the GPU; stays there for post-processing
+            dec = assemble_tiles_from_disk_range_gpu(
+                tile_infos, pixel_H, pixel_W, start, count,
+                blend_mode=vae_tile_blend,
+            )
+            if _vpp is not None and _vpp.needs_resize_back:
+                dec = _vpp.resize_back(dec)
+            return dec
         dec_np = assemble_tiles_from_disk_range(
             tile_infos, pixel_H, pixel_W, start, count,
             blend_mode=vae_tile_blend,
@@ -382,6 +410,24 @@ def _streaming_postprocess_chunk(
         if _vpp.needs_resize_back:
             t = _vpp.resize_back(t)
         return t
+
+    def _read_tail(start, count):
+        """Overlap tail for the next chunk, in CPU memory (no GPU memory held across chunks),
+        filled a batch at a time so no full-size temporaries are allocated."""
+        dec = trans = None
+        for fs in range(start, start + count, _STREAM_PP_BATCH):
+            cnt = min(_STREAM_PP_BATCH, start + count - fs)
+            d = _read_decoded_range(fs, cnt)
+            t = _read_transform_range(fs, cnt)
+            if dec is None:
+                dec = torch.empty((count,) + tuple(d.shape[1:]), dtype=d.dtype)
+                if t is not None:
+                    trans = torch.empty((t.shape[0], count) + tuple(t.shape[2:]), dtype=t.dtype)
+            dec[fs - start:fs - start + cnt] = d
+            if t is not None:
+                trans[:, fs - start:fs - start + cnt] = t
+            del d, t
+        return dec, trans
 
     def _cleanup_all():
         """Clean up tile files."""
@@ -414,9 +460,7 @@ def _streaming_postprocess_chunk(
                 trans_b = _read_transform_range(fs, cnt)
                 pp_func(dec_b, trans_b)
                 del dec_b, trans_b
-            # Read overlap tail into memory (small: ~21 frames).
-            new_ov_dec = _read_decoded_range(safe_end, overlap)
-            new_ov_trans = _read_transform_range(safe_end, overlap)
+            new_ov_dec, new_ov_trans = _read_tail(safe_end, overlap)
             _cleanup_all()
             return new_ov_dec, new_ov_trans
     else:
@@ -426,22 +470,29 @@ def _streaming_postprocess_chunk(
             actual_overlap = min(actual_overlap, overlap_dec.shape[0])
 
         if actual_overlap > 0 and overlap_dec is not None:
-            cur_head_dec = _read_decoded_range(skip, actual_overlap)
-            cur_head_trans = _read_transform_range(skip, actual_overlap)
-            blended_dec = _blend_overlapping_frames(
-                overlap_dec, cur_head_dec, actual_overlap, mode=blend_mode,
-            )
-            blended_trans = None
-            if overlap_trans is not None and cur_head_trans is not None:
-                blended_trans = _blend_overlapping_transformed(
-                    overlap_trans, cur_head_trans, actual_overlap, mode=blend_mode,
+            # blend + post-process the overlap a batch at a time (per-frame weights sliced to
+            # match; colour correction is per frame), so no overlap-sized temporaries
+            for fs in range(0, actual_overlap, _STREAM_PP_BATCH):
+                fr = slice(fs, min(fs + _STREAM_PP_BATCH, actual_overlap))
+                cnt = fr.stop - fr.start
+                cur_head_dec = _read_decoded_range(skip + fs, cnt)
+                cur_head_trans = _read_transform_range(skip + fs, cnt)
+                blended_dec = _blend_overlapping_frames(
+                    overlap_dec[fr].to(cur_head_dec.device), cur_head_dec, actual_overlap,
+                    mode=blend_mode, frames=fr,
                 )
+                blended_trans = None
+                if overlap_trans is not None and cur_head_trans is not None:
+                    blended_trans = _blend_overlapping_transformed(
+                        overlap_trans[:, fr], cur_head_trans, actual_overlap,
+                        mode=blend_mode, frames=fr,
+                    )
+                pp_func(blended_dec, blended_trans)
+                del blended_dec, blended_trans, cur_head_dec, cur_head_trans
             debug.log(
                 f"Blended {actual_overlap} overlapping frames",
                 category="video", indent_level=1,
             )
-            pp_func(blended_dec, blended_trans)
-            del blended_dec, blended_trans, cur_head_dec, cur_head_trans
 
         # Stream the non-overlap remainder.
         rest_start = skip + actual_overlap
@@ -468,8 +519,7 @@ def _streaming_postprocess_chunk(
             _cleanup_all()
             return None, None
         else:
-            new_ov_dec = _read_decoded_range(T_pix - overlap, overlap)
-            new_ov_trans = _read_transform_range(T_pix - overlap, overlap)
+            new_ov_dec, new_ov_trans = _read_tail(T_pix - overlap, overlap)
             _cleanup_all()
             return new_ov_dec, new_ov_trans
 
@@ -711,6 +761,11 @@ def process_video_pix_chunked(
         # stream finalized frames via callback.
         overlap_dec: Optional[torch.Tensor] = None     # [overlap, H, W, C]
         overlap_trans: Optional[torch.Tensor] = None    # [C, overlap, H, W]
+        from concurrent.futures import ThreadPoolExecutor
+        _post_pool = (ThreadPoolExecutor(max_workers=1)
+                      if os.environ.get("POSTPROCESS_PIPELINE", "1") == "1" else None)
+        _post_pending = []
+        _pp_state = {"overlap": (None, None), "busy": 0.0}
 
         for ci, (ws, we) in enumerate(read_windows):
             chunk_len = min(we, T_total) - ws
@@ -802,21 +857,35 @@ def process_video_pix_chunked(
             # tile memmaps.  Assemble + post-process in temporal batches
             # of _STREAM_PP_BATCH frames to avoid the 12 GB peak.
             if isinstance(decoded, dict):
-                decoded, transformed = _streaming_postprocess_chunk(
-                    decoded, ci, num_chunks, is_last, overlap,
-                    extra_skip[ci], overlap_dec, overlap_trans,
-                    _pp, debug,
-                    blend_mode=ctx.get('_temporal_blend', 'hann'),
-                    vae_tile_blend=ctx.get('_vae_tile_blend', 'cosine'),
-                )
-                # _streaming_postprocess_chunk handles blending, _pp calls,
-                # and returns new overlap buffers.
-                if decoded is not None:
-                    overlap_dec = decoded
-                    overlap_trans = transformed
+                # Post-processing of this chunk runs on a background worker while the next
+                # chunk encodes / runs the DiT / decodes. The worker owns this chunk's memmaps
+                # (detached from the shared registry: the next chunk's ingest and tiles reuse
+                # the names) and passes the overlap tail from one chunk's job to the next.
+                _detach_chunk_memmaps(decoded)
+                if overlap_dec is not None and _pp_state["overlap"] == (None, None):
+                    _pp_state["overlap"] = (overlap_dec, overlap_trans)
+                overlap_dec = overlap_trans = None
+
+                def _post_job(meta=decoded, ci=ci, is_last=is_last, skip=extra_skip[ci]):
+                    tj0 = time.time()
+                    ov_dec, ov_trans = _pp_state["overlap"]
+                    _pp_state["overlap"] = _streaming_postprocess_chunk(
+                        meta, ci, num_chunks, is_last, overlap,
+                        skip, ov_dec, ov_trans,
+                        _pp, debug,
+                        blend_mode=ctx.get('_temporal_blend', 'hann'),
+                        vae_tile_blend=ctx.get('_vae_tile_blend', 'cosine'),
+                    )
+                    _pp_state["busy"] += time.time() - tj0
+
+                if _post_pool is None:
+                    _post_job()
                 else:
-                    overlap_dec = None
-                    overlap_trans = None
+                    _post_pending.append(_post_pool.submit(_post_job))
+                    for f in _post_pending:              # a failed job stops the pipeline now
+                        if f.done():
+                            f.result()
+                decoded = transformed = None
             else:
                 # ── Legacy tensor path (non-hybrid) ──
                 if ci == 0:
@@ -899,6 +968,19 @@ def process_video_pix_chunked(
                 clear_memory(debug=debug, force=True)
             elif video_ended_early:
                 break
+
+        # Wait for the background post-processing (the part not hidden behind GPU work)
+        t_wait0 = time.time()
+        for f in _post_pending:
+            f.result()
+        if _post_pool is not None:
+            _post_pool.shutdown()
+            logger.info("[Profile] Background post-processing: %.2fs of work, %.2fs not overlapped",
+                        _pp_state["busy"], time.time() - t_wait0)
+        if _post_pending or _pp_state["overlap"] != (None, None):
+            total_post_time += time.time() - t_wait0
+            if overlap_dec is None:
+                overlap_dec, overlap_trans = _pp_state["overlap"]
 
         # Flush any remaining overlap buffer (shouldn't normally happen)
         if overlap_dec is not None and overlap_dec.shape[0] > 0:
@@ -1114,7 +1196,7 @@ def process_video_pix_chunked(
 
         result = ctx['final_video']
         if isinstance(result, torch.Tensor):
-            if result.is_cuda or (hasattr(result, 'is_mps') and result.is_mps):
+            if result.is_cuda:
                 result = result.cpu()
 
         return result, timings

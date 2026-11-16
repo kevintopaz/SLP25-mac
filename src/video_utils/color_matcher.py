@@ -4,9 +4,8 @@ Consolidates the color correction if/elif dispatch that was previously
 duplicated across generation_phases.py, generation_phases_latent.py,
 and generation_phases_pix.py into one canonical implementation.
 
-Supports per-method overrides so that platform-specific backends (e.g.
-MLX-accelerated wavelet) can be injected at construction time without
-monkey-patching the underlying module.
+Supports per-method overrides so alternative implementations can be
+injected at construction time without monkey-patching the underlying module.
 """
 
 import logging
@@ -31,20 +30,7 @@ class ColorMatcher:
         Mapping of ``{method_name: callable}`` that replaces the built-in
         implementation for that method.  Each callable must accept
         ``(content, reference, debug)`` and return a tensor with the same
-        layout.  This is the preferred way to inject platform-specific
-        backends (e.g. an MLX wavelet implementation) instead of
-        monkey-patching ``color_fix`` at the module level.
-
-    Example
-    -------
-    ::
-
-        from src.utils.color_fix_mlx import wavelet_reconstruction_mlx
-
-        matcher = ColorMatcher(
-            method="wavelet",
-            overrides={"wavelet": wavelet_reconstruction_mlx},
-        )
+        layout.
     """
 
     SUPPORTED = frozenset({

@@ -16,7 +16,6 @@ from ..optimization.memory_manager import (
     get_basic_vram_info, 
     get_ram_usage, 
     reset_vram_peak,
-    is_mps_available,
     is_cuda_available
 )
 from ..utils.constants import __version__
@@ -174,9 +173,6 @@ class Debug:
             except Exception:
                 gpu_str = "CUDA"
                 cudnn_ver = "N/A"
-        elif is_mps_available():
-            gpu_str = "Apple Silicon (MPS)"
-            cudnn_ver = "N/A"
         else:
             gpu_str = "CPU"
             cudnn_ver = "N/A"
@@ -429,8 +425,7 @@ class Debug:
     
     def _collect_memory_metrics(self) -> Dict[str, Any]:
         """Collect current memory metrics."""
-        is_mps = is_mps_available()
-        has_gpu = is_mps or is_cuda_available()
+        has_gpu = is_cuda_available()
         
         metrics = {
             'vram_allocated': 0.0,
@@ -457,9 +452,8 @@ class Debug:
                 metrics['vram_total'] = vram_info["total_gb"]
                 metrics['vram_overflow'] = max(0.0, metrics['vram_peak_rsv'] - metrics['vram_total'])
                 
-                backend = "GPU" if is_mps else "VRAM"
                 metrics['summary_vram'] = (
-                    f"  [{backend}] {metrics['vram_allocated']:.2f}GB allocated / "
+                    f"  [VRAM] {metrics['vram_allocated']:.2f}GB allocated / "
                     f"{metrics['vram_reserved']:.2f}GB reserved / "
                     f"Peak: {metrics['vram_peak_alloc']:.2f}GB / "
                     f"{metrics['vram_free']:.2f}GB free / "
@@ -504,7 +498,7 @@ class Debug:
             try:
                 if torch.is_tensor(obj):
                     stats['total_count'] += 1
-                    is_gpu = obj.is_cuda or (hasattr(obj, 'is_mps') and obj.is_mps)
+                    is_gpu = obj.is_cuda
                     
                     if is_gpu:
                         stats['gpu_count'] += 1
@@ -616,14 +610,11 @@ class Debug:
             'phase4': 'Post-processing'
         }
         
-        is_mps = is_mps_available()
-        
         # Get total VRAM for overflow formatting (Windows only)
         total_vram_gb = 0.0
-        if not is_mps:
-            vram_info = get_basic_vram_info(device=None)
-            if "error" not in vram_info:
-                total_vram_gb = vram_info["total_gb"]
+        vram_info = get_basic_vram_info(device=None)
+        if "error" not in vram_info:
+            total_vram_gb = vram_info["total_gb"]
         
         self.log("", category="none", force=force)
         self.log("────────────────────────", category="none", force=force)
@@ -637,21 +628,15 @@ class Debug:
             rsv = self.phase_vram_peaks_rsv.get(phase_key, 0)
             ram = self.phase_ram_peaks.get(phase_key, 0)
             
-            if is_mps:
-                self.log(f"{phase_num}. {phase_name}: {alloc:.2f}GB", category="memory", indent_level=1, force=force)
-            else:
-                rsv_str = _format_peak_with_overflow(rsv, total_vram_gb)
-                self.log(f"{phase_num}. {phase_name}: VRAM {alloc:.2f}GB allocated, {rsv_str} | RAM {ram:.2f}GB", category="memory", indent_level=1, force=force)
+            rsv_str = _format_peak_with_overflow(rsv, total_vram_gb)
+            self.log(f"{phase_num}. {phase_name}: VRAM {alloc:.2f}GB allocated, {rsv_str} | RAM {ram:.2f}GB", category="memory", indent_level=1, force=force)
         
         overall_alloc = max(self.phase_vram_peaks_alloc.values()) if self.phase_vram_peaks_alloc else 0
         overall_rsv = max(self.phase_vram_peaks_rsv.values()) if self.phase_vram_peaks_rsv else 0
         overall_ram = max(self.phase_ram_peaks.values()) if self.phase_ram_peaks else 0
         
-        if is_mps:
-            self.log(f"Overall peak: {overall_alloc:.2f}GB", category="memory", force=force)
-        else:
-            overall_rsv_str = _format_peak_with_overflow(overall_rsv, total_vram_gb)
-            self.log(f"Overall peak: VRAM {overall_alloc:.2f}GB allocated, {overall_rsv_str} | RAM {overall_ram:.2f}GB", category="memory", force=force)
+        overall_rsv_str = _format_peak_with_overflow(overall_rsv, total_vram_gb)
+        self.log(f"Overall peak: VRAM {overall_alloc:.2f}GB allocated, {overall_rsv_str} | RAM {overall_ram:.2f}GB", category="memory", force=force)
     
     @torch._dynamo.disable  # Skip tracing to avoid time.time() warnings
     def _store_checkpoint(self, label: str, metrics: Dict[str, Any]) -> None:

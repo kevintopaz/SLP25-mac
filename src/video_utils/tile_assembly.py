@@ -2,7 +2,7 @@
 
 Pure NumPy operations for blending overlapping spatial tiles from disk-backed
 memmaps.  These functions are VAE-agnostic — they only need the ``tile_infos``
-dict list produced by any tiled decoder (MLX, MPS, etc.).
+dict list produced by any tiled decoder.
 """
 
 import logging
@@ -213,6 +213,56 @@ def assemble_tiles_from_disk_range(tile_infos, pixel_H, pixel_W,
         del tile_data
 
     return output.astype(np.float16)
+
+
+_GPU_WEIGHTS = {}
+
+
+def assemble_tiles_from_disk_range_gpu(tile_infos, pixel_H, pixel_W,
+                                       frame_start, frame_count,
+                                       blend_mode="cosine", device="cuda"):
+    """``assemble_tiles_from_disk_range`` on the GPU: same arithmetic (fp16 decode
+    of the stored pixels, float32 weights from the same numpy code, float32
+    multiply then add, fp16 result), so the result is identical -- returned as a
+    ``(frame_count, H, W, 3)`` float16 tensor on ``device``."""
+    import torch
+    if not tile_infos:
+        raise ValueError("No tile_infos provided")
+    key = (tuple((i["path"], i["pixel_h"], i["pixel_w"]) for i in tile_infos), pixel_H, pixel_W, blend_mode, str(device))
+    weights = _GPU_WEIGHTS.get(key)
+    if weights is None:
+        _GPU_WEIGHTS.clear()                                   # one tiling at a time
+        total_wt, tile_H, tile_W, ov_H, ov_W, n_h, n_w = \
+            _compute_total_weight(tile_infos, pixel_H, pixel_W, blend_mode)
+        weights = []
+        for info in tile_infos:
+            ph, pw = info["pixel_h"], info["pixel_w"]
+            clip_h = min(tile_H, pixel_H - ph)
+            clip_w = min(tile_W, pixel_W - pw)
+            bw = make_blend_weight(tile_H, tile_W, (ov_H, ov_W), n_h, n_w, info["ti"], info["tj"],
+                                   blend_mode=blend_mode)[:clip_h, :clip_w]
+            norm_bw = bw / total_wt[ph:ph + clip_h, pw:pw + clip_w]
+            weights.append((torch.from_numpy(np.ascontiguousarray(norm_bw))[None, :, :, None].to(device), clip_h, clip_w))
+        _GPU_WEIGHTS[key] = weights
+    output = torch.zeros((frame_count, pixel_H, pixel_W, 3), dtype=torch.float32, device=device)
+    fs, fe = frame_start, frame_start + frame_count
+    for info, (w, clip_h, clip_w) in zip(tile_infos, weights):
+        _tile_dtype = np.dtype(info.get("dtype", "uint8"))
+        mm = np.memmap(info["path"], dtype=_tile_dtype, mode='r', shape=tuple(info["shape"]))
+        raw = np.array(mm[fs:fe])
+        del mm
+        t = torch.from_numpy(raw).to(device)
+        if _tile_dtype == np.uint8:
+            t = t.half() / 127.5 - 1.0                         # fp16 ops, as numpy's float16 math
+        elif _tile_dtype == np.uint16:
+            t = t.to(torch.int32).half() / 32767.5 - 1.0
+        else:
+            t = t.half()
+        ph, pw = info["pixel_h"], info["pixel_w"]
+        prod = t[:, :clip_h, :clip_w, :].float() * w           # multiply, then add: no fused rounding
+        output[:, ph:ph + clip_h, pw:pw + clip_w, :] += prod
+        del t, prod
+    return output.half()
 
 
 # ── Cleanup ──────────────────────────────────────────────────────────────────

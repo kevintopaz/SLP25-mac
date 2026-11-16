@@ -671,7 +671,6 @@ def call_rope_with_stability(method, *args, **kwargs):
         method.cache_clear()
     
     # Only use CUDA autocast context on CUDA devices
-    # MPS has no CUDA autocast to disable
     if torch.cuda.is_available():
         with torch.cuda.amp.autocast(enabled=False):
             return method(*args, **kwargs)
@@ -687,12 +686,10 @@ class CompatibleDiT(torch.nn.Module):
     - FP8: Keeps native FP8 parameters (memory efficient), converts inputs/outputs to compute_dtype for arithmetic
     - FP16/BFloat16/Float32: Uses native precision throughout
     - GGUF: On-the-fly dequantization to compute_dtype
-    - MPS: Forces all parameters to compute_dtype (unified memory requires dtype consistency)
     - RoPE: Converted from FP8 to compute_dtype for numerical consistency
     
     Optimizations:
     - RoPE Stabilization: Error handling for numerical stability in mixed precision
-    - MPS Compatibility: Unified dtype conversion for Apple Silicon backends
     """
     
     def __init__(self, dit_model, debug: 'Debug', compute_dtype: torch.dtype = torch.bfloat16, skip_conversion: bool = False):
@@ -714,15 +711,6 @@ class CompatibleDiT(torch.nn.Module):
             self._convert_rope_freqs(target_dtype=self.compute_dtype)
             self.debug.end_timer("_convert_rope_freqs", "RoPE freqs conversion")
         
-        # MPS requires unified dtype for all parameters/buffers (no autocast fallback)
-        # Apply to ALL model types (FP8, FP16, GGUF) when dtype differs from compute_dtype
-        if not skip_conversion and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            if self.model_dtype != self.compute_dtype:
-                self.debug.log(f"Converting model parameters to {self.compute_dtype}", category="setup")
-                self.debug.start_timer("_force_nadit_precision")
-                self._force_nadit_precision(target_dtype=self.compute_dtype)
-                self.debug.end_timer("_force_nadit_precision", "NaDiT parameters/buffers conversion")
-            
         # Apply RoPE stabilization for numerical stability
         self.debug.log(f"Stabilizing RoPE computations for numerical stability", category="setup")
         self.debug.start_timer("_stabilize_rope_computations")
@@ -758,58 +746,10 @@ class CompatibleDiT(torch.nn.Module):
             if 'RotaryEmbedding' in type(module).__name__:
                 if hasattr(module, 'rope') and hasattr(module.rope, 'freqs'):
                     if module.rope.freqs.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-                        if module.rope.freqs.device.type == "mps":
-                            module.rope.freqs.data = module.rope.freqs.to("cpu").to(target_dtype).to("mps")
-                        else:
-                            module.rope.freqs.data = module.rope.freqs.to(target_dtype)
+                        module.rope.freqs.data = module.rope.freqs.to(target_dtype)
                         converted += 1
         self.debug.log(f"Converted {converted} RoPE frequency buffers from FP8 to {target_dtype} for compatibility", category="success")
                         
-    def _force_nadit_precision(self, target_dtype: torch.dtype = torch.bfloat16) -> None:
-        """
-        Force ALL NaDiT parameters to target dtype to avoid promotion errors (MPS requirement).
-        
-        Args:
-            target_dtype: Target dtype for all parameters (default: bfloat16 for MPS compatibility)
-        """
-        converted_count = 0
-        original_dtype = None
-        
-        # Convert ALL parameters to target dtype
-        for name, param in self.dit_model.named_parameters():
-            if original_dtype is None:
-                original_dtype = param.dtype
-            if param.dtype != target_dtype:
-                if param.device.type == "mps":
-                    temp_cpu = param.data.to("cpu")
-                    temp_converted = temp_cpu.to(target_dtype)
-                    param.data = temp_converted.to("mps")
-                    del temp_cpu, temp_converted
-                else:
-                    param.data = param.data.to(target_dtype)
-                converted_count += 1
-                
-        # Also convert buffers (skip GGUF quantized buffers - they have tensor_type attribute)
-        for name, buffer in self.dit_model.named_buffers():
-            # Skip GGUF quantized buffers - these must stay in packed format for on-the-fly dequantization
-            if hasattr(buffer, 'tensor_type'):
-                continue
-            if buffer.dtype != target_dtype:
-                if buffer.device.type == "mps":
-                    temp_cpu = buffer.data.to("cpu")
-                    temp_converted = temp_cpu.to(target_dtype)
-                    buffer.data = temp_converted.to("mps")
-                    del temp_cpu, temp_converted
-                else:
-                    buffer.data = buffer.data.to(target_dtype)
-                converted_count += 1
-        
-        self.debug.log(f"Converted {converted_count} NaDiT parameters/buffers to {target_dtype} for MPS", category="success")
-        
-        # Update detected dtype
-        self.model_dtype = target_dtype
-        self.is_fp8_model = (target_dtype in (torch.float8_e4m3fn, torch.float8_e5m2))
-
     def _stabilize_rope_computations(self):
         """
         Add error handling to RoPE computations to prevent artifacts.

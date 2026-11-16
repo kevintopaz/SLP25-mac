@@ -59,6 +59,8 @@ class Blend:
             Override the instance default.
         """
         mode = mode or self.mode
+        device = torch.device("cpu")    # a handful of values: computed on the CPU whatever the data's device,
+                                        # so GPU blending uses exactly the same weights as CPU blending
 
         if mode == "hann" and n >= 3:
             t = torch.linspace(0.0, 1.0, steps=n, device=device, dtype=dtype)
@@ -84,8 +86,12 @@ class Blend:
         cur_head: torch.Tensor,
         overlap: int,
         mode: Optional[str] = None,
+        frames: Optional[slice] = None,
     ) -> torch.Tensor:
         """Blend overlapping frames in ``[T, H, W, C]`` layout.
+
+        With *frames*, the inputs hold only those frames of the *overlap*-frame
+        blend (weights sliced to match), so a long overlap can be blended in batches.
 
         Parameters
         ----------
@@ -99,7 +105,9 @@ class Blend:
             Override the instance default blending mode.
         """
         w = self._weights(overlap, prev_tail.device, prev_tail.dtype, mode)
-        w = w.view(overlap, 1, 1, 1)
+        if frames is not None:
+            w = w[frames]
+        w = w.to(prev_tail.device).view(-1, 1, 1, 1)
         return prev_tail * w + cur_head * (1.0 - w)
 
     def temporal_cthw(
@@ -108,10 +116,13 @@ class Blend:
         cur_head: torch.Tensor,
         overlap: int,
         mode: Optional[str] = None,
+        frames: Optional[slice] = None,
     ) -> torch.Tensor:
-        """Blend overlapping frames in ``[C, T, H, W]`` layout."""
+        """Blend overlapping frames in ``[C, T, H, W]`` layout (*frames*: see ``temporal_thwc``)."""
         w = self._weights(overlap, prev_tail.device, prev_tail.dtype, mode)
-        w = w.view(1, overlap, 1, 1)
+        if frames is not None:
+            w = w[frames]
+        w = w.to(prev_tail.device).view(1, -1, 1, 1)
         return prev_tail * w + cur_head * (1.0 - w)
 
     # ------------------------------------------------------------------ #

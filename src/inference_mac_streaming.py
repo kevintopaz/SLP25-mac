@@ -257,8 +257,8 @@ def _system_ram_gb() -> float:
 
 _TOTAL_RAM_GB = _system_ram_gb()
 
-if "MLX_DIT_TILE_FIRST" not in os.environ:
-    os.environ["MLX_DIT_TILE_FIRST"] = "1" if _TOTAL_RAM_GB < 24 else "0"
+if "DIT_TILE_FIRST" not in os.environ:
+    os.environ["DIT_TILE_FIRST"] = "1" if _TOTAL_RAM_GB < 24 else "0"
 
 VAE_ENCODE_TILE_SIZE = (640, 640) 
 VAE_ENCODE_TILE_OVERLAP = (80, 80) 
@@ -857,8 +857,8 @@ class VideoUpscaler:
             # Plain (unencrypted) split checkpoints only; pixel chunking only.
             if nmap:
                 raise NotImplementedError("NEURO_DIT=1 does not support encrypted model files yet")
-            from .neuroplatform_dit import create_neuroplatform_dit
-            self.streaming_dit = create_neuroplatform_dit(split_dir)
+            from .neuroplatform_port import create_dit
+            self.streaming_dit = create_dit(split_dir)
         else:
             self.streaming_dit = MLXNaDiT(
                 io_paths=io_paths,

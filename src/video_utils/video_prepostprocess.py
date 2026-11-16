@@ -30,6 +30,8 @@ Typical usage::
 import logging
 from typing import Any, Callable, Dict, Literal, Optional, Tuple, Union
 
+import os
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -38,10 +40,12 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
 
 from .color_matcher import ColorFn, ColorMatcher
-from .transform_memmap import TransformMemmap
+from .transform_memmap import TransformMemmap, drop_mapped_pages
 from .usm_sharpener import USMSharpener
 
 logger = logging.getLogger(__name__)
+
+_REF_READ_BATCH = 4  # frames per float32 conversion step in read_reference
 
 
 # ====================================================================== #
@@ -173,7 +177,7 @@ class ResizeDivisible:
         self._pad_bottom = padded_h - true_h
         self._pad_right = padded_w - true_w
 
-        antialias = not (isinstance(image, torch.Tensor) and image.device.type == 'mps')
+        antialias = True
 
         already_target = (height == true_h and width == true_w)
 
@@ -381,7 +385,7 @@ class VideoPrePostProcess:
     color_overrides : dict, optional
         Mapping of ``{method_name: callable}`` forwarded to
         ``ColorMatcher(overrides=...)``.  Use this to inject
-        platform-specific backends (e.g. MLX wavelet) instead of
+        alternative implementations instead of
         monkey-patching ``color_fix`` at the module level.
     """
 
@@ -648,7 +652,7 @@ class VideoPrePostProcess:
 
     def read_reference(
         self, start: int = 0, count: Optional[int] = None,
-        as_cthw: bool = True, name: str = "input",
+        as_cthw: bool = True, name: str = "input", device: Optional[str] = None,
     ) -> torch.Tensor:
         """Read frames as ``[-1, 1]`` float16 torch tensor (delegates to ``read_tile``).
 
@@ -659,8 +663,20 @@ class VideoPrePostProcess:
             raise RuntimeError(f"No memmap[{name!r}] — call ingest() or create_memmap() first")
         if count is None:
             count = mm.shape[0] - start
-        tile_np = self.read_tile(start, count, name=name)
-        t = torch.from_numpy(tile_np)
+        # the same float32 steps as read_tile (identical values), as torch ops: multi-threaded on
+        # the CPU (numpy's are single-threaded), or on `device`
+        mm._ensure_mapped()
+        scale = 65535.0 if self.source_bit_depth > 8 else 255.0
+        src = mm._mm[start:start + count]
+        t = torch.empty(src.shape, dtype=torch.float16, device=device or "cpu")
+        # a few frames at a time, in place: float32 temporaries stay small (a 21-frame 4K
+        # overlap read otherwise allocates several GB of float32); same ops, same values
+        for s in range(0, src.shape[0], _REF_READ_BATCH):
+            raw = torch.from_numpy(np.array(src[s:s + _REF_READ_BATCH]))
+            if device is not None:
+                raw = raw.to(device)
+            t[s:s + raw.shape[0]] = raw.float().div_(scale).mul_(2.0).sub_(1.0)
+        drop_mapped_pages(mm._mm, start, count)   # read once per frame; don't keep it resident
         if as_cthw:
             t = t.permute(3, 0, 1, 2)  # THWC → CTHW
         return t
@@ -756,6 +772,9 @@ class VideoPrePostProcess:
             return np.empty((0,) + tuple(decoded.shape[1:]),
                             dtype=self.output_dtype)
 
+        # without sharpening, results stay on the GPU and are quantized there (same float32 math)
+        gpu_out = (str(device).startswith("cuda") and self._usm_sharpener.weight <= 0
+                   and os.environ.get("POSTPROCESS_ON_GPU", "1") == "1")
         if self._color_matcher.method != "none" and reference is not None:
             ref_cpu = reference.permute(1, 0, 2, 3)  # [C,T,H,W] → [T,C,H,W]
             T_ref = ref_cpu.shape[0]
@@ -783,24 +802,26 @@ class VideoPrePostProcess:
                     rc = ref_cpu[s:e].to(device)
                 vc = self._color_matcher.apply(vc, rc)
                 vc.clamp_(-1, 1).mul_(0.5).add_(0.5)
-                result_chunks.append(
-                    vc.permute(0, 2, 3, 1).float().cpu()
-                )
+                vc = vc.permute(0, 2, 3, 1).float()
+                result_chunks.append(vc if gpu_out else vc.cpu())
                 del rc
             del video
-            if torch.cuda.is_available():
+            if not gpu_out:
                 torch.cuda.empty_cache()
-            elif torch.backends.mps.is_available():
-                torch.mps.empty_cache()
             video_out = torch.cat(result_chunks, dim=0)
             del result_chunks, ref_cpu
         else:
-            video_out = self.denormalize_to_01(decoded).float()
+            video_out = self.denormalize_to_01(decoded.to(device) if gpu_out else decoded).float()
 
         if self._usm_sharpener.weight > 0:
             video_out = self._usm_sharpener.apply(video_out, device=device)
 
         scale = self.output_scale
+        if gpu_out and video_out.is_cuda:
+            q = (video_out * scale).clamp_(0, scale)
+            if self.output_dtype == np.uint8:
+                return q.to(torch.uint8).cpu().numpy()
+            return q.to(torch.int32).cpu().numpy().astype(self.output_dtype)
         return (video_out.cpu().numpy() * scale).clip(0, scale).astype(self.output_dtype)
 
     # ------------------------------------------------------------------ #

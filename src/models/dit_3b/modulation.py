@@ -77,13 +77,20 @@ class AdaSingle(nn.Module):
         emb = expand_dims(emb, 1, hid.ndim + 1)
 
         if hid_len is not None:
-            emb = cache(
-                f"emb_repeat_{idx}_{branch_tag}",
-                lambda: slice_inputs(
-                    torch.repeat_interleave(emb, hid_len, dim=0),
-                    dim=0,
-                ),
-            )
+            if hid_len.numel() == 1 and emb.shape[0] == 1 and _single_device():
+                # one sample: the cached per-token embedding would be the same row repeated for every
+                # token (tokens x dim x 3, ~4 GB per layer at 121 frames 1080p); cache the row itself
+                # (same key, so every reader -- including the output head -- gets the same values)
+                # and let broadcasting apply it
+                emb = cache(f"emb_repeat_{idx}_{branch_tag}", lambda: emb)
+            else:
+                emb = cache(
+                    f"emb_repeat_{idx}_{branch_tag}",
+                    lambda: slice_inputs(
+                        torch.repeat_interleave(emb, hid_len, dim=0),
+                        dim=0,
+                    ),
+                )
 
         shiftA, scaleA, gateA = emb.unbind(-1)
         shiftB, scaleB, gateB = (
@@ -119,3 +126,12 @@ class AdaSingle(nn.Module):
 
     def extra_repr(self) -> str:
         return f"dim={self.dim}, emb_dim={self.emb_dim}, layers={self.layers}"
+
+
+def _single_device() -> bool:
+    """No sequence parallelism (slice_inputs would split the per-token embedding)."""
+    try:
+        from ...common.distributed.advanced import get_sequence_parallel_world_size
+        return get_sequence_parallel_world_size() == 1
+    except Exception:
+        return True

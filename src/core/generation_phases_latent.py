@@ -515,7 +515,7 @@ def upscale_latent_chunked(
             dit_dtype = ctx['compute_dtype']
         
         # Use autocast if DiT dtype differs from compute dtype (e.g., fp16 model with bf16 compute)
-        use_autocast = dit_dtype != ctx['compute_dtype'] and ctx['dit_device'].type != 'mps'
+        use_autocast = dit_dtype != ctx['compute_dtype']
         
         debug.start_timer(f"dit_chunk_{chunk_idx}")
         _dit = getattr(runner, 'dit', None)
@@ -719,8 +719,8 @@ def _tiled_dit_block_first(
 ):
     """Block-first tiled DiT: load each block once, process all tiles through it.
 
-    Requires the underlying DiT to expose ``forward_tiles()``.
-    Falls back to per-tile ``runner.inference()`` if not available.
+    Requires the DiT to expose ``forward_many(calls)`` (models accelerated by
+    neuroplatform do: the calls run in lockstep, one block at a time).
     """
     from ..models.dit_3b import na
 
@@ -768,10 +768,13 @@ def _tiled_dit_block_first(
              category="dit", indent_level=1)
 
     # -- Block-first forward --------------------------------------------------
-    dit_outputs = dit_model.forward_tiles(
-        tile_vids, tile_vid_shapes, txt_embed, txt_shape, t_final,
-        progress_callback=progress_callback,
-    )
+    timestep = torch.as_tensor(t_final, device=device).reshape(1)
+    dit_outputs = dit_model.forward_many([
+        dict(vid=vid, txt=txt_embed, vid_shape=shape, txt_shape=txt_shape, timestep=timestep)
+        for vid, shape in zip(tile_vids, tile_vid_shapes)
+    ])
+    if progress_callback is not None:
+        progress_callback(num_tiles, num_tiles)
 
     # -- Sampler denoising per tile -------------------------------------------
     tile_results = []
@@ -820,12 +823,12 @@ def _tiled_dit_inference(
     # Holds num_tiles × per-block-activation simultaneously between blocks
     # — fast but high RAM peak. Tile-first (below) holds only one tile at
     # a time, ~4 GB cheaper at 4K, but re-loads each block per tile.
-    # Override with MLX_DIT_TILE_FIRST=1 to force the low-RAM path on
-    # systems where memory is tighter than disk bandwidth (e.g. <24 GB Macs).
+    # Override with DIT_TILE_FIRST=1 to force the low-RAM path on
+    # systems where memory is tighter than disk bandwidth.
     import os as _os
-    _force_tile_first = _os.environ.get("MLX_DIT_TILE_FIRST", "0") == "1"
+    _force_tile_first = _os.environ.get("DIT_TILE_FIRST", "0") == "1"
     dit_model = runner.dit.dit_model if hasattr(runner.dit, 'dit_model') else runner.dit
-    if hasattr(dit_model, 'forward_tiles') and not _force_tile_first:
+    if hasattr(dit_model, 'forward_many') and not _force_tile_first:
         return _tiled_dit_block_first(
             runner, noises, conditions, text_embeds, ctx,
             tiles_info, T, H, W, C, overlap_h, overlap_w, debug,
@@ -992,9 +995,7 @@ def postprocess_latent_output(
         vpp.configure(color_method=color_correction,
                       usm_weight=usm_weight, usm_radius=usm_radius,
                       usm_threshold=usm_threshold)
-        gpu_device = ('cuda' if torch.cuda.is_available()
-                      else 'mps' if torch.backends.mps.is_available()
-                      else 'cpu')
+        gpu_device = 'cuda' if torch.cuda.is_available() else 'cpu'
         debug.log(f"Applying postprocess ({color_correction}, USM={usm_weight})",
                   category="color", force=True)
         video = vpp.color_correct_and_finalize(video, reference=reference, device=gpu_device)

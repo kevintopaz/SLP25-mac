@@ -27,6 +27,24 @@ from ..mm import MMArg, MMModule
 from ..mlp import get_mlp
     
 
+
+
+def _chunked_mlp(mlp, vid, txt):
+    """The MLP over video tokens in chunks (it is per token): its 4x-wide hidden layer
+    never exists for the whole sequence (DIT_WINDOW_GROUP_TOKENS, as the attention loop)."""
+    import os
+    lim = int(os.environ.get("DIT_WINDOW_GROUP_TOKENS", "16384"))
+    if lim <= 0 or vid.shape[0] <= lim:
+        return mlp(vid, txt)
+    out, txt_out = None, None
+    for s0 in range(0, vid.shape[0], lim):
+        v, t = mlp(vid[s0:s0 + lim], txt if txt_out is None else txt[:0])
+        if out is None:
+            out = v.new_empty((vid.shape[0],) + tuple(v.shape[1:]))
+            txt_out = t
+        out[s0:s0 + v.shape[0]] = v
+    return out, txt_out
+
 class NaMMSRTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -121,7 +139,7 @@ class NaMMSRTransformerBlock(nn.Module):
             txt_mlp = txt_mlp.to(txt_attn.dtype)
         # END BY NUMZ
         vid_mlp, txt_mlp = self.ada(vid_mlp, txt_mlp, layer="mlp", mode="in", **ada_kwargs)
-        vid_mlp, txt_mlp = self.mlp(vid_mlp, txt_mlp)
+        vid_mlp, txt_mlp = _chunked_mlp(self.mlp, vid_mlp, txt_mlp)
         vid_mlp, txt_mlp = self.ada(vid_mlp, txt_mlp, layer="mlp", mode="out", **ada_kwargs)
         vid_mlp, txt_mlp = (vid_mlp + vid_attn), (txt_mlp + txt_attn)
 

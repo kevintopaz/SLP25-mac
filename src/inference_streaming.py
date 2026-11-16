@@ -10,6 +10,10 @@ Architecture:
     - Pipeline: temporal chunking (generation_phases_pix/latent).
 """
 
+import os as _os
+# PyTorch's allocator without fragmentation between the pipeline's phases (the DiT reserved ~3 GB
+# more than it used); must be set before CUDA initializes
+_os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import sys
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -81,7 +85,7 @@ _CHUNK_DEFAULTS = {
 HYBRID_FIXED_WT = 9           # temporal attention window size for full-latent DiT
 DIT_LATENT_CHUNK = 0          # latent frames per DiT temporal chunk (0 = all at once)
 DIT_LATENT_OVERLAP = 0        # overlap in latent frames between DiT chunks
-HYBRID_TEMPORAL_ENCODE_SLICE = 5   # pixel frames per streaming encode slice
+HYBRID_TEMPORAL_ENCODE_SLICE = 17  # pixel frames per streaming encode slice (larger slices: fewer, fuller GPU calls)
 HYBRID_TEMPORAL_DECODE_SLICE = 5    # latent frames per streaming decode slice
 COLOR_CORRECTION = "wavelet"
 USM_WEIGHT = 0.0

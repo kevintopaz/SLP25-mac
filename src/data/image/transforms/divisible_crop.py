@@ -64,7 +64,7 @@ class DivisiblePad:
         if new_height == height and new_width == width:
             return image
 
-        antialias = not (isinstance(image, torch.Tensor) and image.device.type == 'mps')
+        antialias = True
         if isinstance(image, torch.Tensor):
             image = TVF.resize(image, [new_height, new_width],
                                interpolation=InterpolationMode.BILINEAR,

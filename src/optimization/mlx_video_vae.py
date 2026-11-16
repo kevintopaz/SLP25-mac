@@ -1074,6 +1074,7 @@ def _gpu_blend_paste(canvas, weight_canvas, tile, bw_5d, t_slice, h_slice, w_sli
     return canvas, weight_canvas
 
 
+from ..video_utils.transform_memmap import drop_mapped_pages  # noqa: E402
 # Re-export tile assembly functions (moved to src/video_utils/tile_assembly.py)
 from ..video_utils.tile_assembly import (  # noqa: E402, F401
     make_blend_weight as _make_blend_weight,
@@ -1172,6 +1173,7 @@ class MLXVideoVAE:
         _thwc_input = (input_layout == 'THWC')
         _need_normalize = (pixel_scale > 0)
         _owned_mm_path = None  # track internal memmap for cleanup
+        _src_mm = frames if isinstance(frames, np.memmap) else None  # np.asarray drops the memmap type
 
         if _cthw_input and not _need_normalize:
             frames_arr = np.asarray(frames)
@@ -1305,6 +1307,8 @@ class MLXVideoVAE:
                 del enc_full, bw5d
                 mx.eval(latent, lat_wt)
                 mx.clear_cache()
+                if _src_mm is not None:      # this tile's input pages are encoded: don't keep them resident
+                    drop_mapped_pages(_src_mm)
                 tc += 1
                 total_tiles = n_h * n_w
                 logger.debug(f"  Enc tile {tc}/{total_tiles}: {time.perf_counter()-t0:.1f}s")
@@ -1463,7 +1467,7 @@ class MLXVideoVAE:
                         actual_shape[2], actual_shape[3], mode=tile_dtype,
                     )
                     tmm.write_raw_batch(quantized, 0)
-                    tmm.flush()
+                    tmm.release()   # unmap: assembly opens its own read-only mapping per read
                     tile_path = tmm.path
                 else:
                     tile_path = os.path.join(tmp_dir, f"{tile_name}.dat")

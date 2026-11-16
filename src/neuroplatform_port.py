@@ -1,5 +1,6 @@
 """Model port: the unchanged PyTorch models of this repo, run on the machine's
-backend by neuroplatform (MLX on Apple silicon, PyTorch CUDA on NVIDIA/AMD).
+backends by neuroplatform (see PLACEMENT: which backend each model uses on each
+platform).
 
 This is the only file that talks to the platform layer. ``install()`` (called
 once by the entry script, a server adapter, or ``python -m neuroplatform.launch
@@ -12,6 +13,11 @@ once by the entry script, a server adapter, or ``python -m neuroplatform.launch
 The model-specific facts live here too: which config builds each model, where
 its weights are, and that on MLX the DiT's RoPE frequencies are computed with
 MLX (as the hand-written MLX DiT does).
+
+Which backend runs each model, and with what options, is decided here, per
+platform (PLACEMENT). For experiments it can be overridden without editing:
+NEURO_BACKEND_DIT / NEURO_BACKEND_VAE / NEURO_BACKEND_COLORFIX (one model),
+NEURO_BACKEND (all), NEURO_GGML_DIT_DTYPE / NEURO_GGML_VAE_DTYPE (f32, f16, bf16).
 """
 
 import os
@@ -50,12 +56,61 @@ def install() -> None:
     model_factory.create_dit = create_dit
     model_factory.create_vae = create_vae
     original = color_fix.wavelet_reconstruction
-    wavelet = neuroplatform.accelerate(lambda content, style: original(content, style))
+    backend, opts = placement("colorfix")
+    wavelet = neuroplatform.accelerate(lambda content, style: original(content, style), backend=backend, **opts)
     color_fix.wavelet_reconstruction = lambda content, style, debug=None: wavelet(content, style)
 
 
-def backend_name() -> str:
-    return neuroplatform.detect_backend()
+# ── placement: which backend runs each model, per platform ───────────────────
+
+# On ggml both models run in bf16: the DiT carries activations beyond the f16
+# range (73k from block 9), and the VAE overflows f16 on real video (its encoder
+# output turns to NaN). The colour fix is a few elementwise/conv ops on MLX.
+PLACEMENT = {
+    "apple": {"dit": ("ggml", {"ggml_dtype": "bf16"}),
+              "vae": ("ggml", {"ggml_dtype": "bf16"}),
+              "colorfix": ("mlx", {})},
+    "cuda": {"dit": ("torch", {}), "vae": ("torch", {}), "colorfix": ("torch", {})},   # NVIDIA, AMD (ROCm)
+    "cpu": {"dit": ("torch", {}), "vae": ("torch", {}), "colorfix": ("torch", {})},
+}
+
+
+def platform_name() -> str:
+    import platform
+    if sys.platform == "darwin" and platform.machine() == "arm64":
+        return "apple"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _available(backend: str) -> bool:
+    try:
+        if backend.startswith("ggml"):
+            from neuroplatform.backends import ggml_lib  # noqa: F401  (loads the library)
+        elif backend == "mlx":
+            import mlx.core  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def placement(kind: str):
+    """(backend, accelerate options) for a model kind: "dit", "vae", "colorfix"."""
+    backend, opts = PLACEMENT[platform_name()][kind]
+    forced = (os.environ.get(f"NEURO_BACKEND_{kind.upper()}") or os.environ.get("NEURO_BACKEND") or "").strip().lower()
+    if forced and forced != "auto" and forced != backend:
+        backend, opts = forced, {}
+    if not _available(backend):                  # e.g. the ggml library not built on this machine
+        fallback = neuroplatform.detect_backend()
+        print(f"neuroplatform_port: {backend} not available for {kind}; using {fallback}", file=sys.stderr)
+        backend, opts = fallback, {}
+    opts = dict(opts)
+    if backend.startswith("ggml"):
+        opts["ggml_dtype"] = os.environ.get(f"NEURO_GGML_{kind.upper()}_DTYPE", opts.get("ggml_dtype", "bf16"))
+    return backend, opts
+
+
+def backend_name(kind: str) -> str:
+    return placement(kind)[0]
 
 
 # ── DiT ─────────────────────────────────────────────────────────────────────
@@ -67,13 +122,13 @@ def create_dit(split_dir: str, device=None):
     weights = WeightFiles.from_split_manifest(os.path.join(split_dir, "block_manifest.json"))
     model = neuroplatform.build_model(
         lambda: create_object(load_config_from_string(CONFIG_YAML).dit.model), weights, dtype=torch.bfloat16)
-    backend = neuroplatform.detect_backend()
+    backend, opts = placement("dit")
     if backend == "mlx":
         mlx_rope_frequencies(model)
-    # Weights stream from the split blocks on every backend (MLX, or PyTorch on
-    # NVIDIA/AMD): about two blocks resident instead of the whole model.
+    # Weights stream from the split blocks on every backend (MLX, ggml, or PyTorch
+    # on NVIDIA/AMD): about two blocks resident instead of the whole model.
     return neuroplatform.accelerate(model, weights=weights, backend=backend, match_input_dtype=True,
-                                    stream_weights=True)
+                                    stream_weights=True, **opts)
 
 
 def mlx_rope_frequencies(model: torch.nn.Module, theta: float = 10000.0) -> torch.nn.Module:
@@ -105,6 +160,9 @@ def create_vae(vae_path: str, device=None) -> TiledVAE:
     model_cfg = OmegaConf.merge(cfg.vae.model, load_config_from_string(VAE_CONFIG_YAML))
     weights = WeightFiles({"": vae_path})
     vae = neuroplatform.build_model(lambda: create_object(model_cfg), weights, dtype=torch.bfloat16).eval()
-    vae.encoder = neuroplatform.accelerate(vae.encoder, weights=weights.scoped("encoder."))
-    vae.decoder = neuroplatform.accelerate(vae.decoder, weights=weights.scoped("decoder."))
+    backend, opts = placement("vae")
+    vae.encoder = neuroplatform.accelerate(vae.encoder, weights=weights.scoped("encoder."), backend=backend, **opts)
+    vae.decoder = neuroplatform.accelerate(vae.decoder, weights=weights.scoped("decoder."), backend=backend, **opts)
+    if vae.encoder.device.type == "cuda":    # ggml on CUDA exchanges CUDA tensors: the VAE's own
+        vae.to("cuda")                       # torch layers (quant convs) live there too
     return TiledVAE(vae, dtype=torch.bfloat16)

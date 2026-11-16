@@ -17,7 +17,6 @@ import torch
 from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TVF
-from ....optimization.memory_manager import is_mps_available
 
 class SideResize:
     def __init__(
@@ -31,8 +30,6 @@ class SideResize:
         self.max_size = max_size
         self.downsample_only = downsample_only
         self.interpolation = interpolation
-        if is_mps_available():
-            self.interpolation = InterpolationMode.BILINEAR
 
     def __call__(self, image: Union[torch.Tensor, Image.Image]):
         """
@@ -57,8 +54,8 @@ class SideResize:
         else:
             size = self.size
 
-        # Resize to shortest edge (disable antialias only for MPS tensors - not supported)
-        antialias = not (isinstance(image, torch.Tensor) and image.device.type == 'mps')
+        # Resize to shortest edge
+        antialias = True
         resized = TVF.resize(image, size, self.interpolation, antialias=antialias)
         
         # Apply max_size constraint if specified

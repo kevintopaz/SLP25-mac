@@ -25,6 +25,7 @@ import numpy as np
 import torch
 
 from .tile_assembly import make_blend_weight
+from .transform_memmap import drop_mapped_pages
 
 logger = logging.getLogger(__name__)
 
@@ -108,12 +109,23 @@ class TiledVAE:
                     crop = np.asarray(frames[:, :, hs:hs + tile_H, ws:ws + tile_W]).transpose(1, 2, 3, 0)
                 else:
                     crop = np.asarray(frames[:, hs:hs + tile_H, ws:ws + tile_W, :])
-                if pixel_scale > 0:
-                    crop = ((crop.astype(np.float32) / pixel_scale) * 2.0 - 1.0).astype(np.float16)
-                x = torch.from_numpy(np.ascontiguousarray(crop)).permute(3, 0, 1, 2)[None]   # 1 C T H W
-                del crop
-                moments = self.vae.slicing_encode(x.to(device=device, dtype=self.dtype))
+                if pixel_scale > 0 and torch.cuda.is_available():
+                    # normalise on the GPU (same float32 steps as below: identical values); the
+                    # VAE takes the CUDA tensor directly
+                    xt = torch.from_numpy(np.ascontiguousarray(crop)).to("cuda")
+                    xt = ((xt.float() / pixel_scale) * 2.0 - 1.0).half()
+                    x = xt.permute(3, 0, 1, 2)[None]
+                    del crop, xt
+                    xdev = x.device
+                else:
+                    if pixel_scale > 0:
+                        crop = ((crop.astype(np.float32) / pixel_scale) * 2.0 - 1.0).astype(np.float16)
+                    x = torch.from_numpy(np.ascontiguousarray(crop)).permute(3, 0, 1, 2)[None]   # 1 C T H W
+                    del crop
+                    xdev = device
+                moments = self.vae.slicing_encode(x.to(device=xdev, dtype=self.dtype))
                 del x
+                drop_mapped_pages(frames)    # the crop is on the device now: unmap the input pages it touched
                 tile_lat = moments[0].float().permute(1, 2, 3, 0).cpu()                      # T h w 2C
                 del moments
                 bw = torch.from_numpy(make_blend_weight(lat_tile_H, lat_tile_W, (lat_ov_H, lat_ov_W),
@@ -158,6 +170,9 @@ class TiledVAE:
         device = self.device
         tile_infos = []
         t0 = time.perf_counter()
+        from concurrent.futures import ThreadPoolExecutor
+        writer = ThreadPoolExecutor(max_workers=1)        # tile downloads + disk writes, off the GPU's path
+        pending = []
         for ti in range(n_h):
             for tj in range(n_w):
                 lh = min(ti * (lat_tile_H - lat_ov_H), lat_H - lat_tile_H)
@@ -166,22 +181,65 @@ class TiledVAE:
                     latent_f32_np[0, :, lh:lh + lat_tile_H, lw:lw + lat_tile_W, :])).permute(3, 0, 1, 2)[None]
                 out = self.vae.slicing_decode(z.to(device=device, dtype=self.dtype))
                 del z
-                tile = out[0].to(torch.float16).permute(1, 2, 3, 0).cpu().numpy()          # T H W 3
-                del out
-                tile = tile[:T_pix]
-                if tile_dtype == "uint8":
-                    quantized = ((tile.astype(np.float32) + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
-                elif tile_dtype == "uint16":
-                    quantized = ((tile.astype(np.float32) + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+                if tile_dtype in ("uint8", "uint16") and torch.cuda.is_available():
+                    # same float32 math as the numpy path below, on the GPU (identical values);
+                    # the download and the disk write run in the background (writer) while the
+                    # next tile decodes
+                    t = out[0].to(torch.float16).permute(1, 2, 3, 0)[:T_pix].to("cuda").float()
+                    del out
+                    if tile_dtype == "uint8":
+                        q = ((t + 1.0) * 127.5).clamp_(0, 255).to(torch.uint8)
+                    else:
+                        q = ((t + 1.0) * 32767.5).clamp_(0, 65535).to(torch.int32)
+                    del t
+                    shape = tuple(q.shape)
+                    name = f"tile_{ti}_{tj}"
+                    if vpp is not None:
+                        tmm = vpp.create_memmap(name, shape[0], shape[1], shape[2], shape[3], mode=tile_dtype)
+                        path = tmm.path
+
+                        def _write(q=q, tmm=tmm):
+                            a = q.cpu().numpy()
+                            tmm.write_raw_batch(a if tile_dtype == "uint8" else a.astype(np.uint16), 0)
+                            tmm.release()   # unmap: assembly opens its own read-only mapping per read
+                    else:
+                        path = os.path.join(tmp_dir, f"{name}.dat")
+                        mm = np.memmap(path, dtype=np.dtype(tile_dtype), mode="w+", shape=shape)
+
+                        def _write(q=q, mm=mm):
+                            a = q.cpu().numpy()
+                            mm[:] = a if tile_dtype == "uint8" else a.astype(np.uint16)
+                            mm.flush()
+                            drop_mapped_pages(mm)
+                    pending.append(writer.submit(_write))
+                    del q
+                    info = {"shape": shape, "dtype": tile_dtype, "pixel_h": lh * 8, "pixel_w": lw * 8,
+                            "tile_H": tile_H, "tile_W": tile_W, "ti": ti, "tj": tj, "n_h": n_h, "n_w": n_w,
+                            "ov_H": ov_H, "ov_W": ov_W, "path": path}
+                    if vpp is not None:
+                        info["vpp_name"] = name
+                    tile_infos.append(info)
+                    torch.cuda.empty_cache()
+                    if progress_fn is not None:
+                        progress_fn(ti * n_w + tj + 1, n_h * n_w)
+                    continue
                 else:
-                    quantized = tile.astype(np.dtype(tile_dtype))
-                del tile
+                    tile = out[0].to(torch.float16).permute(1, 2, 3, 0).cpu().numpy()          # T H W 3
+                    del out
+                    tile = tile[:T_pix]
+                    if tile_dtype == "uint8":
+                        quantized = ((tile.astype(np.float32) + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
+                    elif tile_dtype == "uint16":
+                        quantized = ((tile.astype(np.float32) + 1.0) * 32767.5).clip(0, 65535).astype(np.uint16)
+                    else:
+                        quantized = tile.astype(np.dtype(tile_dtype))
+                    del tile
                 shape = quantized.shape
                 name = f"tile_{ti}_{tj}"
                 if vpp is not None:
                     tmm = vpp.create_memmap(name, shape[0], shape[1], shape[2], shape[3], mode=tile_dtype)
                     tmm.write_raw_batch(quantized, 0)
-                    tmm.flush()
+                    tmm.release()
                     path = tmm.path
                 else:
                     path = os.path.join(tmp_dir, f"{name}.dat")
@@ -199,5 +257,8 @@ class TiledVAE:
                 torch.cuda.empty_cache()
                 if progress_fn is not None:
                     progress_fn(ti * n_w + tj + 1, n_h * n_w)
+        for f in pending:                                 # every tile on disk before anyone reads it
+            f.result()
+        writer.shutdown()
         logger.debug("Decoded %d tiles in %.1fs", len(tile_infos), time.perf_counter() - t0)
         return tile_infos

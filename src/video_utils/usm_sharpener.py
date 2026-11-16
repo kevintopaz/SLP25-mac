@@ -38,7 +38,7 @@ class USMSharpener:
             ``[T, H, W, C]`` in ``[0, 1]``, **float16 on CPU**.
         device : str
             GPU device string for the convolution kernels
-            (e.g. ``"cuda:0"``, ``"mps"``).
+            (e.g. ``"cuda:0"``).
 
         Returns
         -------
@@ -88,10 +88,7 @@ class USMSharpener:
 
             video[s:e] = out.permute(0, 2, 3, 1).float().to(dtype=torch.float16).cpu()
             del out
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            elif torch.backends.mps.is_available():
-                torch.mps.empty_cache()
+            torch.cuda.empty_cache()
 
         del kernel_h, kernel_v, gauss_1d
         return video

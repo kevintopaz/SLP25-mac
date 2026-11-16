@@ -8,12 +8,61 @@ This class is intentionally separate from VideoPrePostProcess — it manages
 storage (a different concern from pixel transforms).
 """
 
+import mmap
 import os
+import sys
 import tempfile
 from typing import Optional, Tuple
 
 import numpy as np
 import torch
+
+
+_DROP_PAGES = os.environ.get("MEMMAP_DROP_PAGES", "1") == "1"
+_MS_SYNC_INVALIDATE = 0x10 | 0x2    # macOS <sys/mman.h>: MS_SYNC | MS_INVALIDATE
+_libc = None
+
+
+def _darwin_msync_invalidate(m, a: int, n: int) -> None:
+    """macOS ignores MADV_DONTNEED for shared file mappings; msync(MS_SYNC|MS_INVALIDATE)
+    writes back dirty pages and evicts the range from the process (RSS drops)."""
+    global _libc
+    import ctypes
+    if _libc is None:
+        _libc = ctypes.CDLL(None, use_errno=True)
+        _libc.msync.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    view = np.frombuffer(m, dtype=np.uint8)     # base address of the mapping (works for read-only maps)
+    base = view.ctypes.data
+    del view
+    _libc.msync(base + a, n, _MS_SYNC_INVALIDATE)
+
+
+def drop_mapped_pages(arr, start: int = 0, count: Optional[int] = None) -> None:
+    """Release the resident pages of a numpy memmap's frames ``[start, start+count)``
+    (the whole mapping when *count* is None) so they stop counting toward the process's RSS.
+
+    The mapping is shared and file-backed: written data stays in the page cache (and
+    reaches the file); a later access just faults the page back in. Linux uses
+    ``madvise(MADV_DONTNEED)``; macOS, where that is a no-op for file mappings, uses
+    ``msync(MS_SYNC|MS_INVALIDATE)``. No-op for anything that is not a memmap."""
+    m = getattr(arr, "_mmap", None)
+    if m is None or not _DROP_PAGES:
+        return
+    size = len(m)
+    if count is None:
+        a, b = 0, size
+    else:
+        fb = (size // arr.shape[0]) if arr.shape[0] else 0     # bytes per frame (offset-0 memmaps)
+        a, b = (start * fb) // mmap.PAGESIZE * mmap.PAGESIZE, min(size, (start + count) * fb)
+    if b <= a:
+        return
+    try:
+        if sys.platform == "darwin":
+            _darwin_msync_invalidate(m, a, b - a)
+        elif hasattr(m, "madvise") and hasattr(mmap, "MADV_DONTNEED"):
+            m.madvise(mmap.MADV_DONTNEED, a, b - a)
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
 
 
 class TransformMemmap:
@@ -70,6 +119,7 @@ class TransformMemmap:
         count = frames.shape[0]
         data = (frames.cpu().float() * self.scale).clamp(0, self.scale)
         self._mm[start:start + count] = data.numpy().astype(self.dtype)
+        drop_mapped_pages(self._mm, start, count)
 
     def write(self, tensor: torch.Tensor) -> None:
         """Write a full tensor directly (raw mode).
@@ -95,6 +145,7 @@ class TransformMemmap:
         """
         count = frames_np.shape[0]
         self._mm[start:start + count] = frames_np.astype(self.dtype)
+        drop_mapped_pages(self._mm, start, count)
 
     def mirror_pad(self, t_input: int) -> None:
         """Mirror-pad trailing frames up to self.shape[0]."""
