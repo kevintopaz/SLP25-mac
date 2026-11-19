@@ -25,7 +25,8 @@ import sys
 
 import torch
 
-# The platform layer ships next to the code (neuroplatform/ at the repo root).
+# The platform layer: the neuroplatform submodule at the repo root (git clone --recurse-submodules), else an installed
+# neuroplatform wheel.
 _PLATFORM_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "neuroplatform")
 if os.path.isdir(_PLATFORM_DIR) and _PLATFORM_DIR not in sys.path:
     sys.path.insert(0, _PLATFORM_DIR)
@@ -35,6 +36,8 @@ try:
     from neuroplatform import WeightFiles  # noqa: E402
 except ImportError:          # no platform layer here: the pipeline stays plain PyTorch
     neuroplatform = None
+if neuroplatform is not None:
+    neuroplatform.check_api(1)    # an incompatible neuroplatform fails here, not by silently changing backends
 
 from .video_utils.tiled_vae import TiledVAE  # noqa: E402
 
@@ -83,14 +86,7 @@ def platform_name() -> str:
 
 
 def _available(backend: str) -> bool:
-    try:
-        if backend.startswith("ggml"):
-            from neuroplatform.backends import ggml_lib  # noqa: F401  (loads the library)
-        elif backend == "mlx":
-            import mlx.core  # noqa: F401
-        return True
-    except Exception:
-        return False
+    return neuroplatform is not None and neuroplatform.available(backend)
 
 
 def placement(kind: str):
@@ -125,6 +121,14 @@ def create_dit(split_dir: str, device=None):
     backend, opts = placement("dit")
     if backend == "mlx":
         mlx_rope_frequencies(model)
+    if backend == "torch" and os.environ.get("NEURO_TORCH_GRAPH", "0") == "1":
+        opts = {**opts, "graph": True}      # recorded graph + fused kernels (backends.torch.graph)
+    if backend != "torch" or opts.get("graph"):
+        # The DiT's window-group attention loop and chunked MLP cap eager PyTorch's
+        # activation memory by filling a preallocated buffer slice by slice. A
+        # backend plans its own memory (and chunks itself), so it records the plain
+        # forward instead.
+        os.environ.setdefault("DIT_WINDOW_GROUP_TOKENS", "0")
     # Weights stream from the split blocks on every backend (MLX, ggml, or PyTorch
     # on NVIDIA/AMD): about two blocks resident instead of the whole model.
     return neuroplatform.accelerate(model, weights=weights, backend=backend, match_input_dtype=True,

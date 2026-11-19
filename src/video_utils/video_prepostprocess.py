@@ -31,6 +31,7 @@ import logging
 from typing import Any, Callable, Dict, Literal, Optional, Tuple, Union
 
 import os
+import warnings
 
 import numpy as np
 import torch
@@ -298,6 +299,14 @@ class VideoWriter:
         self._total_frames = total_frames
         self._written = 0
         self._progress_fn = progress_fn
+        # Frames are encoded on one background thread (order kept) so the GPU post-processing of
+        # the next batch overlaps the CPU-bound encoder (4K: ~7 s of writes per 121 frames).
+        # At most _MAX_PENDING batches wait; close() waits for all and re-raises a write error.
+        import os as _os
+        self._async = _os.environ.get("VIDEO_WRITER_ASYNC", "1") == "1"
+        self._pool = None
+        self._pending = []
+        self._closed = False
 
     # -- public API ------------------------------------------------------- #
 
@@ -308,12 +317,31 @@ class VideoWriter:
         ----------
         frames : np.ndarray
             ``[T, H, W, C]`` uint8 or uint16 — typically the output of
-            ``VideoPrePostProcess.color_correct_and_finalize``.
+            ``VideoPrePostProcess.color_correct_and_finalize``. Written in the
+            background: the caller must not modify the array afterwards.
         """
+        if self._closed:
+            raise RuntimeError("VideoWriter.write_frames after close()")
         if self._write_fn is None:
             H, W = frames.shape[1], frames.shape[2]
             self._write_fn, self._close_fn = self._factory(H, W)
+        if not self._async:
+            self._write_batch(frames)
+            return
+        if self._pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+            self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video_writer")
+        while len(self._pending) >= self._MAX_PENDING:
+            self._pending.pop(0).result()
+        self._pending.append(self._pool.submit(self._write_batch, frames))
 
+    _MAX_PENDING = 2
+
+    def _drain(self) -> None:
+        while self._pending:
+            self._pending.pop(0).result()
+
+    def _write_batch(self, frames: np.ndarray) -> None:
         for i in range(frames.shape[0]):
             self._write_fn(frames[i])
         self._written += frames.shape[0]
@@ -329,7 +357,22 @@ class VideoWriter:
                      self._written, self._total_frames or "?")
 
     def close(self) -> None:
-        """Finalise and release the writer.  Idempotent."""
+        """Finalise and release the writer.  Idempotent.
+
+        Every queued batch is written before the output is finalised. If a queued write
+        failed, the output is still finalised (and every other queued batch waited for)
+        before the error is raised; later writes are refused."""
+        self._closed = True
+        err = None
+        try:
+            self._drain()
+        except BaseException as e:            # finalise first, then report
+            err = e
+        finally:
+            if self._pool is not None:
+                self._pool.shutdown(wait=True)   # also waits for batches queued after a failure
+                self._pool = None
+            self._pending = []
         if self._close_fn is not None:
             try:
                 self._close_fn()
@@ -337,10 +380,13 @@ class VideoWriter:
                 logger.exception("Error closing writer")
             self._close_fn = None
         self._write_fn = None
+        if err is not None:
+            raise err
 
     @property
     def frames_written(self) -> int:
-        """Number of frames written so far."""
+        """Number of frames written so far (queued batches included once written)."""
+        self._drain()
         return self._written
 
     def __del__(self):
@@ -580,19 +626,43 @@ class VideoPrePostProcess:
 
         mm = self.create_memmap(name, padded_frames, H, W, C)
 
+        if torch.cuda.is_available() and os.environ.get("INGEST_GPU_RESIZE", "0") == "1":
+            self._ingest_gpu(reader_fn, total_frames, batch_size, mm, src_scale)
+            if padded_frames > total_frames:
+                mm.mirror_pad(total_frames)
+            mm.flush()
+            logger.debug("Ingested %d frames to disk cache (GPU resize): %s", total_frames, mm)
+            return mm
+
+        # Same float32 steps as converting each batch at once, but frame by frame into buffers
+        # allocated once: large fresh temporaries per batch fault in new pages every batch
+        # (and can stall in the kernel when memory is fragmented).
+        # The float steps run in torch (multi-threaded); uint8 output is cast by torch, other
+        # integer types by numpy (truncation, like astype).
+        f_hwc = torch.empty((H, W, C), dtype=torch.float32)        # resized frame, HWC
+        f_np = f_hwc.numpy()
+        out_np = np.empty((batch_size, H, W, C), dtype=mm.dtype)
+        out_t = torch.from_numpy(out_np) if out_np.dtype == np.uint8 else None
+        src_f = None
         for start in range(0, total_frames, batch_size):
             count = min(batch_size, total_frames - start)
             frames_np = reader_fn(start, count)  # [B, H, W, C] uint8/uint16
-
-            # Convert to float [0,1] for resize, then back to integer
-            frames_f = torch.from_numpy(frames_np.astype(np.float32) / src_scale)
-            batch_chw = frames_f.permute(0, 3, 1, 2)  # [B, C, H, W]
-            batch_out = torch.stack([self._resizer(f) for f in batch_chw])
-            batch_out = batch_out.cpu().float().clamp(0.0, 1.0)
-            # Quantize back to integer
-            resized_np = (batch_out.permute(0, 2, 3, 1).numpy() * src_scale).clip(0, src_scale).astype(mm.dtype)
-            mm.write_raw_batch(resized_np, start)
-            del frames_np, frames_f, batch_chw, batch_out, resized_np
+            count = min(count, frames_np.shape[0])   # the reader may return fewer at the end
+            for i in range(count):
+                if src_f is None:
+                    src_f = np.empty(frames_np.shape[1:], dtype=np.float32)
+                # to float [0, 1], resize, back to integer
+                np.divide(frames_np[i], src_scale, out=src_f, dtype=np.float32)
+                r = self._resizer(torch.from_numpy(src_f).permute(2, 0, 1))   # [C, H, W]
+                f_hwc.copy_(r.permute(1, 2, 0))
+                del r
+                f_hwc.clamp_(0.0, 1.0).mul_(src_scale).clamp_(0, src_scale)
+                if out_t is not None:
+                    out_t[i].copy_(f_hwc)
+                else:
+                    np.copyto(out_np[i], f_np, casting="unsafe")
+            mm.write_raw_batch(out_np[:count], start)
+            del frames_np
 
         if padded_frames > total_frames:
             mm.mirror_pad(total_frames)
@@ -600,6 +670,39 @@ class VideoPrePostProcess:
         mm.flush()
         logger.debug("Ingested %d frames to disk cache: %s", total_frames, mm)
         return mm
+
+    @torch.no_grad()
+    def _ingest_gpu(self, reader_fn, total_frames: int, batch_size: int, mm, src_scale: float) -> None:
+        """``ingest``'s resize on the GPU, one frame at a time (a few frame-sized buffers; the
+        cache is emptied before returning). Same float32 steps as the CPU loop; the bicubic
+        kernel may round differently, so values can differ from the CPU path by 1 level."""
+        H, W = self._resizer.padded_dims
+        C = mm.shape[-1]
+        u8 = np.dtype(mm.dtype) == np.uint8
+        # downloads land in one reused pinned buffer; uint16 goes through int32 (CUDA casts)
+        host = torch.empty((batch_size, H, W, C), dtype=torch.uint8 if u8 else torch.int32, pin_memory=True)
+        host_np = host.numpy()
+        out_np = None if u8 else np.empty((batch_size, H, W, C), dtype=mm.dtype)
+        for start in range(0, total_frames, batch_size):
+            count = min(batch_size, total_frames - start)
+            frames_np = reader_fn(start, count)  # [B, H, W, C] uint8/uint16
+            count = min(count, frames_np.shape[0])   # the reader may return fewer at the end
+            for i in range(count):
+                x = torch.from_numpy(np.ascontiguousarray(frames_np[i]).astype(np.int32, copy=False)
+                                     if not u8 else np.ascontiguousarray(frames_np[i])).to("cuda")
+                f = (x.float() / src_scale).permute(2, 0, 1)          # [C, h, w] in [0, 1]
+                r = self._resizer(f).clamp_(0.0, 1.0)
+                q = (r.permute(1, 2, 0) * src_scale).clamp_(0, src_scale).to(host.dtype)
+                host[i].copy_(q)
+                del x, f, r, q
+            batch = host_np[:count]
+            if not u8:
+                np.copyto(out_np[:count], batch, casting="unsafe")
+                batch = out_np[:count]
+            mm.write_raw_batch(batch, start)
+            del frames_np
+        del host, host_np, out_np
+        torch.cuda.empty_cache()
 
     def read_tile(
         self,
@@ -672,9 +775,13 @@ class VideoPrePostProcess:
         # a few frames at a time, in place: float32 temporaries stay small (a 21-frame 4K
         # overlap read otherwise allocates several GB of float32); same ops, same values
         for s in range(0, src.shape[0], _REF_READ_BATCH):
-            raw = torch.from_numpy(np.array(src[s:s + _REF_READ_BATCH]))
             if device is not None:
-                raw = raw.to(device)
+                # uploaded straight from the mapping (no host copy); the slice is only read
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)   # read-only mapping
+                    raw = torch.from_numpy(np.ascontiguousarray(src[s:s + _REF_READ_BATCH])).to(device)
+            else:
+                raw = torch.from_numpy(np.array(src[s:s + _REF_READ_BATCH]))
             t[s:s + raw.shape[0]] = raw.float().div_(scale).mul_(2.0).sub_(1.0)
         drop_mapped_pages(mm._mm, start, count)   # read once per frame; don't keep it resident
         if as_cthw:

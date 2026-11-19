@@ -266,10 +266,12 @@ VAE_DECODE_TILE_SIZE = (480, 480)
 VAE_DECODE_TILE_OVERLAP = (60, 60) 
 
 def _auto_mlx_cache_gb() -> float:
+    # MLX buffer cache (freed buffers kept for reuse) by machine size:
+    # 16 GB and below -> 1 GB, 24 GB and below -> 2 GB, larger -> 6 GB.
     if _TOTAL_RAM_GB <= 16:
-        return 2.0
+        return 1.0
     if _TOTAL_RAM_GB <= 24:
-        return 4.0
+        return 2.0
     return 6.0
 
 

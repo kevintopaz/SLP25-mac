@@ -1,0 +1,4 @@
+[submodule "neuroplatform"]
+	path = neuroplatform
+	url = git@github.com:Topaz-Labs-Research/NeuroStream3.git
+	branch = kevin/dev

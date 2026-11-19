@@ -14,6 +14,7 @@ import os as _os
 # PyTorch's allocator without fragmentation between the pipeline's phases (the DiT reserved ~3 GB
 # more than it used); must be set before CUDA initializes
 _os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import math
 import sys
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -62,6 +63,11 @@ from . import neuroplatform_port
 # Run the models on this machine's backend (MLX on Apple silicon, streamed
 # PyTorch on NVIDIA/AMD); a no-op when the platform layer is not installed.
 neuroplatform_port.install()
+
+# Large numpy temporaries (4K frame batches) must not request transparent huge pages: on a
+# machine whose page cache has fragmented memory each request stalls in kernel compaction.
+from .video_utils.transform_memmap import disable_numpy_hugepages
+disable_numpy_hugepages()
 
 logging.basicConfig(
     format='%(asctime)s %(levelname)-8s %(message)s',
@@ -207,6 +213,19 @@ VAE_ENCODE_TILE_SIZE = (640, 640)
 VAE_ENCODE_TILE_OVERLAP = (80, 80) 
 VAE_DECODE_TILE_SIZE = (480, 480) 
 VAE_DECODE_TILE_OVERLAP = (60, 60) 
+
+
+def _vae_max_tile(kind: str):
+    """Largest VAE tile edge (px) for per-axis tiling (TiledVAE plan_tile). Default: the
+    fixed tile sizes above, so no tile is larger than today's -- tiles are only resized
+    to fit the frame (1080p decode: 1.65x -> 1.24x the latent area). The device memory
+    of a tile grows with its area and most of it is the backend's own (ggml: ~10 GB at
+    640 px encode tiles), so larger tiles are opt-in: VAE_DECODE_MAX_TILE /
+    VAE_ENCODE_MAX_TILE (px); 0 keeps the fixed tiles."""
+    env = os.environ.get(f"VAE_{kind.upper()}_MAX_TILE")
+    if env is not None:
+        return int(env) or None
+    return VAE_DECODE_TILE_SIZE if kind == "decode" else VAE_ENCODE_TILE_SIZE
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
@@ -735,6 +754,7 @@ class VideoUpscaler:
                     frames_torch,
                     tile_size=VAE_ENCODE_TILE_SIZE,
                     tile_overlap=VAE_ENCODE_TILE_OVERLAP,
+                    max_tile=_vae_max_tile("encode"),
                     temporal_slice=frames_torch.shape[0],
                     progress_fn=getattr(runner, '_vae_progress', None),
                     blend_mode=self.ctx.get('_vae_tile_blend', 'cosine'),
@@ -766,6 +786,7 @@ class VideoUpscaler:
                     lat_np,
                     tile_size=VAE_DECODE_TILE_SIZE,
                     tile_overlap=VAE_DECODE_TILE_OVERLAP,
+                    max_tile=_vae_max_tile("decode"),
                     temporal_slice=T_lat,
                     progress_fn=getattr(runner, '_vae_progress', None),
                     tile_dtype=self.ctx.get('_tile_dtype', 'uint8'),
@@ -921,6 +942,7 @@ class VideoUpscaler:
                         _input_mm._mm,
                         tile_size=VAE_ENCODE_TILE_SIZE,
                         tile_overlap=VAE_ENCODE_TILE_OVERLAP,
+                        max_tile=_vae_max_tile("encode"),
                         temporal_slice=HYBRID_TEMPORAL_ENCODE_SLICE,
                         input_layout=_input_mm.layout,
                         pixel_scale=_input_mm.scale,
@@ -939,6 +961,7 @@ class VideoUpscaler:
                         frames_torch,
                         tile_size=VAE_ENCODE_TILE_SIZE,
                         tile_overlap=VAE_ENCODE_TILE_OVERLAP,
+                        max_tile=_vae_max_tile("encode"),
                         temporal_slice=HYBRID_TEMPORAL_ENCODE_SLICE,
                         progress_fn=getattr(runner, '_vae_progress', None),
                         blend_mode=vae_tile_blend,
@@ -966,6 +989,7 @@ class VideoUpscaler:
                         lat_np,
                         tile_size=VAE_DECODE_TILE_SIZE,
                         tile_overlap=VAE_DECODE_TILE_OVERLAP,
+                        max_tile=_vae_max_tile("decode"),
                         temporal_slice=HYBRID_TEMPORAL_DECODE_SLICE,
                         vpp=self.ctx.get('vpp'),
                         progress_fn=getattr(runner, '_vae_progress', None),

@@ -406,7 +406,9 @@ def _streaming_postprocess_chunk(
         """Read colour-correction reference for frames [start : start+count]."""
         if not _has_transform_ref:
             return None
-        t = _vpp.read_reference(start, count, as_cthw=True)
+        # with GPU post-processing the integer frames go to the GPU and are converted there
+        # (same float32 steps, identical values): half the transfer, no CPU float temporaries
+        t = _vpp.read_reference(start, count, as_cthw=True, device="cuda" if _gpu_assembly else None)
         if _vpp.needs_resize_back:
             t = _vpp.resize_back(t)
         return t
@@ -442,13 +444,21 @@ def _streaming_postprocess_chunk(
 
     if ci == 0:
         if num_chunks == 1:
-            # Single chunk — stream everything through pp_func.
-            for fs in range(0, T_pix, _STREAM_PP_BATCH):
-                cnt = min(_STREAM_PP_BATCH, T_pix - fs)
-                dec_b = _read_decoded_range(fs, cnt)
-                trans_b = _read_transform_range(fs, cnt)
-                pp_func(dec_b, trans_b)
-                del dec_b, trans_b
+            # Single chunk — stream everything through pp_func. The next batch's colour
+            # reference is read on a background thread while this batch is processed.
+            from concurrent.futures import ThreadPoolExecutor
+            starts = list(range(0, T_pix, _STREAM_PP_BATCH))
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="pp_reference") as ref_pool:
+                nxt = ref_pool.submit(_read_transform_range, 0, min(_STREAM_PP_BATCH, T_pix)) if starts else None
+                for k, fs in enumerate(starts):
+                    cnt = min(_STREAM_PP_BATCH, T_pix - fs)
+                    trans_b = nxt.result()
+                    if k + 1 < len(starts):
+                        f2 = starts[k + 1]
+                        nxt = ref_pool.submit(_read_transform_range, f2, min(_STREAM_PP_BATCH, T_pix - f2))
+                    dec_b = _read_decoded_range(fs, cnt)
+                    pp_func(dec_b, trans_b)
+                    del dec_b, trans_b
             _cleanup_all()
             return None, None
         else:
@@ -484,7 +494,7 @@ def _streaming_postprocess_chunk(
                 blended_trans = None
                 if overlap_trans is not None and cur_head_trans is not None:
                     blended_trans = _blend_overlapping_transformed(
-                        overlap_trans[:, fr], cur_head_trans, actual_overlap,
+                        overlap_trans[:, fr].to(cur_head_trans.device), cur_head_trans, actual_overlap,
                         mode=blend_mode, frames=fr,
                     )
                 pp_func(blended_dec, blended_trans)

@@ -40,6 +40,26 @@ def _n_tiles(size, tile, overlap):
     return max(1, int(math.ceil((size - overlap) / (tile - overlap))))
 
 
+def plan_tile(extent: int, max_tile: int, overlap: int) -> int:
+    """Tile edge along one axis (all in latent rows): the fewest tiles whose edge
+    fits ``max_tile``, each just long enough that n tiles overlapping by ``overlap``
+    cover ``extent`` -- the only work beyond the frame is the overlap itself.
+    Fixed-size tiles instead redo up to a whole tile of extra rows at the edge
+    (today's 480 px decode tiles decode 1.65x a 1080p latent)."""
+    if extent <= max_tile:
+        return extent
+    n = 2
+    while True:
+        tile = -(-(extent + (n - 1) * overlap) // n)
+        if tile <= max_tile or tile <= overlap + 1:
+            return max(tile, overlap + 1)
+        n += 1
+
+
+def _auto_tile(extent_lat: int, max_tile_px, overlap_lat: int) -> int:
+    return plan_tile(extent_lat, max(overlap_lat + 1, int(max_tile_px) // 8), overlap_lat) * 8
+
+
 class TiledVAE:
     """Tiled encode / decode around ``vae`` (an ``nn.Module`` with
     ``slicing_encode``, ``slicing_decode`` and ``set_causal_slicing``).
@@ -73,7 +93,7 @@ class TiledVAE:
     @torch.no_grad()
     def tiled_encode(self, frames, tile_size=640, tile_overlap=80, temporal_slice=9,
                      input_layout: str = "THWC", pixel_scale: float = 0.0, progress_fn=None,
-                     blend_mode: str = "cosine") -> np.ndarray:
+                     blend_mode: str = "cosine", max_tile=None) -> np.ndarray:
         """frames: ``[T, H, W, C]`` (or ``[C, T, H, W]`` with input_layout="CTHW"),
         numpy / memmap / CPU tensor. With ``pixel_scale > 0`` values are raw
         pixels in ``[0, pixel_scale]``, normalised to ``[-1, 1]`` per tile."""
@@ -91,6 +111,9 @@ class TiledVAE:
 
         tile_H, tile_W = _hw(tile_size)
         ov_H, ov_W = _hw(tile_overlap)
+        if max_tile:                        # per-axis tiles sized to the frame (see plan_tile)
+            mh, mw = _hw(max_tile)
+            tile_H, tile_W = _auto_tile(H // 8, mh, ov_H // 8), _auto_tile(W // 8, mw, ov_W // 8)
         tile_H, tile_W = min(tile_H, H), min(tile_W, W)
         n_h, n_w = _n_tiles(H, tile_H, ov_H), _n_tiles(W, tile_W, ov_W)
         lat_tile_H, lat_tile_W, lat_ov_H, lat_ov_W = tile_H // 8, tile_W // 8, ov_H // 8, ov_W // 8
@@ -150,16 +173,22 @@ class TiledVAE:
     @torch.no_grad()
     def tiled_decode(self, latent_f32_np: np.ndarray, tile_size=480, tile_overlap=60, temporal_slice=5,
                      num_frames: Optional[int] = None, tmp_dir: Optional[str] = None, progress_fn=None,
-                     tile_dtype: str = "uint8", vpp=None, blend_mode: str = "cosine") -> list:
+                     tile_dtype: str = "uint8", vpp=None, blend_mode: str = "cosine", max_tile=None) -> list:
         """latent_f32_np: ``[1, T_lat, H_lat, W_lat, 16]``. Each spatial tile is
         decoded (temporal slices of ``temporal_slice`` latent frames), quantised
         and written to its own memmap; returns the tile descriptions."""
         _, T_lat, lat_H, lat_W, _ = latent_f32_np.shape
         tile_H, tile_W = _hw(tile_size)
         ov_H, ov_W = _hw(tile_overlap)
+        if max_tile:                        # per-axis tiles sized to the frame (see plan_tile)
+            mh, mw = _hw(max_tile)
+            tile_H, tile_W = _auto_tile(lat_H, mh, ov_H // 8), _auto_tile(lat_W, mw, ov_W // 8)
         tile_H, tile_W = min(tile_H, lat_H * 8), min(tile_W, lat_W * 8)
         lat_tile_H, lat_tile_W, lat_ov_H, lat_ov_W = tile_H // 8, tile_W // 8, ov_H // 8, ov_W // 8
         n_h, n_w = _n_tiles(lat_H, lat_tile_H, lat_ov_H), _n_tiles(lat_W, lat_tile_W, lat_ov_W)
+        logger.info("VAE decode tiles: %dx%d of %dx%d px (overlap %dx%d px), %.2fx the latent area",
+                    n_h, n_w, tile_H, tile_W, lat_ov_H * 8, lat_ov_W * 8,
+                    (n_h * lat_tile_H) * (n_w * lat_tile_W) / max(1, lat_H * lat_W))
         T_pix = 1 if T_lat == 1 else (T_lat - 1) * self.temporal_down + 1
         if num_frames is not None:
             T_pix = min(T_pix, num_frames)
@@ -185,13 +214,22 @@ class TiledVAE:
                     # same float32 math as the numpy path below, on the GPU (identical values);
                     # the download and the disk write run in the background (writer) while the
                     # next tile decodes
-                    t = out[0].to(torch.float16).permute(1, 2, 3, 0)[:T_pix].to("cuda").float()
+                    # in chunks of frames into a result allocated first: whole-tile float copies
+                    # (~0.5 GB at 1080p) would fragment PyTorch's cache, and the result, kept until
+                    # the writer has saved it, would pin those blocks during the next tile's decode
+                    o = out[0].to("cuda")
                     del out
-                    if tile_dtype == "uint8":
-                        q = ((t + 1.0) * 127.5).clamp_(0, 255).to(torch.uint8)
-                    else:
-                        q = ((t + 1.0) * 32767.5).clamp_(0, 65535).to(torch.int32)
-                    del t
+                    n_t = min(T_pix, o.shape[1])
+                    q = torch.empty((n_t, o.shape[2], o.shape[3], o.shape[0]), device="cuda",
+                                    dtype=torch.uint8 if tile_dtype == "uint8" else torch.int32)
+                    for f0 in range(0, n_t, 16):
+                        t = o[:, f0:f0 + 16].to(torch.float16).permute(1, 2, 3, 0).float()
+                        if tile_dtype == "uint8":
+                            q[f0:f0 + t.shape[0]] = ((t + 1.0) * 127.5).clamp_(0, 255)
+                        else:
+                            q[f0:f0 + t.shape[0]] = ((t + 1.0) * 32767.5).clamp_(0, 65535)
+                        del t
+                    del o
                     shape = tuple(q.shape)
                     name = f"tile_{ti}_{tj}"
                     if vpp is not None:
