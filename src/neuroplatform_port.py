@@ -153,8 +153,7 @@ def create_dit(split_dir: str, device=None):
         mmattn.WINDOW_GROUP_TOKENS = 0          # this package's module: no other model sees it
     # Weights stream from the split blocks on every backend (MLX, ggml, or PyTorch
     # on NVIDIA/AMD): about two blocks resident instead of the whole model.
-    return neuroplatform.accelerate(model, weights=weights, backend=backend, match_input_dtype=True,
-                                    stream_weights=True, **opts)
+    return neuroplatform.accelerate(model, weights=weights, backend=backend, stream_weights=True, **opts)
 
 
 def mlx_rope_frequencies(model: torch.nn.Module, theta: float = 10000.0) -> torch.nn.Module:
