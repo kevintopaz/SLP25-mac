@@ -285,9 +285,19 @@ class NaSwinAttention(NaMMAttention):
 # the scheme the MLX DiT uses on Apple silicon.
 import os as _os
 
+# Tokens per window group / MLP chunk; 0: the plain forward (a backend that plans its own memory sets it on this
+# module). None: DIT_WINDOW_GROUP_TOKENS, default 16384.
+WINDOW_GROUP_TOKENS = None
+
+
+def window_group_tokens() -> int:
+    if WINDOW_GROUP_TOKENS is not None:
+        return int(WINDOW_GROUP_TOKENS)
+    return int(_os.environ.get("DIT_WINDOW_GROUP_TOKENS", "16384"))
+
 
 def _window_groups_wanted(vid_shape: torch.LongTensor) -> bool:
-    lim = int(_os.environ.get("DIT_WINDOW_GROUP_TOKENS", "16384"))
+    lim = window_group_tokens()
     if lim <= 0 or vid_shape.shape[0] != 1 or int(vid_shape.prod(-1).sum()) <= lim:
         return False
     try:
@@ -298,7 +308,7 @@ def _window_groups_wanted(vid_shape: torch.LongTensor) -> bool:
 
 
 def _forward_window_groups(self, vid, txt, vid_shape, txt_shape, cache):
-    lim = int(_os.environ.get("DIT_WINDOW_GROUP_TOKENS", "16384"))
+    lim = window_group_tokens()
     cache_win = cache.namespace(f"{self.window_method}_{self.window}_{self.fixed_wt}_sd3")
 
     def make_window(x: torch.Tensor):

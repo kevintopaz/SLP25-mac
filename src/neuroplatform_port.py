@@ -128,7 +128,8 @@ def create_dit(split_dir: str, device=None):
         # activation memory by filling a preallocated buffer slice by slice. A
         # backend plans its own memory (and chunks itself), so it records the plain
         # forward instead.
-        os.environ.setdefault("DIT_WINDOW_GROUP_TOKENS", "0")
+        from .models.dit_3b.nablocks.attention import mmattn
+        mmattn.WINDOW_GROUP_TOKENS = 0          # this package's module: no other model sees it
     # Weights stream from the split blocks on every backend (MLX, ggml, or PyTorch
     # on NVIDIA/AMD): about two blocks resident instead of the whole model.
     return neuroplatform.accelerate(model, weights=weights, backend=backend, match_input_dtype=True,

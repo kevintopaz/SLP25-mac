@@ -32,8 +32,8 @@ from ..mlp import get_mlp
 def _chunked_mlp(mlp, vid, txt):
     """The MLP over video tokens in chunks (it is per token): its 4x-wide hidden layer
     never exists for the whole sequence (DIT_WINDOW_GROUP_TOKENS, as the attention loop)."""
-    import os
-    lim = int(os.environ.get("DIT_WINDOW_GROUP_TOKENS", "16384"))
+    from .attention.mmattn import window_group_tokens
+    lim = window_group_tokens()
     if lim <= 0 or vid.shape[0] <= lim:
         return mlp(vid, txt)
     out, txt_out = None, None
