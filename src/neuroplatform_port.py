@@ -25,10 +25,25 @@ import sys
 
 import torch
 
-# The platform layer: the neuroplatform submodule at the repo root (git clone --recurse-submodules), else an installed
-# neuroplatform wheel.
-_PLATFORM_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "neuroplatform")
-if os.path.isdir(_PLATFORM_DIR) and _PLATFORM_DIR not in sys.path:
+# Which neuroplatform: NEURO_PLATFORM_DIR if set (development), else the installed neuroplatform wheel (deployment:
+# its Python code and compiled ggml come from one commit), else the submodule in this repo (a source checkout,
+# git clone --recurse-submodules). A process serving several models imports one neuroplatform for all of them.
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _platform_dir():
+    if os.environ.get("NEURO_PLATFORM_DIR"):
+        return os.environ["NEURO_PLATFORM_DIR"]
+    import importlib.util
+    spec = importlib.util.find_spec("neuroplatform")
+    if spec is not None and (spec.origin or "").endswith("__init__.py"):
+        return None                                        # installed (or already on the path)
+    return os.path.join(_REPO, "neuroplatform")
+
+
+_PLATFORM_DIR = _platform_dir()
+if _PLATFORM_DIR and os.path.isfile(os.path.join(_PLATFORM_DIR, "neuroplatform", "__init__.py")) \
+        and _PLATFORM_DIR not in sys.path:
     sys.path.insert(0, _PLATFORM_DIR)
 
 try:
@@ -37,7 +52,13 @@ try:
 except ImportError:          # no platform layer here: the pipeline stays plain PyTorch
     neuroplatform = None
 if neuroplatform is not None:
-    neuroplatform.check_api(1)    # an incompatible neuroplatform fails here, not by silently changing backends
+    neuroplatform.check_api(2)    # an incompatible neuroplatform fails here, not by silently changing backends
+
+# The neuroplatform commit this model was checked with (neuroplatform.pin, the submodule's commit): any other stops
+# here (PORTING.md, "Keeping coupled models working"; NEURO_ALLOW_BUILD_MISMATCH=1 only warns).
+_PIN = os.path.join(_REPO, "neuroplatform.pin")
+if neuroplatform is not None:
+    neuroplatform.check_build(open(_PIN).read() if os.path.isfile(_PIN) else "")
 
 from .video_utils.tiled_vae import TiledVAE  # noqa: E402
 
