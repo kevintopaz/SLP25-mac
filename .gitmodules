@@ -2,3 +2,7 @@
 	path = neuroplatform
 	url = git@github.com:Topaz-Labs-Research/NeuroStream3.git
 	branch = kevin/dev
+[submodule "third_party/video_tools"]
+	path = third_party/video_tools
+	url = git@github.com:Topaz-Labs-Research/video_tools.git
+	branch = kevin/improved
