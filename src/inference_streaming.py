@@ -200,6 +200,12 @@ def _system_ram_gb() -> float:
             pass
     try:
         return (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / 1024**3
+    except AttributeError:  # Windows has no os.sysconf
+        try:
+            import psutil
+            return psutil.virtual_memory().total / 1024**3
+        except Exception:
+            return 0.0
     except (ValueError, OSError):
         return 0.0  # conservative: triggers small-tile / small-cache tier
 

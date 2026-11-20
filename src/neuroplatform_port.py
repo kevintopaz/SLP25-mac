@@ -80,9 +80,24 @@ def install() -> None:
     model_factory.create_dit = create_dit
     model_factory.create_vae = create_vae
     original = color_fix.wavelet_reconstruction
+    if torch.version.hip:
+        original = _without_miopen(original)
     backend, opts = placement("colorfix")
     wavelet = neuroplatform.accelerate(lambda content, style: original(content, style), backend=backend, **opts)
     color_fix.wavelet_reconstruction = lambda content, style, debug=None: wavelet(content, style)
+
+
+def _without_miopen(fn):
+    """AMD (ROCm): ``fn`` with MIOpen off for the call. MIOpen returns wrong results for the colour fix's 3x3 depthwise
+    blur (R9700 / gfx1201, ROCm 7.2.1: flash3's fp16 blur gave +-512 for inputs in [-1, 1]; here, colour casts per
+    tile); PyTorch's own conv kernels are correct and faster for it. Scoped: other models in the process keep MIOpen."""
+    cudnn = torch.backends.cudnn
+
+    def wrapped(*args, **kwargs):
+        with cudnn.flags(enabled=False, benchmark=cudnn.benchmark, deterministic=cudnn.deterministic,
+                         allow_tf32=cudnn.allow_tf32):
+            return fn(*args, **kwargs)
+    return wrapped
 
 
 # ── placement: which backend runs each model, per platform ───────────────────
@@ -99,6 +114,12 @@ PLACEMENT = {
 }
 
 
+# AMD (ROCm) differs from NVIDIA here: PyTorch's 3-D convs go to MIOpen, which compiles and searches kernels on the CPU
+# for minutes per new conv shape (R9700 / gfx1201, ROCm 7.2.1: the encode sat with the GPU idle), so the VAE runs on
+# neuroplatform's ggml (ggml-hip) as on Apple, in bf16 for the same reason.
+ROCM_PLACEMENT = {"vae": ("ggml", {"ggml_dtype": "bf16"})}
+
+
 def platform_name() -> str:
     import platform
     if sys.platform == "darwin" and platform.machine() == "arm64":
@@ -113,6 +134,8 @@ def _available(backend: str) -> bool:
 def placement(kind: str):
     """(backend, accelerate options) for a model kind: "dit", "vae", "colorfix"."""
     backend, opts = PLACEMENT[platform_name()][kind]
+    if platform_name() == "cuda" and torch.version.hip and kind in ROCM_PLACEMENT:
+        backend, opts = ROCM_PLACEMENT[kind]
     forced = (os.environ.get(f"NEURO_BACKEND_{kind.upper()}") or os.environ.get("NEURO_BACKEND") or "").strip().lower()
     if forced and forced != "auto" and forced != backend:
         backend, opts = forced, {}
