@@ -70,7 +70,7 @@ _blender_cache: Dict[str, Blend] = {}
 
 def _get_blender(mode: str = "hann") -> Blend:
     if mode not in _blender_cache:
-        _blender_cache[mode] = Blend(mode=mode)
+        _blender_cache[mode] = Blend(mode=mode, cpu_weights=True)   # CPU weights: GPU blending == CPU blending
     return _blender_cache[mode]
 
 

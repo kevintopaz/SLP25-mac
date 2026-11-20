@@ -882,6 +882,10 @@ class VideoUpscaler:
                 source_bit_depth=reader.bit_depth,
                 output_bit_depth=output_bit_depth,
                 color_overrides=self.ctx.get('color_overrides'),
+                # video_tools' options for this model's VPP: antialiased on MPS too, frames encoded on a
+                # background thread (VIDEO_WRITER_ASYNC=0: on the caller's thread)
+                antialias=True,
+                async_write=os.environ.get("VIDEO_WRITER_ASYNC", "1") == "1",
             )
 
         vpp = self.ctx['vpp']
