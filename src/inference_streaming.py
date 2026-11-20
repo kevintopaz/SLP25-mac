@@ -903,9 +903,16 @@ class VideoUpscaler:
                 writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             return _write_frame, writer.release
 
+        # video_tools' writer (NVENC where the machine has it, else the same codec in software) for the default
+        # request; the ffmpeg writer for custom ffmpeg arguments and 4:2:2 / 4:4:4
+        from .video_io import writer_factory as _vt_writer_factory
+        _vt_factory, _writer_desc = _vt_writer_factory(output_path, fps, use_10bit, video_profile, ffmpeg_encoding)
+        logger.info("Video writer: %s", _writer_desc if _vt_factory else f"ffmpeg ({_writer_desc})")
         vpp.open_writer(
-            writer_factory=_ffmpeg_writer_factory,
+            writer_factory=_vt_factory or _ffmpeg_writer_factory,
             total_frames=total_frames,
+            # video_tools' writer encodes on its own thread already
+            **({"async_write": False} if _vt_factory else {}),
         )
 
         t_start = time.time()
