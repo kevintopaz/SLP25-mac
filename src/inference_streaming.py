@@ -1130,6 +1130,9 @@ def parse_arguments():
     parser.add_argument("--vae_path", type=str, default=None,
                         help="VAE safetensors path (overrides model_dir)")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--neuroplatform", default="", metavar="KIND=BACKEND,...",
+                        help="run a model kind on another backend than the port's table, e.g. "
+                             "dit=ggml,vae=torch_graph (kinds: dit, vae, colorfix)")
     parser.add_argument("--chunking_mode", default="latent", choices=["pixel", "latent"],
                         help="Chunking strategy: 'latent' (default, hybrid streaming) or 'pixel'")
     return parser.parse_args()
@@ -1137,6 +1140,8 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
+    if args.neuroplatform:
+        neuroplatform_port.choose(**dict(kv.split("=", 1) for kv in args.neuroplatform.split(",")))
     output = args.output or str(Path(args.input).with_stem(Path(args.input).stem + "_upscaled"))
     os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
 

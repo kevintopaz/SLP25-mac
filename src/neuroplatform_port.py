@@ -15,9 +15,9 @@ its weights are, and that on MLX the DiT's RoPE frequencies are computed with
 MLX (as the hand-written MLX DiT does).
 
 Which backend runs each model, and with what options, is decided here, per
-platform (PLACEMENT). For experiments it can be overridden without editing:
-NEURO_BACKEND_DIT / NEURO_BACKEND_VAE / NEURO_BACKEND_COLORFIX (one model),
-NEURO_BACKEND (all), NEURO_GGML_DIT_DTYPE / NEURO_GGML_VAE_DTYPE (f32, f16, bf16).
+platform (PLACEMENT). An experiment chooses explicitly -- choose(dit="ggml"),
+or the entry script's --neuroplatform dit=ggml,vae=torch_graph -- never through
+environment variables, so a variable left in a shell cannot change a run.
 """
 
 import os
@@ -82,9 +82,14 @@ def install() -> None:
     original = color_fix.wavelet_reconstruction
     if torch.version.hip:
         original = _without_miopen(original)
-    backend, opts = placement("colorfix")
-    wavelet = neuroplatform.accelerate(lambda content, style: original(content, style), backend=backend, **opts)
-    color_fix.wavelet_reconstruction = lambda content, style, debug=None: wavelet(content, style)
+    accelerated = []        # built on first use: after the entry script's explicit choices (choose)
+
+    def wavelet(content, style, debug=None):
+        if not accelerated:
+            backend, opts = placement("colorfix")
+            accelerated.append(neuroplatform.accelerate(lambda c, s: original(c, s), backend=backend, **opts))
+        return accelerated[0](content, style)
+    color_fix.wavelet_reconstruction = wavelet
 
 
 def _without_miopen(fn):
@@ -109,43 +114,33 @@ PLACEMENT = {
     "apple": {"dit": ("ggml", {"ggml_dtype": "bf16"}),
               "vae": ("ggml", {"ggml_dtype": "bf16"}),
               "colorfix": ("mlx", {})},
-    "cuda": {"dit": ("torch", {}), "vae": ("torch", {}), "colorfix": ("torch", {})},   # NVIDIA, AMD (ROCm)
+    "cuda": {"dit": ("torch", {}), "vae": ("torch", {}), "colorfix": ("torch", {})},   # NVIDIA
+    # AMD (ROCm) differs from NVIDIA here: PyTorch's 3-D convs go to MIOpen, which compiles and searches kernels on the
+    # CPU for minutes per new conv shape (R9700 / gfx1201, ROCm 7.2.1: the encode sat with the GPU idle), so the VAE
+    # runs on neuroplatform's ggml (ggml-hip) as on Apple, in bf16 for the same reason.
+    "rocm": {"dit": ("torch", {}), "vae": ("ggml", {"ggml_dtype": "bf16"}), "colorfix": ("torch", {})},
     "cpu": {"dit": ("torch", {}), "vae": ("torch", {}), "colorfix": ("torch", {})},
 }
 
 
-# AMD (ROCm) differs from NVIDIA here: PyTorch's 3-D convs go to MIOpen, which compiles and searches kernels on the CPU
-# for minutes per new conv shape (R9700 / gfx1201, ROCm 7.2.1: the encode sat with the GPU idle), so the VAE runs on
-# neuroplatform's ggml (ggml-hip) as on Apple, in bf16 for the same reason.
-ROCM_PLACEMENT = {"vae": ("ggml", {"ggml_dtype": "bf16"})}
+_CHOICE = {}        # kind -> backend chosen explicitly for this process (choose); else PLACEMENT's
 
 
-def platform_name() -> str:
-    import platform
-    if sys.platform == "darwin" and platform.machine() == "arm64":
-        return "apple"
-    return "cuda" if torch.cuda.is_available() else "cpu"
-
-
-def _available(backend: str) -> bool:
-    return neuroplatform is not None and neuroplatform.available(backend)
+def choose(**backends) -> None:
+    """Run a model kind on another backend than PLACEMENT's, e.g. choose(dit="ggml", vae="torch_graph") (an
+    experiment; "auto" / None: the table's). Before the models are built."""
+    unknown = set(backends) - {"dit", "vae", "colorfix"}
+    if unknown:
+        raise ValueError(f"unknown model kinds {sorted(unknown)}")
+    _CHOICE.update({k: v for k, v in backends.items()})
 
 
 def placement(kind: str):
-    """(backend, accelerate options) for a model kind: "dit", "vae", "colorfix"."""
-    backend, opts = PLACEMENT[platform_name()][kind]
-    if platform_name() == "cuda" and torch.version.hip and kind in ROCM_PLACEMENT:
-        backend, opts = ROCM_PLACEMENT[kind]
-    forced = (os.environ.get(f"NEURO_BACKEND_{kind.upper()}") or os.environ.get("NEURO_BACKEND") or "").strip().lower()
-    if forced and forced != "auto" and forced != backend:
-        backend, opts = forced, {}
-    if not _available(backend):                  # e.g. the ggml library not built on this machine
-        fallback = neuroplatform.detect_backend()
-        print(f"neuroplatform_port: {backend} not available for {kind}; using {fallback}", file=sys.stderr)
-        backend, opts = fallback, {}
-    opts = dict(opts)
+    """(backend, accelerate options) for a model kind: "dit", "vae", "colorfix" (neuroplatform.placement: this
+    platform's PLACEMENT entry, an explicit choice, a fallback where the backend is not available)."""
+    backend, opts = neuroplatform.placement(kind, PLACEMENT, backend=_CHOICE.get(kind))
     if backend.startswith("ggml"):
-        opts["ggml_dtype"] = os.environ.get(f"NEURO_GGML_{kind.upper()}_DTYPE", opts.get("ggml_dtype", "bf16"))
+        opts.setdefault("ggml_dtype", "bf16")       # both models need bf16 on ggml (above)
     return backend, opts
 
 
@@ -165,8 +160,6 @@ def create_dit(split_dir: str, device=None):
     backend, opts = placement("dit")
     if backend == "mlx":
         mlx_rope_frequencies(model)
-    if backend == "torch" and os.environ.get("NEURO_TORCH_GRAPH", "0") == "1":
-        opts = {**opts, "graph": True}      # recorded graph + fused kernels (backends.torch.graph)
     if backend != "torch" or opts.get("graph"):
         # The DiT's window-group attention loop and chunked MLP cap eager PyTorch's
         # activation memory by filling a preallocated buffer slice by slice. A
